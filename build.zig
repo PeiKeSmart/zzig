@@ -67,6 +67,13 @@ const version_12 = struct {
             .optimize = optimize,
         });
 
+        lib = b.addObject(.{
+            .name = "zig-strings",
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+
         const docs_step = b.step("docs", "Emit docs");
 
         const docs_install = b.addInstallDirectory(.{
