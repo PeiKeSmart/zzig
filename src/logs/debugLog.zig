@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const strings = @import("strings");
 
 /// PrintStrings 打印字符串。
 ///
@@ -12,13 +13,18 @@ pub fn PrintStrings(args: []const []const u8) void {
     std.debug.print("{s}\n", .{args});
 }
 
-/// PrintString 打印字符串。
+/// PrintString 打印格式化字符串。
 ///
 /// 参数:
-/// - args: 字符串。
+/// - `fmt`: 格式化字符串，使用 comptime 确定格式。
+/// - `args`: 要打印的字符串参数。
 ///
 /// 返回:
 /// - 无返回值。
-pub fn PrintString(args: []u8) void {
-    std.debug.print("{s}\n", .{args});
+pub fn PrintString(comptime fmt: []const u8, args: []u8) void {
+    if (strings.Contains(fmt, "{s}")) {
+        std.debug.print(fmt, .{args});
+    } else {
+        @compileError("错误: 格式化字符串中缺少 '{s}' 占位符。");
+    }
 }

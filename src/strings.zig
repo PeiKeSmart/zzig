@@ -27,3 +27,17 @@ pub fn AddStrings(allocator: std.mem.Allocator, slices: []const []const u8) ![]u
     // 使用指定的分配器将两个字符串拼接成一个新字符串
     return try std.mem.concat(allocator, u8, slices);
 }
+
+/// Contains检查字符串 `a` 是否包含子字符串 `b`。
+///
+/// 参数:
+/// - `a`: 要搜索的字符串。
+/// - `b`: 要查找的子字符串。
+///
+/// 返回值:
+/// - 如果 `a` 包含 `b`，则返回 `true`；否则返回 `false`。
+pub fn Contains(a: []const u8, b: []const u8) bool {
+    const found = std.mem.indexOf(u8, a, b) != null;
+
+    return found;
+}
