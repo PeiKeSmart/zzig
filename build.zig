@@ -37,6 +37,14 @@ const version_12 = struct {
             .root_source_file = b.path(b.pathJoin(&.{ "src", "strings.zig" })),
         });
 
+        _ = b.addModule("debugLog", .{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
+        });
+
+        _ = b.addModule("xtrace", .{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "xtrace.zig" })),
+        });
+
         generateDocs(b, optimize, target);
 
         const test_step = b.step("test", "Run unit tests");
