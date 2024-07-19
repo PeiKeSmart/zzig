@@ -33,43 +33,28 @@ const version_12 = struct {
         const target = b.standardTargetOptions(.{});
         const optimize = b.standardOptimizeOption(.{});
 
-        const strings = b.addModule("strings", .{
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "strings.zig" })),
-        });
-
-        _ = b.addModule("debugLog", .{
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
-        });
-
-        _ = b.addModule("xtrace", .{
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "xtrace.zig" })),
+        const zzig = b.addModule("zzig", .{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
         });
 
         generateDocs(b, optimize, target);
 
         const test_step = b.step("test", "Run unit tests");
 
-        const strings_unit_tests = b.addTest(.{
+        const zzig_unit_tests = b.addTest(.{
             .root_source_file = b.path(b.pathJoin(&.{ "src", "test.zig" })),
             .target = target,
             .optimize = optimize,
         });
-        strings_unit_tests.root_module.addImport("strings", strings);
-        const run_strings_tests = b.addRunArtifact(strings_unit_tests);
-        test_step.dependOn(&run_strings_tests.step);
+        zzig_unit_tests.root_module.addImport("zzig", zzig);
+        const run_zzig_tests = b.addRunArtifact(zzig_unit_tests);
+        test_step.dependOn(&run_zzig_tests.step);
     }
 
     fn generateDocs(b: *Build, optimize: OptimizeMode, target: Build.ResolvedTarget) void {
         var lib = b.addObject(.{
-            .name = "zig-strings",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "strings.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        lib = b.addObject(.{
-            .name = "zig-debugLog",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
+            .name = "zig-zzig",
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
             .target = target,
             .optimize = optimize,
         });
