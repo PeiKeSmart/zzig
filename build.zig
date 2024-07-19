@@ -74,8 +74,22 @@ const version_12 = struct {
         });
 
         lib = b.addObject(.{
+            .name = "zig-xtrace",
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "xtrace.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        lib = b.addObject(.{
             .name = "zig-random",
             .root_source_file = b.path(b.pathJoin(&.{ "src", "random", "random.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        lib = b.addObject(.{
+            .name = "zig-file",
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "file", "file.zig" })),
             .target = target,
             .optimize = optimize,
         });
