@@ -12,7 +12,7 @@ const builtin = @import("builtin");
 /// - 拼接后的新字符串，或者在失败时返回错误。
 pub fn AddString(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
     // 使用指定的分配器将两个字符串拼接成一个新字符串
-    return try std.mem.concat(allocator, u8, &[_][]const u8{ a, b });
+    return std.mem.concat(allocator, u8, &[_][]const u8{ a, b });
 }
 
 /// 函数用于将多个字符串拼接成一个新字符串。
@@ -25,7 +25,7 @@ pub fn AddString(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]
 /// - 拼接后的新字符串，或者在失败时返回错误。
 pub fn AddStrings(allocator: std.mem.Allocator, slices: []const []const u8) ![]u8 {
     // 使用指定的分配器将两个字符串拼接成一个新字符串
-    return try std.mem.concat(allocator, u8, slices);
+    return std.mem.concat(allocator, u8, slices);
 }
 
 /// 检查字符串 `a` 是否包含子字符串 `b`。
