@@ -41,3 +41,17 @@ pub fn Contains(a: []const u8, b: []const u8) bool {
 
     return found;
 }
+
+/// 比较两个字符串。
+///
+/// 参数:
+/// - context: 上下文参数，当前未使用。
+/// - a: 第一个要比较的字符串。
+/// - b: 第二个要比较的字符串。
+///
+/// 返回值:
+/// - 返回值: 如果 a 小于 b，则返回 true；否则返回 false。
+pub fn CompareStrings(context: void, a: []const u8, b: []const u8) bool {
+    _ = context; // 避免未使用参数的警告
+    return std.mem.lessThan(u8, a, b); // 使用 std.mem.lessThan 比较字符串
+}
