@@ -26,6 +26,6 @@ pub fn PrintString(comptime fmt: []const u8, args: []u8) void {
         std.debug.print(fmt, .{args});
     } else {
         //@compileError("错误: 格式化字符串中缺少 '{s}' 占位符。");
-        std.debug.print("错误: 格式化字符串中缺少 '{s}' 占位符。", .{});
+        std.debug.print("错误: 格式化字符串中缺少 '{s}' 占位符。", .{"{s}"});
     }
 }
