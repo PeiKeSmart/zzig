@@ -5,4 +5,4 @@ pub const Strings = @import("string/strings.zig");
 pub const DebugLog = @import("logs/debugLog.zig");
 
 /// 随机数处理
-pub const Randoms = @import("randoms/randoms.zig");
+pub const Randoms = @import("random/randoms.zig");
