@@ -61,14 +61,21 @@ const version_12 = struct {
 
         lib = b.addObject(.{
             .name = "zig-strings",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "strings.zig" })),
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "string", "strings.zig" })),
             .target = target,
             .optimize = optimize,
         });
 
         lib = b.addObject(.{
             .name = "zig-debugLog",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "debugLog.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        lib = b.addObject(.{
+            .name = "zig-random",
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "random", "random.zig" })),
             .target = target,
             .optimize = optimize,
         });

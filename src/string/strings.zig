@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// AddString 函数用于将两个字符串拼接成一个新字符串。
+/// 函数用于将两个字符串拼接成一个新字符串。
 ///
 /// 参数:
 /// - allocator: 用于分配内存的分配器。
@@ -15,7 +15,7 @@ pub fn AddString(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]
     return try std.mem.concat(allocator, u8, &[_][]const u8{ a, b });
 }
 
-/// AddStrings 函数用于将多个字符串拼接成一个新字符串。
+/// 函数用于将多个字符串拼接成一个新字符串。
 ///
 /// 参数:
 /// - allocator: 用于分配内存的分配器。
@@ -28,7 +28,7 @@ pub fn AddStrings(allocator: std.mem.Allocator, slices: []const []const u8) ![]u
     return try std.mem.concat(allocator, u8, slices);
 }
 
-/// Contains检查字符串 `a` 是否包含子字符串 `b`。
+/// 检查字符串 `a` 是否包含子字符串 `b`。
 ///
 /// 参数:
 /// - `a`: 要搜索的字符串。
