@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const strings = @import("strings.zig");
+const strings = @import("../zzig.zig").Strings;
 
 /// PrintStrings 打印字符串。
 ///
@@ -26,6 +26,6 @@ pub fn PrintString(comptime fmt: []const u8, args: []u8) void {
         std.debug.print(fmt, .{args});
     } else {
         //@compileError("错误: 格式化字符串中缺少 '{s}' 占位符。");
-        std.debug.print("错误: 格式化字符串中缺少 '{s}' 占位符。", .{"{s}"});
+        std.debug.print("Error: The '{s}' placeholder is missing from the formatted string.", .{"{s}"});
     }
 }
