@@ -13,8 +13,5 @@ pub fn CurrentPath(allocator: std.mem.Allocator) ![]u8 {
     const cwd = std.fs.cwd();
 
     // 获取当前工作目录的绝对路径
-    const real_path = try cwd.realpathAlloc(allocator, ".");
-    defer allocator.free(real_path);
-
-    return real_path;
+    return cwd.realpathAlloc(allocator, ".");
 }
