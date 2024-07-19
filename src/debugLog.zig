@@ -22,7 +22,6 @@ pub fn PrintStrings(args: []const []const u8) void {
 /// 返回:
 /// - 无返回值。
 pub fn PrintString(comptime fmt: []const u8, args: []u8) void {
-    std.debug.print("{s}\n", .{strings.Contains(fmt, "{s}")});
     if (strings.Contains(fmt, "{s}")) {
         std.debug.print(fmt, .{args});
     } else {
