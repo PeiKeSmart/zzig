@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const strings = @import("../strings.zig");
+const strings = @import("strings.zig");
 
 /// PrintStrings 打印字符串。
 ///

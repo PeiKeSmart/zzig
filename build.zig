@@ -38,7 +38,7 @@ const version_12 = struct {
         });
 
         _ = b.addModule("debugLog", .{
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "debugLog.zig" })),
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
         });
 
         _ = b.addModule("xtrace", .{
@@ -69,7 +69,7 @@ const version_12 = struct {
 
         lib = b.addObject(.{
             .name = "zig-debugLog",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "debugLog.zig" })),
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "debugLog.zig" })),
             .target = target,
             .optimize = optimize,
         });
