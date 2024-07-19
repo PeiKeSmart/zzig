@@ -60,7 +60,7 @@ const version_12 = struct {
     }
 
     fn generateDocs(b: *Build, optimize: OptimizeMode, target: Build.ResolvedTarget) void {
-        const lib = b.addObject(.{
+        var lib = b.addObject(.{
             .name = "zig-strings",
             .root_source_file = b.path(b.pathJoin(&.{ "src", "strings.zig" })),
             .target = target,
