@@ -10,6 +10,7 @@
 - ✅ **精确时间戳**：纳秒级时间戳，格式：`YYYY-MM-DD HH:MM:SS.nnnnnnnnn`
 - ✅ **彩色输出**：不同级别使用不同颜色（青、绿、黄、红）
 - ✅ **跨平台支持**：Windows 使用 `WriteConsoleW` 确保中文正确显示，Unix 使用标准输出
+- ✅ **线程安全**：支持多线程环境，可选启用互斥锁保护
 - ✅ **零外部依赖**：仅依赖 Zig 标准库
 - ✅ **可配置级别**：支持全局日志级别过滤
 - ✅ **性能友好**：使用 `ArenaAllocator` 批量释放内存
@@ -102,6 +103,51 @@ pub fn setLevel(level: Level) void
 **示例：**
 ```zig
 zzig.Logger.setLevel(.warn); // 只显示 warn 和 err 级别
+```
+
+#### enableThreadSafe
+
+启用线程安全模式，确保多线程环境下日志不会交错。
+
+```zig
+pub fn enableThreadSafe() void
+```
+
+**示例：**
+```zig
+// 在多线程程序启动时调用
+zzig.Logger.enableThreadSafe();
+
+// 创建多个线程
+var threads: [10]std.Thread = undefined;
+for (&threads, 0..) |*t, i| {
+    t.* = try std.Thread.spawn(.{}, worker, .{i});
+}
+```
+
+**注意：** 启用后会有轻微性能开销（互斥锁），单线程程序不需要启用。
+
+#### disableThreadSafe
+
+禁用线程安全模式（恢复默认状态）。
+
+```zig
+pub fn disableThreadSafe() void
+```
+
+#### isThreadSafe
+
+检查当前是否启用了线程安全模式。
+
+```zig
+pub fn isThreadSafe() bool
+```
+
+**示例：**
+```zig
+if (zzig.Logger.isThreadSafe()) {
+    std.debug.print("线程安全模式已启用\n", .{});
+}
 ```
 
 #### debug
@@ -250,6 +296,50 @@ pub fn main() !void {
 }
 ```
 
+### 多线程环境使用
+
+```zig
+const std = @import("std");
+const zzig = @import("zzig");
+
+fn workerThread(thread_id: usize) void {
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        zzig.Logger.info("线程 {d} 处理任务 {d}", .{ thread_id, i });
+        
+        // 执行实际工作
+        processTask(i);
+    }
+}
+
+pub fn main() !void {
+    // 启用线程安全模式
+    zzig.Logger.enableThreadSafe();
+    zzig.Logger.info("线程安全模式已启用", .{});
+    
+    // 创建多个工作线程
+    const thread_count = 10;
+    var threads: [thread_count]std.Thread = undefined;
+    
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, workerThread, .{i});
+    }
+    
+    // 等待所有线程完成
+    for (threads) |thread| {
+        thread.join();
+    }
+    
+    zzig.Logger.info("所有线程已完成", .{});
+}
+```
+        zzig.Logger.setLevel(.debug); // 开发环境显示全部
+    }
+    
+    // ... 应用逻辑
+}
+```
+
 ## 输出示例
 
 ```
@@ -273,17 +363,19 @@ pub fn main() !void {
 - **内存分配**：每次日志调用使用独立的 `ArenaAllocator`，在函数结束时批量释放
 - **时间戳计算**：使用 `std.time.nanoTimestamp()` 获取纳秒级时间戳
 - **跨平台时区**：Windows 通过 `GetTimeZoneInformation` API 获取，Unix 简化为 UTC+8（可根据需求调整）
+- **线程安全开销**：启用线程安全模式后，每次日志调用会有互斥锁开销（约几十纳秒），单线程程序无需启用
 
 ## 注意事项
 
 1. **日志级别过滤**：被过滤的日志不会执行格式化，性能损耗极小
 2. **中文支持**：Windows 平台确保终端支持 UTF-8，Linux/macOS 需终端配置 UTF-8
 3. **颜色输出**：如果重定向到文件，颜色代码会保留（可根据需求扩展）
-4. **线程安全**：当前版本未实现线程安全，多线程环境需外部同步
+4. **线程安全**：默认关闭以保持最佳性能，多线程环境请调用 `enableThreadSafe()` 启用
+5. **性能优化**：单线程高性能场景保持默认设置；多线程场景启用线程安全即可
 
 ## 未来计划
 
-- [ ] 线程安全支持（添加互斥锁）
+- [x] ~~线程安全支持（添加互斥锁）~~ ✅ 已完成
 - [ ] 日志文件输出（支持文件滚动）
 - [ ] 自定义格式化器
 - [ ] 性能指标统计

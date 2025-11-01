@@ -5,6 +5,9 @@ pub fn main() void {
     // 设置全局日志级别（可选，默认为 debug）
     zzig.Logger.setLevel(.info);
 
+    // 如果是多线程程序，启用线程安全
+    // zzig.Logger.enableThreadSafe();
+
     // 使用不同级别的日志
     zzig.Logger.debug("这是一条调试信息（因为级别设置为 info，此条不会显示）", .{});
     zzig.Logger.info("应用程序启动成功", .{});

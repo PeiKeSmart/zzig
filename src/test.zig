@@ -73,3 +73,38 @@ test "File - CurrentPath returns non-empty path" {
 
     try testing.expect(path.len > 0);
 }
+
+// Logger 线程安全测试
+test "Logger - thread safe enable/disable" {
+    // 默认应该是关闭的
+    try testing.expect(!zzig.Logger.isThreadSafe());
+
+    // 启用线程安全
+    zzig.Logger.enableThreadSafe();
+    try testing.expect(zzig.Logger.isThreadSafe());
+
+    // 禁用线程安全
+    zzig.Logger.disableThreadSafe();
+    try testing.expect(!zzig.Logger.isThreadSafe());
+}
+
+test "Logger - basic logging functions work" {
+    // 这个测试主要确保日志函数不会崩溃
+    zzig.Logger.setLevel(.debug);
+
+    zzig.Logger.debug("Test debug message", .{});
+    zzig.Logger.info("Test info message", .{});
+    zzig.Logger.warn("Test warn message", .{});
+    zzig.Logger.err("Test error message", .{});
+    zzig.Logger.always("Test always message", .{});
+    zzig.Logger.print("Test print\n", .{});
+}
+
+test "Logger - thread safe mode does not crash" {
+    zzig.Logger.enableThreadSafe();
+    defer zzig.Logger.disableThreadSafe();
+
+    zzig.Logger.info("Thread safe test", .{});
+    zzig.Logger.debug("With multiple", .{});
+    zzig.Logger.warn("Different levels", .{});
+}

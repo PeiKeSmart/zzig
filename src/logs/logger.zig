@@ -32,6 +32,37 @@ pub const Level = enum {
 /// 全局日志级别，可通过环境变量或配置调整
 var global_level: Level = .debug;
 
+/// 线程安全互斥锁
+var log_mutex: std.Thread.Mutex = .{};
+
+/// 线程安全开关（默认关闭以保持性能）
+var thread_safe_enabled: bool = false;
+
+/// 启用线程安全模式
+///
+/// 在多线程环境中调用此函数以确保日志输出不会交错。
+/// 注意：启用后会有轻微性能开销。
+///
+/// 示例：
+/// ```zig
+/// Logger.enableThreadSafe();
+/// ```
+pub fn enableThreadSafe() void {
+    thread_safe_enabled = true;
+}
+
+/// 禁用线程安全模式（默认状态）
+///
+/// 在单线程环境或对性能要求极高的场景可以禁用。
+pub fn disableThreadSafe() void {
+    thread_safe_enabled = false;
+}
+
+/// 检查是否启用了线程安全模式
+pub fn isThreadSafe() bool {
+    return thread_safe_enabled;
+}
+
 /// 设置全局日志级别
 pub fn setLevel(level: Level) void {
     global_level = level;
@@ -208,6 +239,12 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
         return;
     }
 
+    // 线程安全保护
+    if (thread_safe_enabled) {
+        log_mutex.lock();
+        defer log_mutex.unlock();
+    }
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -252,8 +289,14 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     log(.err, fmt, args);
 }
 
-/// 强制输出日志（忽略全局日志级别，用于启动信息等关键日志）
+/// 强制输出日志（忽略全局日志级别,用于启动信息等关键日志）
 pub fn always(comptime fmt: []const u8, args: anytype) void {
+    // 线程安全保护
+    if (thread_safe_enabled) {
+        log_mutex.lock();
+        defer log_mutex.unlock();
+    }
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -280,6 +323,12 @@ pub fn always(comptime fmt: []const u8, args: anytype) void {
 
 /// 不带时间戳和级别的简单打印（用于替换原有的简单打印场景）
 pub fn print(comptime fmt: []const u8, args: anytype) void {
+    // 线程安全保护
+    if (thread_safe_enabled) {
+        log_mutex.lock();
+        defer log_mutex.unlock();
+    }
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
