@@ -79,6 +79,86 @@ const version_15 = struct {
         const config_demo_step = b.step("config-demo", "Run async logger with config file demo");
         config_demo_step.dependOn(&run_config_demo.step);
 
+        // 文件输出测试程序
+        const file_output_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "async_logger_file_output.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        file_output_demo_module.addImport("zzig", zzig);
+
+        const file_output_demo = b.addExecutable(.{
+            .name = "async_logger_file_output_demo",
+            .root_module = file_output_demo_module,
+        });
+        b.installArtifact(file_output_demo);
+
+        const run_file_output_demo = b.addRunArtifact(file_output_demo);
+        run_file_output_demo.step.dependOn(b.getInstallStep());
+
+        const file_output_demo_step = b.step("file-demo", "Run async logger file output demo");
+        file_output_demo_step.dependOn(&run_file_output_demo.step);
+
+        // 日志轮转压力测试程序
+        const rotation_test_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "async_logger_rotation_test.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        rotation_test_module.addImport("zzig", zzig);
+
+        const rotation_test = b.addExecutable(.{
+            .name = "async_logger_rotation_test",
+            .root_module = rotation_test_module,
+        });
+        b.installArtifact(rotation_test);
+
+        const run_rotation_test = b.addRunArtifact(rotation_test);
+        run_rotation_test.step.dependOn(b.getInstallStep());
+
+        const rotation_test_step = b.step("rotation-test", "Run async logger rotation stress test");
+        rotation_test_step.dependOn(&run_rotation_test.step);
+
+        // both模式测试程序
+        const both_test_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "async_logger_both_mode_test.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        both_test_module.addImport("zzig", zzig);
+
+        const both_test = b.addExecutable(.{
+            .name = "async_logger_both_test",
+            .root_module = both_test_module,
+        });
+        b.installArtifact(both_test);
+
+        const run_both_test = b.addRunArtifact(both_test);
+        run_both_test.step.dependOn(b.getInstallStep());
+
+        const both_test_step = b.step("both-test", "Run async logger both mode test");
+        both_test_step.dependOn(&run_both_test.step);
+
+        // 零分配模式演示程序（推荐 ARM 设备）
+        const zero_alloc_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "async_logger_zero_alloc_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        zero_alloc_demo_module.addImport("zzig", zzig);
+
+        const zero_alloc_demo = b.addExecutable(.{
+            .name = "async_logger_zero_alloc_demo",
+            .root_module = zero_alloc_demo_module,
+        });
+        b.installArtifact(zero_alloc_demo);
+
+        const run_zero_alloc_demo = b.addRunArtifact(zero_alloc_demo);
+        run_zero_alloc_demo.step.dependOn(b.getInstallStep());
+
+        const zero_alloc_demo_step = b.step("zero-alloc-demo", "Run async logger zero allocation demo (recommended for ARM devices)");
+        zero_alloc_demo_step.dependOn(&run_zero_alloc_demo.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

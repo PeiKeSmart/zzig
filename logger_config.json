@@ -1,9 +1,28 @@
 {
-  "queue_capacity": 8192,
-  "min_level": "info",
-  "output_target": "console",
+  "queue_capacity": 16384,
+  "_queue_capacity_comment": "环形队列容量,必须是2的幂次 (1024/2048/4096/8192/16384/32768/65536)",
+
+  "min_level": "debug",
+  "_min_level_comment": "最低日志级别 (debug/info/warn/err)",
+
+  "output_target": "both",
+  "_output_target_comment": "输出目标 (console/file/both)",
+
   "log_file_path": "logs/app.log",
-  "batch_size": 50,
-  "drop_rate_warning_threshold": 5.0,
-  "enable_statistics": true
+  "_log_file_path_comment": "日志文件路径 (当 output_target 为 file 或 both 时使用)",
+
+  "batch_size": 100,
+  "_batch_size_comment": "批处理大小 (工作线程每次处理的最大消息数)",
+
+  "drop_rate_warning_threshold": 10,
+  "_drop_rate_warning_threshold_comment": "丢弃告警阈值 (0-100,超过此丢弃率时打印警告)",
+
+  "enable_statistics": true,
+  "_enable_statistics_comment": "是否启用性能监控统计",
+
+  "max_file_size": 1048576,
+  "_max_file_size_comment": "日志文件最大大小 (字节), 超过此值触发轮转, 0 表示不限制 (1MB 用于测试轮转)",
+
+  "max_backup_files": 3,
+  "_max_backup_files_comment": "保留的旧日志文件数量 (0-100)"
 }

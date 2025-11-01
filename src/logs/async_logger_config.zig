@@ -88,6 +88,12 @@ pub const AsyncLoggerConfig = struct {
     /// 是否启用性能监控统计
     enable_statistics: bool = true,
 
+    /// 日志文件最大大小 (字节), 超过此值触发轮转, 0 表示不限制
+    max_file_size: u64 = 100 * 1024 * 1024, // 默认 100MB
+
+    /// 保留的旧日志文件数量
+    max_backup_files: u32 = 5,
+
     allocator: std.mem.Allocator,
 
     /// 标记 log_file_path 是否需要释放 (解决内存泄漏问题)
@@ -187,7 +193,12 @@ pub const AsyncLoggerConfig = struct {
         }
 
         if (root.get("drop_rate_warning_threshold")) |v| {
-            config.drop_rate_warning_threshold = @floatCast(v.float);
+            // 支持整数和浮点数
+            config.drop_rate_warning_threshold = switch (v) {
+                .integer => @floatFromInt(v.integer),
+                .float => @floatCast(v.float),
+                else => 10.0,
+            };
             // 验证范围 (0.0 - 100.0)
             if (config.drop_rate_warning_threshold < 0.0) {
                 std.debug.print("⚠️  drop_rate_warning_threshold 必须 >= 0.0,使用默认值 10.0\n", .{});
@@ -202,6 +213,29 @@ pub const AsyncLoggerConfig = struct {
             config.enable_statistics = v.bool;
         }
 
+        if (root.get("max_file_size")) |v| {
+            config.max_file_size = @intCast(v.integer);
+            // 验证范围 (最小 1MB, 最大 10GB)
+            const min_size: u64 = 1024 * 1024; // 1MB
+            const max_size: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+            if (config.max_file_size < min_size) {
+                std.debug.print("⚠️  max_file_size 过小,使用最小值 1MB\n", .{});
+                config.max_file_size = min_size;
+            } else if (config.max_file_size > max_size) {
+                std.debug.print("⚠️  max_file_size 过大,使用最大值 10GB\n", .{});
+                config.max_file_size = max_size;
+            }
+        }
+
+        if (root.get("max_backup_files")) |v| {
+            config.max_backup_files = @intCast(v.integer);
+            // 验证范围 (0-100)
+            if (config.max_backup_files > 100) {
+                std.debug.print("⚠️  max_backup_files 过大,使用最大值 100\n", .{});
+                config.max_backup_files = 100;
+            }
+        }
+
         return config;
     }
 
@@ -209,8 +243,8 @@ pub const AsyncLoggerConfig = struct {
     pub fn saveToFile(self: AsyncLoggerConfig, config_path: []const u8) !void {
         // 确保目录存在
         if (fs.path.dirname(config_path)) |dir| {
-            fs.cwd().makePath(dir) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
+            fs.cwd().makePath(dir) catch |make_err| {
+                if (make_err != error.PathAlreadyExists) return make_err;
             };
         }
 
@@ -219,9 +253,9 @@ pub const AsyncLoggerConfig = struct {
         defer file.close();
 
         // 使用动态缓冲区避免溢出
-        var buffer = std.ArrayList(u8).init(self.allocator);
-        defer buffer.deinit();
-        const writer = buffer.writer();
+        var buffer: std.ArrayList(u8) = .{};
+        defer buffer.deinit(self.allocator);
+        const writer = buffer.writer(self.allocator);
 
         // 写入格式化的 JSON (带注释说明)
         try writer.writeAll("{\n");
@@ -250,7 +284,15 @@ pub const AsyncLoggerConfig = struct {
         try writer.writeAll("\n");
 
         try writer.print("  \"enable_statistics\": {},\n", .{self.enable_statistics});
-        try writer.writeAll("  \"_enable_statistics_comment\": \"是否启用性能监控统计\"\n");
+        try writer.writeAll("  \"_enable_statistics_comment\": \"是否启用性能监控统计\",\n");
+        try writer.writeAll("\n");
+
+        try writer.print("  \"max_file_size\": {d},\n", .{self.max_file_size});
+        try writer.writeAll("  \"_max_file_size_comment\": \"日志文件最大大小 (字节), 超过此值触发轮转, 0 表示不限制\",\n");
+        try writer.writeAll("\n");
+
+        try writer.print("  \"max_backup_files\": {d},\n", .{self.max_backup_files});
+        try writer.writeAll("  \"_max_backup_files_comment\": \"保留的旧日志文件数量 (0-100)\"\n");
 
         try writer.writeAll("}\n");
 
@@ -276,6 +318,8 @@ pub const AsyncLoggerConfig = struct {
         std.debug.print("  批处理量: {d}\n", .{self.batch_size});
         std.debug.print("  告警阈值: {d:.1}%\n", .{self.drop_rate_warning_threshold});
         std.debug.print("  性能统计: {}\n", .{self.enable_statistics});
+        std.debug.print("  最大文件: {d} MB\n", .{self.max_file_size / 1024 / 1024});
+        std.debug.print("  保留备份: {d}\n", .{self.max_backup_files});
         std.debug.print("\n", .{});
     }
 };
