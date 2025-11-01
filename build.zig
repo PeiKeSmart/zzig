@@ -2,7 +2,7 @@ const std = @import("std");
 
 const builtin = @import("builtin");
 
-const min_zig_string = "0.12.0";
+const min_zig_string = "0.15.2";
 
 const current_zig = builtin.zig_version;
 
@@ -19,12 +19,12 @@ comptime {
 
 pub fn build(b: *std.Build) void {
     switch (current_zig.minor) {
-        12, 13, 14 => version_12.build(b),
+        15 => version_15.build(b),
         else => @compileError("unknown version!"),
     }
 }
 
-const version_12 = struct {
+const version_15 = struct {
     const Build = std.Build;
     const Module = Build.Module;
     const OptimizeMode = std.builtin.OptimizeMode;
@@ -41,58 +41,46 @@ const version_12 = struct {
 
         const test_step = b.step("test", "Run unit tests");
 
-        const zzig_unit_tests = b.addTest(.{
+        // 创建测试模块
+        const test_module = b.createModule(.{
             .root_source_file = b.path(b.pathJoin(&.{ "src", "test.zig" })),
             .target = target,
             .optimize = optimize,
         });
-        zzig_unit_tests.root_module.addImport("zzig", zzig);
+        test_module.addImport("zzig", zzig);
+
+        const zzig_unit_tests = b.addTest(.{
+            .name = "zzig-tests",
+            .root_module = test_module,
+        });
+
         const run_zzig_tests = b.addRunArtifact(zzig_unit_tests);
         test_step.dependOn(&run_zzig_tests.step);
     }
-
     fn generateDocs(b: *Build, optimize: OptimizeMode, target: Build.ResolvedTarget) void {
-        var lib = b.addObject(.{
-            .name = "zig-zzig",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
+        const sources = [_]struct { name: []const u8, path: []const []const u8 }{
+            .{ .name = "zig-zzig", .path = &.{ "src", "zzig.zig" } },
+            .{ .name = "zig-strings", .path = &.{ "src", "string", "strings.zig" } },
+            .{ .name = "zig-debugLog", .path = &.{ "src", "logs", "debugLog.zig" } },
+            .{ .name = "zig-xtrace", .path = &.{ "src", "logs", "xtrace.zig" } },
+            .{ .name = "zig-random", .path = &.{ "src", "random", "randoms.zig" } },
+            .{ .name = "zig-file", .path = &.{ "src", "file", "file.zig" } },
+        };
 
-        lib = b.addObject(.{
-            .name = "zig-strings",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "string", "strings.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
+        var lib: *Build.Step.Compile = undefined;
+        for (sources, 0..) |source, i| {
+            const module = b.createModule(.{
+                .root_source_file = b.path(b.pathJoin(source.path)),
+                .target = target,
+                .optimize = optimize,
+            });
 
-        lib = b.addObject(.{
-            .name = "zig-debugLog",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "debugLog.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        lib = b.addObject(.{
-            .name = "zig-xtrace",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "logs", "xtrace.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        lib = b.addObject(.{
-            .name = "zig-random",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "random", "random.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        lib = b.addObject(.{
-            .name = "zig-file",
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "file", "file.zig" })),
-            .target = target,
-            .optimize = optimize,
-        });
+            lib = b.addObject(.{
+                .name = source.name,
+                .root_module = module,
+            });
+            if (i == sources.len - 1) break;
+        }
 
         const docs_step = b.step("docs", "Emit docs");
 
