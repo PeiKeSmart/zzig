@@ -1,2 +1,6 @@
+# Zig 编译缓存
 .zig-cache/**
 zig-cache/**
+
+# Zig 构建输出（文档、可执行文件、库文件等）
+zig-out/**
