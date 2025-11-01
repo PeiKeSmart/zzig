@@ -61,8 +61,6 @@ const version_15 = struct {
         const sources = [_]struct { name: []const u8, path: []const []const u8 }{
             .{ .name = "zig-zzig", .path = &.{ "src", "zzig.zig" } },
             .{ .name = "zig-strings", .path = &.{ "src", "string", "strings.zig" } },
-            .{ .name = "zig-debugLog", .path = &.{ "src", "logs", "debugLog.zig" } },
-            .{ .name = "zig-xtrace", .path = &.{ "src", "logs", "xtrace.zig" } },
             .{ .name = "zig-logger", .path = &.{ "src", "logs", "logger.zig" } },
             .{ .name = "zig-random", .path = &.{ "src", "random", "randoms.zig" } },
             .{ .name = "zig-file", .path = &.{ "src", "file", "file.zig" } },

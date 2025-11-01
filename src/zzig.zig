@@ -1,12 +1,6 @@
 /// 字符串处理
 pub const Strings = @import("string/strings.zig");
 
-/// Debug日志处理
-pub const DebugLog = @import("logs/debugLog.zig");
-
-/// 专属日志处理
-pub const XTrace = @import("logs/xtrace.zig");
-
 /// 结构化日志处理（支持多级别、时间戳、跨平台）
 pub const Logger = @import("logs/logger.zig");
 
