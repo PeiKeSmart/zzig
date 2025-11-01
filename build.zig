@@ -39,6 +39,46 @@ const version_15 = struct {
 
         generateDocs(b, optimize, target);
 
+        // 异步日志器演示程序
+        const async_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "async_logger_test.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        async_demo_module.addImport("zzig", zzig);
+
+        const async_demo = b.addExecutable(.{
+            .name = "async_logger_demo",
+            .root_module = async_demo_module,
+        });
+        b.installArtifact(async_demo);
+
+        const run_async_demo = b.addRunArtifact(async_demo);
+        run_async_demo.step.dependOn(b.getInstallStep());
+
+        const async_demo_step = b.step("async-demo", "Run async logger demo");
+        async_demo_step.dependOn(&run_async_demo.step);
+
+        // 配置文件示例程序
+        const config_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "async_logger_with_config.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        config_demo_module.addImport("zzig", zzig);
+
+        const config_demo = b.addExecutable(.{
+            .name = "async_logger_config_demo",
+            .root_module = config_demo_module,
+        });
+        b.installArtifact(config_demo);
+
+        const run_config_demo = b.addRunArtifact(config_demo);
+        run_config_demo.step.dependOn(b.getInstallStep());
+
+        const config_demo_step = b.step("config-demo", "Run async logger with config file demo");
+        config_demo_step.dependOn(&run_config_demo.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

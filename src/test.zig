@@ -108,3 +108,94 @@ test "Logger - thread safe mode does not crash" {
     zzig.Logger.debug("With multiple", .{});
     zzig.Logger.warn("Different levels", .{});
 }
+
+// AsyncLogger 测试
+test "AsyncLogger - RingQueue basic operations" {
+    const allocator = testing.allocator;
+
+    var queue = try zzig.AsyncLogger.RingQueue.init(allocator, 4);
+    defer queue.deinit();
+
+    // 测试空队列
+    try testing.expect(queue.isEmpty());
+    try testing.expectEqual(@as(usize, 0), queue.size());
+
+    // 测试推入
+    const msg1 = zzig.AsyncLogger.LogMessage.init(.info, 12345, "test message 1");
+    try testing.expect(queue.tryPush(msg1));
+    try testing.expectEqual(@as(usize, 1), queue.size());
+
+    // 测试弹出
+    const popped = queue.tryPop().?;
+    try testing.expectEqual(zzig.AsyncLogger.Level.info, popped.level);
+    try testing.expectEqual(@as(usize, 0), queue.size());
+
+    // 测试队列满
+    for (0..3) |_| {
+        _ = queue.tryPush(msg1);
+    }
+    try testing.expect(!queue.tryPush(msg1)); // 第4次应该失败（容量3）
+}
+
+test "AsyncLogger - basic initialization and cleanup" {
+    const allocator = testing.allocator;
+
+    const config = zzig.AsyncLogger.AsyncLoggerConfig{
+        .queue_capacity = 16,
+        .idle_sleep_us = 100,
+    };
+
+    const logger = try zzig.AsyncLogger.AsyncLogger.init(allocator, config);
+    defer logger.deinit();
+
+    try testing.expect(logger.getProcessedCount() == 0);
+    try testing.expect(logger.getDroppedCount() == 0);
+}
+
+test "AsyncLogger - log messages are queued" {
+    const allocator = testing.allocator;
+
+    const config = zzig.AsyncLogger.AsyncLoggerConfig{
+        .queue_capacity = 128,
+        .global_level = .debug,
+    };
+
+    const logger = try zzig.AsyncLogger.AsyncLogger.init(allocator, config);
+    defer logger.deinit();
+
+    // 发送一些日志
+    logger.info("Test message 1", .{});
+    logger.debug("Test message 2", .{});
+    logger.warn("Test message 3", .{});
+
+    // 短暂等待后台处理
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // 验证已处理（可能还有未处理的）
+    try testing.expect(logger.getProcessedCount() > 0);
+}
+
+test "AsyncLogger - level filtering works" {
+    const allocator = testing.allocator;
+
+    const config = zzig.AsyncLogger.AsyncLoggerConfig{
+        .queue_capacity = 128,
+        .global_level = .warn, // 只记录 warn 及以上
+    };
+
+    const logger = try zzig.AsyncLogger.AsyncLogger.init(allocator, config);
+    defer logger.deinit();
+
+    // 这些应该被过滤
+    logger.debug("Filtered debug", .{});
+    logger.info("Filtered info", .{});
+
+    // 这些应该被记录
+    logger.warn("Logged warn", .{});
+    logger.err("Logged error", .{});
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // 应该只有 2 条被处理
+    try testing.expectEqual(@as(usize, 2), logger.getProcessedCount());
+}

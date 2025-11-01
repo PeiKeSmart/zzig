@@ -1,0 +1,9 @@
+{
+  "queue_capacity": 8192,
+  "min_level": "info",
+  "output_target": "console",
+  "log_file_path": "logs/app.log",
+  "batch_size": 50,
+  "drop_rate_warning_threshold": 5.0,
+  "enable_statistics": true
+}
