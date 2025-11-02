@@ -15,3 +15,6 @@ pub const Randoms = @import("random/randoms.zig");
 
 /// 文件及文件夹处理
 pub const File = @import("file/file.zig");
+
+/// 控制台工具（UTF-8 编码、ANSI 颜色支持、跨平台兼容）
+pub const Console = @import("console/console.zig");

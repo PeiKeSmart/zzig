@@ -159,6 +159,26 @@ const version_15 = struct {
         const zero_alloc_demo_step = b.step("zero-alloc-demo", "Run async logger zero allocation demo (recommended for ARM devices)");
         zero_alloc_demo_step.dependOn(&run_zero_alloc_demo.step);
 
+        // 控制台工具演示程序（UTF-8 + ANSI 颜色）
+        const console_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "console_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        console_demo_module.addImport("zzig", zzig);
+
+        const console_demo = b.addExecutable(.{
+            .name = "console_example",
+            .root_module = console_demo_module,
+        });
+        b.installArtifact(console_demo);
+
+        const run_console_demo = b.addRunArtifact(console_demo);
+        run_console_demo.step.dependOn(b.getInstallStep());
+
+        const console_demo_step = b.step("console-demo", "Run console utility demo (UTF-8 + ANSI colors)");
+        console_demo_step.dependOn(&run_console_demo.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块
