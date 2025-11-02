@@ -6,6 +6,10 @@ const windows = std.os.windows;
 extern "kernel32" fn SetConsoleOutputCP(wCodePageID: u32) callconv(@import("std").builtin.CallingConvention.winapi) windows.BOOL;
 extern "kernel32" fn SetConsoleCP(wCodePageID: u32) callconv(@import("std").builtin.CallingConvention.winapi) windows.BOOL;
 
+/// 全局初始化状态（线程安全）
+var init_once = std.once(initImpl);
+var global_init_result: InitResult = .{};
+
 /// 控制台功能标志
 pub const ConsoleFeatures = packed struct {
     /// 启用 UTF-8 编码
@@ -32,12 +36,15 @@ pub const InitResult = struct {
 /// - **Windows**: 设置代码页为 UTF-8 (65001)，启用虚拟终端处理（ANSI 转义序列）
 /// - **Unix/Linux/macOS**: 通常默认支持，无需特殊处理
 ///
+/// # 线程安全
+/// - 多线程并发调用安全，使用 `std.once` 确保只初始化一次
+///
 /// # 示例
 /// ```zig
 /// const console = @import("console");
 ///
 /// pub fn main() !void {
-///     // 启用所有功能
+///     // 启用所有功能（多次调用安全）
 ///     const result = console.init(.{});
 ///     defer console.deinit(result);
 ///
@@ -53,6 +60,15 @@ pub const InitResult = struct {
 /// # 返回
 /// - `InitResult`: 初始化结果，包含各功能的启用状态
 pub fn init(features: ConsoleFeatures) InitResult {
+    // 使用 std.once 确保线程安全的单次初始化
+    init_once.call();
+    _ = features; // 当前忽略参数，全局初始化使用默认配置
+    return global_init_result;
+}
+
+/// 内部实现：实际的初始化逻辑（仅执行一次）
+fn initImpl() void {
+    const features = ConsoleFeatures{}; // 默认全部启用
     var result = InitResult{};
 
     if (builtin.os.tag == .windows) {
@@ -92,7 +108,7 @@ pub fn init(features: ConsoleFeatures) InitResult {
         result.ansi_enabled = true;
     }
 
-    return result;
+    global_init_result = result;
 }
 
 /// 恢复控制台原始设置（可选）

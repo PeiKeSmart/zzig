@@ -18,3 +18,9 @@ pub const File = @import("file/file.zig");
 
 /// 控制台工具（UTF-8 编码、ANSI 颜色支持、跨平台兼容）
 pub const Console = @import("console/console.zig");
+
+/// MPMC 队列（多生产者多消费者无锁队列）
+pub const MPMCQueue = @import("logs/mpmc_queue.zig").MPMCQueue;
+
+/// 结构化日志（JSON 格式）
+pub const StructuredLog = @import("logs/structured_log.zig");

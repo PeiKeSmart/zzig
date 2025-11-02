@@ -50,22 +50,30 @@ pub const LogMessage = struct {
     }
 };
 
-/// 无锁环形队列（单生产者单消费者）
+/// 无锁环形队列（单生产者单消费者 - SPSC）
+///
+/// 注意: 此队列假定只有一个生产者线程和一个消费者线程。
+/// 多生产者或多消费者场景会导致数据竞争。
 pub const RingQueue = struct {
     buffer: []LogMessage,
     capacity: usize,
+    capacity_mask: usize, // 容量掩码,用于快速取模(容量必须是2的幂)
     write_pos: std.atomic.Value(usize),
     read_pos: std.atomic.Value(usize),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !RingQueue {
-        // 容量必须是 2 的幂，便于位运算优化
-        const actual_capacity = std.math.ceilPowerOfTwo(usize, capacity) catch capacity;
+        // 强制容量为 2 的幂,至少 4,便于位运算优化
+        // 测试环境允许小容量,生产环境建议 >= 256
+        const actual_capacity = std.math.ceilPowerOfTwo(usize, @max(capacity, 4)) catch {
+            return error.CapacityTooLarge;
+        };
         const buffer = try allocator.alloc(LogMessage, actual_capacity);
 
         return RingQueue{
             .buffer = buffer,
             .capacity = actual_capacity,
+            .capacity_mask = actual_capacity - 1, // 2的幂减1得到掩码
             .write_pos = std.atomic.Value(usize).init(0),
             .read_pos = std.atomic.Value(usize).init(0),
             .allocator = allocator,
@@ -77,41 +85,52 @@ pub const RingQueue = struct {
     }
 
     /// 尝试推入消息（非阻塞，失败返回 false）
+    ///
+    /// 内存序说明:
+    /// - write_pos.load(.monotonic): 只需保证读到单调递增的值
+    /// - read_pos.load(.acquire): 同步消费者对 read_pos 的更新
+    /// - write_pos.store(.release): 发布写入,确保 buffer 写入对消费者可见
     pub fn tryPush(self: *RingQueue, msg: LogMessage) bool {
-        const write = self.write_pos.load(.acquire);
+        const write = self.write_pos.load(.monotonic);
         const read = self.read_pos.load(.acquire);
 
-        // 计算下一个写位置
-        const next = (write + 1) % self.capacity;
+        // 使用位运算计算下一个写位置(快速取模)
+        const next = (write + 1) & self.capacity_mask;
 
-        // 队列满
+        // 队列满: next == read 表示写指针追上读指针
         if (next == read) {
             return false;
         }
 
-        // 写入消息
-        self.buffer[write] = msg;
+        // 写入消息到当前位置
+        self.buffer[write & self.capacity_mask] = msg;
 
-        // 更新写指针
+        // 使用 .release 确保上面的写入在此之前完成
+        // .release 语义保证所有前序写入对后续 acquire 可见
         self.write_pos.store(next, .release);
         return true;
     }
 
     /// 尝试弹出消息（非阻塞，队列空返回 null）
+    ///
+    /// 内存序说明:
+    /// - read_pos.load(.monotonic): 只需保证读到单调递增的值
+    /// - write_pos.load(.acquire): 同步生产者的写入,确保能读到最新数据
+    /// - read_pos.store(.release): 发布读取位置,让生产者知道可复用空间
     pub fn tryPop(self: *RingQueue) ?LogMessage {
-        const read = self.read_pos.load(.acquire);
+        const read = self.read_pos.load(.monotonic);
         const write = self.write_pos.load(.acquire);
 
-        // 队列空
+        // 队列空: read == write 表示读指针追上写指针
         if (read == write) {
             return null;
         }
 
-        // 读取消息
-        const msg = self.buffer[read];
+        // .acquire 保证能读到生产者写入的最新数据
+        const msg = self.buffer[read & self.capacity_mask];
 
-        // 更新读指针
-        const next = (read + 1) % self.capacity;
+        // 更新读指针,通知生产者可以复用空间
+        const next = (read + 1) & self.capacity_mask;
         self.read_pos.store(next, .release);
 
         return msg;
@@ -119,18 +138,17 @@ pub const RingQueue = struct {
 
     /// 获取当前队列大小（近似值，因为无锁）
     pub fn size(self: *RingQueue) usize {
-        const write = self.write_pos.load(.acquire);
-        const read = self.read_pos.load(.acquire);
-        if (write >= read) {
-            return write - read;
-        }
-        return self.capacity - read + write;
+        const write = self.write_pos.load(.monotonic);
+        const read = self.read_pos.load(.monotonic);
+
+        // 使用位运算计算环形队列大小
+        return (write -% read) & self.capacity_mask;
     }
 
     /// 检查队列是否为空
     pub fn isEmpty(self: *RingQueue) bool {
-        const read = self.read_pos.load(.acquire);
-        const write = self.write_pos.load(.acquire);
+        const read = self.read_pos.load(.monotonic);
+        const write = self.write_pos.load(.monotonic);
         return read == write;
     }
 };
@@ -192,6 +210,10 @@ pub const AsyncLogger = struct {
     drop_rate_warning_threshold: f32,
     max_file_size: u64,
     max_backup_files: u32,
+
+    // 文件轮转保护
+    rotation_mutex: std.Thread.Mutex,
+    is_rotating: std.atomic.Value(bool),
 
     // 零分配模式：工作线程预分配缓冲区
     worker_format_buffer: []u8,
@@ -284,6 +306,8 @@ pub const AsyncLogger = struct {
             .drop_rate_warning_threshold = 10.0,
             .max_file_size = 100 * 1024 * 1024,
             .max_backup_files = 5,
+            .rotation_mutex = std.Thread.Mutex{},
+            .is_rotating = std.atomic.Value(bool).init(false),
             .worker_format_buffer = worker_format_buffer,
             .worker_utf16_buffer = worker_utf16_buffer,
             .worker_file_buffer_data = worker_file_buffer_data,
@@ -444,13 +468,30 @@ pub const AsyncLogger = struct {
     }
 
     /// 检查是否需要轮转日志文件
+    ///
+    /// 使用原子标志和互斥锁防止并发轮转竞态条件
     fn checkRotation(self: *AsyncLogger) !void {
         if (self.max_file_size == 0) return; // 0 表示不限制
 
         const current_size = self.current_file_size.load(.acquire);
-        if (current_size >= self.max_file_size) {
-            try self.rotateLogFile();
+        if (current_size < self.max_file_size) return;
+
+        // 原子检查并设置轮转标志(防止多线程同时轮转)
+        const was_rotating = self.is_rotating.swap(true, .acq_rel);
+        if (was_rotating) return; // 已有线程在轮转,退出
+
+        defer self.is_rotating.store(false, .release);
+
+        // 二次确认(Double-Check),避免误触发
+        if (self.current_file_size.load(.acquire) < self.max_file_size) {
+            return;
         }
+
+        // 加锁执行轮转操作
+        self.rotation_mutex.lock();
+        defer self.rotation_mutex.unlock();
+
+        try self.rotateLogFile();
     }
 
     /// 轮转日志文件
@@ -671,7 +712,11 @@ pub const AsyncLogger = struct {
         const last_flush = self.last_flush_time.load(.acquire);
 
         if (new_len > buffer_threshold or (now - last_flush) > 100) { // 100ms 超时
-            try self.flushFileBuffer();
+            // 捕获错误,避免刷盘失败导致数据丢失
+            self.flushFileBuffer() catch |flush_err| {
+                std.debug.print("⚠️  文件刷新失败: {}\n", .{flush_err});
+                // 注意: 缓冲区数据仍保留,稍后可重试
+            };
         }
     }
 
@@ -705,19 +750,29 @@ pub const AsyncLogger = struct {
         // 手动 UTF-8 → UTF-16 转换（避免分配）
         var utf16_len: usize = 0;
         var utf8_index: usize = 0;
+        var truncated = false;
 
-        while (utf8_index < text.len and utf16_len < self.worker_utf16_buffer.len) {
+        // 预留空间给代理对(Surrogate Pair),避免越界
+        while (utf8_index < text.len and utf16_len + 2 <= self.worker_utf16_buffer.len) {
             const char_len = std.unicode.utf8ByteSequenceLength(text[utf8_index]) catch break;
             if (utf8_index + char_len > text.len) break;
 
             const codepoint = std.unicode.utf8Decode(text[utf8_index..][0..char_len]) catch break;
 
             if (codepoint < 0x10000) {
+                // BMP 字符(基本多文种平面)
+                if (utf16_len >= self.worker_utf16_buffer.len) {
+                    truncated = true;
+                    break;
+                }
                 self.worker_utf16_buffer[utf16_len] = @intCast(codepoint);
                 utf16_len += 1;
             } else {
-                // 代理对（Surrogate Pair）
-                if (utf16_len + 2 > self.worker_utf16_buffer.len) break;
+                // 补充平面字符,需要代理对
+                if (utf16_len + 2 > self.worker_utf16_buffer.len) {
+                    truncated = true;
+                    break;
+                }
                 const adjusted = codepoint - 0x10000;
                 self.worker_utf16_buffer[utf16_len] = @intCast(0xD800 + (adjusted >> 10));
                 self.worker_utf16_buffer[utf16_len + 1] = @intCast(0xDC00 + (adjusted & 0x3FF));
@@ -725,6 +780,16 @@ pub const AsyncLogger = struct {
             }
 
             utf8_index += char_len;
+        }
+
+        // 如果发生截断,追加省略号
+        if (truncated and utf8_index < text.len) {
+            const ellipsis = [_]u16{ '.', '.', '.' };
+            const remain = self.worker_utf16_buffer.len - utf16_len;
+            if (remain >= ellipsis.len) {
+                @memcpy(self.worker_utf16_buffer[utf16_len..][0..ellipsis.len], &ellipsis);
+                utf16_len += ellipsis.len;
+            }
         }
 
         var written: w.DWORD = 0;
@@ -756,9 +821,9 @@ pub const AsyncLogger = struct {
 
     /// 零分配路径：使用线程局部缓冲区
     fn logZeroAlloc(self: *AsyncLogger, level: Level, comptime fmt: []const u8, args: anytype) void {
-        // 线程局部缓冲区（每线程一个，自动初始化）
+        // 线程局部缓冲区（每线程一个，零初始化避免未定义行为）
         const TLS = struct {
-            threadlocal var format_buffer: [4096]u8 = undefined;
+            threadlocal var format_buffer: [4096]u8 = [_]u8{0} ** 4096;
             threadlocal var is_formatting: bool = false; // 防止递归
         };
 

@@ -179,6 +179,46 @@ const version_15 = struct {
         const console_demo_step = b.step("console-demo", "Run console utility demo (UTF-8 + ANSI colors)");
         console_demo_step.dependOn(&run_console_demo.step);
 
+        // ========== Console 并发测试 ==========
+        const console_concurrent_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "console_concurrent_test.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        console_concurrent_module.addImport("zzig", zzig);
+
+        const console_concurrent_test_exe = b.addExecutable(.{
+            .name = "console_concurrent_test",
+            .root_module = console_concurrent_module,
+        });
+        b.installArtifact(console_concurrent_test_exe);
+
+        const run_console_concurrent_test = b.addRunArtifact(console_concurrent_test_exe);
+        run_console_concurrent_test.step.dependOn(b.getInstallStep());
+
+        const console_concurrent_test_step = b.step("console-concurrent-test", "测试 Console 并发初始化安全性");
+        console_concurrent_test_step.dependOn(&run_console_concurrent_test.step);
+
+        // ========== 功能扩展演示 ==========
+        const feature_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "feature_extension_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        feature_demo_module.addImport("zzig", zzig);
+
+        const feature_demo_exe = b.addExecutable(.{
+            .name = "feature_extension_demo",
+            .root_module = feature_demo_module,
+        });
+        b.installArtifact(feature_demo_exe);
+
+        const run_feature_demo = b.addRunArtifact(feature_demo_exe);
+        run_feature_demo.step.dependOn(b.getInstallStep());
+
+        const feature_demo_step = b.step("feature-demo", "演示 MPMC 队列和结构化日志");
+        feature_demo_step.dependOn(&run_feature_demo.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

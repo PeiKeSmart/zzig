@@ -1,13 +1,16 @@
 const std = @import("std");
 
-/// 生成一个随机字符。
+/// 生成一个随机字符（无偏采样）
+///
+/// 使用密码学安全的随机数生成器,避免模偏差(modulo bias)。
 ///
 /// 返回:
 /// - 随机生成的字符。
 fn RandomChar() u8 {
     const rand = std.crypto.random;
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    return chars[rand.int(u32) % chars.len];
+    // 使用 uintLessThan 避免模偏差
+    return chars[rand.uintLessThan(usize, chars.len)];
 }
 
 /// 生成一个随机字符串。
