@@ -219,6 +219,46 @@ const version_15 = struct {
         const feature_demo_step = b.step("feature-demo", "演示 MPMC 队列和结构化日志");
         feature_demo_step.dependOn(&run_feature_demo.step);
 
+        // ========== 性能剖析器演示 ==========
+        const profiler_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "profiler_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        profiler_demo_module.addImport("zzig", zzig);
+
+        const profiler_demo_exe = b.addExecutable(.{
+            .name = "profiler_demo",
+            .root_module = profiler_demo_module,
+        });
+        b.installArtifact(profiler_demo_exe);
+
+        const run_profiler_demo = b.addRunArtifact(profiler_demo_exe);
+        run_profiler_demo.step.dependOn(b.getInstallStep());
+
+        const profiler_demo_step = b.step("profiler-demo", "演示性能剖析器（零开销/采样模式）");
+        profiler_demo_step.dependOn(&run_profiler_demo.step);
+
+        // ========== 高级特性综合演示 ==========
+        const advanced_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "advanced_features_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        advanced_demo_module.addImport("zzig", zzig);
+
+        const advanced_demo_exe = b.addExecutable(.{
+            .name = "advanced_features_demo",
+            .root_module = advanced_demo_module,
+        });
+        b.installArtifact(advanced_demo_exe);
+
+        const run_advanced_demo = b.addRunArtifact(advanced_demo_exe);
+        run_advanced_demo.step.dependOn(b.getInstallStep());
+
+        const advanced_demo_step = b.step("advanced-demo", "演示动态队列、日志轮转、性能剖析综合场景");
+        advanced_demo_step.dependOn(&run_advanced_demo.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

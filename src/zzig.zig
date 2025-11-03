@@ -24,3 +24,21 @@ pub const MPMCQueue = @import("logs/mpmc_queue.zig").MPMCQueue;
 
 /// 结构化日志（JSON 格式）
 pub const StructuredLog = @import("logs/structured_log.zig");
+
+/// 性能剖析器（零开销、采样模式、热点识别）
+pub const profiler = struct {
+    pub const Profiler = @import("profiler/profiler.zig").Profiler;
+    pub const ProfilerConfig = @import("profiler/profiler.zig").ProfilerConfig;
+    pub const Metrics = @import("profiler/profiler.zig").Metrics;
+};
+
+/// 动态队列（自动扩容的 SPSC 队列）
+pub const logs = struct {
+    pub const DynamicQueue = @import("logs/dynamic_queue.zig").DynamicQueue;
+    pub const DynamicQueueConfig = @import("logs/dynamic_queue.zig").DynamicQueueConfig;
+
+    /// 日志轮转管理器（多策略轮转 + 异步压缩）
+    pub const RotationManager = @import("logs/rotation_manager.zig").RotationManager;
+    pub const AdvancedRotationConfig = @import("logs/rotation_manager.zig").AdvancedRotationConfig;
+    pub const RotationStrategy = @import("logs/rotation_manager.zig").RotationStrategy;
+};

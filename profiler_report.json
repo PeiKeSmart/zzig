@@ -1,0 +1,28 @@
+{
+  "zones": [
+    {
+      "name": "file_write",
+      "call_count": 200,
+      "total_duration_ns": 23400,
+      "min_duration_ns": 100,
+      "max_duration_ns": 200,
+      "avg_duration_ns": 117
+    },
+    {
+      "name": "queue_push",
+      "call_count": 1000,
+      "total_duration_ns": 185800,
+      "min_duration_ns": 100,
+      "max_duration_ns": 16800,
+      "avg_duration_ns": 185
+    },
+    {
+      "name": "log_processing",
+      "call_count": 500,
+      "total_duration_ns": 84300,
+      "min_duration_ns": 100,
+      "max_duration_ns": 900,
+      "avg_duration_ns": 168
+    }
+  ]
+}
