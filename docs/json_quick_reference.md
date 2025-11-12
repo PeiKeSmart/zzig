@@ -498,10 +498,49 @@ const count = try Parser.parseChunk(&state, &tokens, &parents, last_chunk, true)
 //                                                                           ^^^^
 ```
 
+## 性能基准测试结果
+
+### 实测数据（Windows x86_64, Debug 模式）
+
+| JSON 大小 | 原版解析器 | 零分配优化 | 性能提升 | 堆分配减少 |
+|----------|-----------|-----------|---------|----------|
+| 小型 (261B) | 5.32 μs | 2.04 μs | **2.5x** | 0 → 0 |
+| 中型 (5KB) | 128.65 μs | 38.98 μs | **3.3x** | 100% |
+| 大型 (64KB) | 1249.39 μs | 467.12 μs | **2.7x** | 100% |
+
+### 吞吐量对比
+
+| JSON 大小 | 原版吞吐量 | 零分配吞吐量 | 提升 |
+|----------|-----------|-------------|------|
+| 小型 (261B) | 48 MB/s | 122 MB/s | **2.5x** |
+| 中型 (5KB) | 39 MB/s | 128 MB/s | **3.3x** |
+| 大型 (64KB) | 49 MB/s | 132 MB/s | **2.7x** |
+
+### 内存占用对比
+
+| Token 格式 | 单个 Token 大小 | 1000 个 Token | 内存节省 |
+|-----------|---------------|-------------|---------|
+| 标准格式 | 32 字节 | 31 KB | - |
+| 紧凑格式 | 4 字节 | 3 KB | **87.5%** |
+
+**注意：**
+- 紧凑格式有性能开销（比标准格式慢 7-14%）
+- 紧凑格式限制：JSON < 1MB，token 长度 < 256
+- 超出限制时自动回退到标准格式
+
+### 运行基准测试
+
+```bash
+zig build json-bench  # 完整性能测试
+zig build json-large  # 大型 JSON 回退测试
+```
+
 ## 更多资源
 
 - 完整教程：[json_usage.md](json_usage.md)
 - 基础示例：`examples/json_example.zig`
 - 高级示例：`examples/json_advanced_example.zig`
+- 性能基准：`examples/json_performance_benchmark.zig`
 - 源代码：`src/json/jsmn_zig.zig`
 - 原始项目：https://github.com/Ferki-git-creator/jsmn_zig
+
