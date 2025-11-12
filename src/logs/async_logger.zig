@@ -12,23 +12,40 @@ pub const ConfigOutputTarget = config_mod.OutputTarget;
 // 其他平台(x86/x64/ARMv8+)继续使用高性能原子操作
 
 /// 检测平台是否支持 u64 原子操作
+///
+/// 关键修复: 使用编译时架构检测而非运行时字符串匹配
+/// builtin.cpu.model.llvm_name 在 baseline 模式下为 null,不可靠
 fn supportsAtomicU64() bool {
     return switch (builtin.cpu.arch) {
-        // ARMv6 及更早版本不支持 64 位原子操作
-        .arm, .armeb => blk: {
-            // ARMv6 及以下不支持,ARMv7+ 支持
-            const baseline = builtin.cpu.model.llvm_name orelse "";
-            if (std.mem.indexOf(u8, baseline, "armv6") != null) break :blk false;
-            if (std.mem.indexOf(u8, baseline, "armv5") != null) break :blk false;
-            if (std.mem.indexOf(u8, baseline, "armv4") != null) break :blk false;
-            break :blk true; // ARMv7+ 支持
-        },
-        // 32 位 MIPS 通常不支持 64 位原子操作
+        // 32 位 ARM 架构统一不支持 64 位原子操作
+        // ARMv6/ARMv7 都是 32 位,即使 ARMv7 理论上支持,为安全起见统一处理
+        .arm, .armeb, .thumb, .thumbeb => false,
+
+        // 64 位 ARM 支持
+        .aarch64, .aarch64_be => true,
+
+        // 32 位 MIPS 不支持
         .mips, .mipsel => false,
-        // RISC-V 32 位不支持
+
+        // 64 位 MIPS 支持
+        .mips64, .mips64el => true,
+
+        // RISC-V: 32 位不支持, 64 位支持
         .riscv32 => false,
-        // 其他现代架构均支持
-        else => true,
+        .riscv64 => true,
+
+        // x86 系列: 32 位理论支持 CMPXCHG8B,但为兼容性考虑使用 Mutex
+        .x86 => false,
+
+        // x86_64 完全支持
+        .x86_64 => true,
+
+        // PowerPC: 32 位不支持, 64 位支持
+        .powerpc, .powerpcle => false,
+        .powerpc64, .powerpc64le => true,
+
+        // 其他架构保守处理: 默认不支持,除非明确已知
+        else => false,
     };
 }
 
