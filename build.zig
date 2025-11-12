@@ -54,7 +54,6 @@ const version_15 = struct {
         b.installArtifact(async_demo);
 
         const run_async_demo = b.addRunArtifact(async_demo);
-        run_async_demo.step.dependOn(b.getInstallStep());
 
         const async_demo_step = b.step("async-demo", "Run async logger demo");
         async_demo_step.dependOn(&run_async_demo.step);
@@ -74,7 +73,6 @@ const version_15 = struct {
         b.installArtifact(config_demo);
 
         const run_config_demo = b.addRunArtifact(config_demo);
-        run_config_demo.step.dependOn(b.getInstallStep());
 
         const config_demo_step = b.step("config-demo", "Run async logger with config file demo");
         config_demo_step.dependOn(&run_config_demo.step);
@@ -94,7 +92,6 @@ const version_15 = struct {
         b.installArtifact(file_output_demo);
 
         const run_file_output_demo = b.addRunArtifact(file_output_demo);
-        run_file_output_demo.step.dependOn(b.getInstallStep());
 
         const file_output_demo_step = b.step("file-demo", "Run async logger file output demo");
         file_output_demo_step.dependOn(&run_file_output_demo.step);
@@ -114,7 +111,6 @@ const version_15 = struct {
         b.installArtifact(rotation_test);
 
         const run_rotation_test = b.addRunArtifact(rotation_test);
-        run_rotation_test.step.dependOn(b.getInstallStep());
 
         const rotation_test_step = b.step("rotation-test", "Run async logger rotation stress test");
         rotation_test_step.dependOn(&run_rotation_test.step);
@@ -134,7 +130,6 @@ const version_15 = struct {
         b.installArtifact(both_test);
 
         const run_both_test = b.addRunArtifact(both_test);
-        run_both_test.step.dependOn(b.getInstallStep());
 
         const both_test_step = b.step("both-test", "Run async logger both mode test");
         both_test_step.dependOn(&run_both_test.step);
@@ -154,9 +149,8 @@ const version_15 = struct {
         b.installArtifact(zero_alloc_demo);
 
         const run_zero_alloc_demo = b.addRunArtifact(zero_alloc_demo);
-        run_zero_alloc_demo.step.dependOn(b.getInstallStep());
 
-        const zero_alloc_demo_step = b.step("zero-alloc-demo", "Run async logger zero allocation demo (recommended for ARM devices)");
+        const zero_alloc_demo_step = b.step("zero-alloc-demo", "Run async logger zero-alloc demo (recommended for ARM devices)");
         zero_alloc_demo_step.dependOn(&run_zero_alloc_demo.step);
 
         // 控制台工具演示程序（UTF-8 + ANSI 颜色）
@@ -174,9 +168,8 @@ const version_15 = struct {
         b.installArtifact(console_demo);
 
         const run_console_demo = b.addRunArtifact(console_demo);
-        run_console_demo.step.dependOn(b.getInstallStep());
 
-        const console_demo_step = b.step("console-demo", "Run console utility demo (UTF-8 + ANSI colors)");
+        const console_demo_step = b.step("console-demo", "Run Console module demo");
         console_demo_step.dependOn(&run_console_demo.step);
 
         // ========== Console 并发测试 ==========
@@ -194,7 +187,6 @@ const version_15 = struct {
         b.installArtifact(console_concurrent_test_exe);
 
         const run_console_concurrent_test = b.addRunArtifact(console_concurrent_test_exe);
-        run_console_concurrent_test.step.dependOn(b.getInstallStep());
 
         const console_concurrent_test_step = b.step("console-concurrent-test", "测试 Console 并发初始化安全性");
         console_concurrent_test_step.dependOn(&run_console_concurrent_test.step);
@@ -214,7 +206,6 @@ const version_15 = struct {
         b.installArtifact(feature_demo_exe);
 
         const run_feature_demo = b.addRunArtifact(feature_demo_exe);
-        run_feature_demo.step.dependOn(b.getInstallStep());
 
         const feature_demo_step = b.step("feature-demo", "演示 MPMC 队列和结构化日志");
         feature_demo_step.dependOn(&run_feature_demo.step);
@@ -234,7 +225,6 @@ const version_15 = struct {
         b.installArtifact(profiler_demo_exe);
 
         const run_profiler_demo = b.addRunArtifact(profiler_demo_exe);
-        run_profiler_demo.step.dependOn(b.getInstallStep());
 
         const profiler_demo_step = b.step("profiler-demo", "演示性能剖析器（零开销/采样模式）");
         profiler_demo_step.dependOn(&run_profiler_demo.step);
@@ -254,9 +244,8 @@ const version_15 = struct {
         b.installArtifact(advanced_demo_exe);
 
         const run_advanced_demo = b.addRunArtifact(advanced_demo_exe);
-        run_advanced_demo.step.dependOn(b.getInstallStep());
 
-        const advanced_demo_step = b.step("advanced-demo", "演示动态队列、日志轮转、性能剖析综合场景");
+        const advanced_demo_step = b.step("advanced-demo", "演示所有高级特性（日志轮转/MPMC/结构化日志/性能剖析）");
         advanced_demo_step.dependOn(&run_advanced_demo.step);
 
         // ========== JSON 解析器基础示例 ==========
@@ -274,7 +263,6 @@ const version_15 = struct {
         b.installArtifact(json_demo_exe);
 
         const run_json_demo = b.addRunArtifact(json_demo_exe);
-        run_json_demo.step.dependOn(b.getInstallStep());
 
         const json_demo_step = b.step("json-demo", "演示 JSON 解析器基础用法");
         json_demo_step.dependOn(&run_json_demo.step);
@@ -294,7 +282,6 @@ const version_15 = struct {
         b.installArtifact(json_advanced_exe);
 
         const run_json_advanced = b.addRunArtifact(json_advanced_exe);
-        run_json_advanced.step.dependOn(b.getInstallStep());
 
         const json_advanced_step = b.step("json-advanced", "演示 JSON 解析器高级特性（流式、紧凑、SIMD）");
         json_advanced_step.dependOn(&run_json_advanced.step);
@@ -314,7 +301,6 @@ const version_15 = struct {
         b.installArtifact(json_benchmark_exe);
 
         const run_json_benchmark = b.addRunArtifact(json_benchmark_exe);
-        run_json_benchmark.step.dependOn(b.getInstallStep());
 
         const json_benchmark_step = b.step("json-bench", "运行 JSON 解析器性能基准测试");
         json_benchmark_step.dependOn(&run_json_benchmark.step);
@@ -334,7 +320,6 @@ const version_15 = struct {
         b.installArtifact(json_large_exe);
 
         const run_json_large = b.addRunArtifact(json_large_exe);
-        run_json_large.step.dependOn(b.getInstallStep());
 
         const json_large_step = b.step("json-large", "测试大型 JSON 紧凑格式自动回退");
         json_large_step.dependOn(&run_json_large.step);
