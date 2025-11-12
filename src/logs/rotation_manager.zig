@@ -1,4 +1,29 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// ===== ARMv6 兼容性: 平台原子操作能力检测 =====
+// ARMv6 及部分嵌入式平台不支持 64 位原子操作,需使用 Mutex 代替
+// 其他平台(x86/x64/ARMv8+)继续使用高性能原子操作
+
+/// 检测平台是否支持 i64 原子操作
+fn supportsAtomicI64() bool {
+    return switch (builtin.cpu.arch) {
+        // ARMv6 及更早版本不支持 64 位原子操作
+        .arm, .armeb => blk: {
+            const baseline = builtin.cpu.model.llvm_name orelse "";
+            if (std.mem.indexOf(u8, baseline, "armv6") != null) break :blk false;
+            if (std.mem.indexOf(u8, baseline, "armv5") != null) break :blk false;
+            if (std.mem.indexOf(u8, baseline, "armv4") != null) break :blk false;
+            break :blk true; // ARMv7+ 支持
+        },
+        // 32 位 MIPS 通常不支持 64 位原子操作
+        .mips, .mipsel => false,
+        // RISC-V 32 位不支持
+        .riscv32 => false,
+        // 其他现代架构均支持
+        else => true,
+    };
+}
 
 /// 日志轮转策略
 pub const RotationStrategy = enum {
@@ -96,7 +121,9 @@ pub const RotationManager = struct {
 
     // 状态
     current_file_size: std.atomic.Value(usize),
-    last_rotation_time: std.atomic.Value(i64),
+    // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
+    last_rotation_time: if (supportsAtomicI64()) std.atomic.Value(i64) else i64,
+    last_rotation_time_mutex: if (!supportsAtomicI64()) std.Thread.Mutex else void,
     rotation_count: std.atomic.Value(usize),
 
     // 互斥锁
@@ -114,11 +141,12 @@ pub const RotationManager = struct {
             compression_queue = .{}; // ✅ Zig 0.15.2 空字面量
         }
 
-        return RotationManager{
+        var manager: RotationManager = .{
             .allocator = allocator,
             .config = config,
             .current_file_size = std.atomic.Value(usize).init(0),
-            .last_rotation_time = std.atomic.Value(i64).init(std.time.timestamp()),
+            .last_rotation_time = undefined,
+            .last_rotation_time_mutex = if (comptime !supportsAtomicI64()) std.Thread.Mutex{} else undefined,
             .rotation_count = std.atomic.Value(usize).init(0),
             .rotation_mutex = .{},
             .is_rotating = std.atomic.Value(bool).init(false),
@@ -126,6 +154,15 @@ pub const RotationManager = struct {
             .compression_thread = null,
             .should_stop_compression = std.atomic.Value(bool).init(false),
         };
+
+        // 根据平台初始化 last_rotation_time
+        if (comptime supportsAtomicI64()) {
+            manager.last_rotation_time = std.atomic.Value(i64).init(std.time.timestamp());
+        } else {
+            manager.last_rotation_time = std.time.timestamp();
+        }
+
+        return manager;
     }
 
     pub fn deinit(self: *RotationManager) void {
@@ -148,6 +185,30 @@ pub const RotationManager = struct {
     pub fn startCompressionWorker(self: *RotationManager) !void {
         if (self.config.enable_compression and self.compression_thread == null) {
             self.compression_thread = try std.Thread.spawn(.{}, compressionWorker, .{self});
+        }
+    }
+
+    // ===== ARMv6 兼容性: 封装原子操作函数 =====
+
+    /// 获取上次轮转时间 (跨平台兼容)
+    fn getLastRotationTime(self: *const RotationManager) i64 {
+        if (comptime supportsAtomicI64()) {
+            return self.last_rotation_time.load(.monotonic);
+        } else {
+            // ARMv6: 无需锁保护,只读操作
+            return self.last_rotation_time;
+        }
+    }
+
+    /// 设置上次轮转时间 (跨平台兼容)
+    fn setLastRotationTime(self: *RotationManager, timestamp: i64) void {
+        if (comptime supportsAtomicI64()) {
+            self.last_rotation_time.store(timestamp, .release);
+        } else {
+            // ARMv6: 加锁保护
+            self.last_rotation_time_mutex.lock();
+            defer self.last_rotation_time_mutex.unlock();
+            self.last_rotation_time = timestamp;
         }
     }
 
@@ -174,7 +235,7 @@ pub const RotationManager = struct {
     /// 按时间判断是否轮转
     fn shouldRotateByTime(self: *const RotationManager) bool {
         const now = std.time.timestamp();
-        const last_rotation = self.last_rotation_time.load(.monotonic);
+        const last_rotation = self.getLastRotationTime();
 
         switch (self.config.time_interval) {
             .hourly => {
@@ -224,7 +285,7 @@ pub const RotationManager = struct {
 
         // 更新状态
         self.current_file_size.store(0, .release);
-        self.last_rotation_time.store(std.time.timestamp(), .release);
+        self.setLastRotationTime(std.time.timestamp());
         _ = self.rotation_count.fetchAdd(1, .monotonic);
 
         // 添加到压缩队列（异步）

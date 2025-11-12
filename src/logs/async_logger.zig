@@ -7,6 +7,36 @@ pub const ConfigFile = config_mod.AsyncLoggerConfig;
 pub const ConfigLogLevel = config_mod.LogLevel;
 pub const ConfigOutputTarget = config_mod.OutputTarget;
 
+// ===== ARMv6 兼容性: 平台原子操作能力检测 =====
+// ARMv6 及部分嵌入式平台不支持 64 位原子操作,需使用 Mutex 代替
+// 其他平台(x86/x64/ARMv8+)继续使用高性能原子操作
+
+/// 检测平台是否支持 u64 原子操作
+fn supportsAtomicU64() bool {
+    return switch (builtin.cpu.arch) {
+        // ARMv6 及更早版本不支持 64 位原子操作
+        .arm, .armeb => blk: {
+            // ARMv6 及以下不支持,ARMv7+ 支持
+            const baseline = builtin.cpu.model.llvm_name orelse "";
+            if (std.mem.indexOf(u8, baseline, "armv6") != null) break :blk false;
+            if (std.mem.indexOf(u8, baseline, "armv5") != null) break :blk false;
+            if (std.mem.indexOf(u8, baseline, "armv4") != null) break :blk false;
+            break :blk true; // ARMv7+ 支持
+        },
+        // 32 位 MIPS 通常不支持 64 位原子操作
+        .mips, .mipsel => false,
+        // RISC-V 32 位不支持
+        .riscv32 => false,
+        // 其他现代架构均支持
+        else => true,
+    };
+}
+
+/// 检测平台是否支持 i64 原子操作
+fn supportsAtomicI64() bool {
+    return supportsAtomicU64(); // 有符号和无符号支持性相同
+}
+
 /// 日志级别
 pub const Level = enum {
     debug,
@@ -205,7 +235,10 @@ pub const AsyncLogger = struct {
     // 文件输出相关
     log_file: ?std.fs.File,
     log_file_path: ?[]const u8,
-    current_file_size: std.atomic.Value(u64),
+    // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
+    // 其他平台继续使用高性能原子操作
+    current_file_size: if (supportsAtomicU64()) std.atomic.Value(u64) else u64,
+    current_file_size_mutex: if (!supportsAtomicU64()) std.Thread.Mutex else void,
     output_target: ConfigOutputTarget,
     drop_rate_warning_threshold: f32,
     max_file_size: u64,
@@ -215,12 +248,14 @@ pub const AsyncLogger = struct {
     rotation_mutex: std.Thread.Mutex,
     is_rotating: std.atomic.Value(bool),
 
-    // 零分配模式：工作线程预分配缓冲区
+    // 零分配模式:工作线程预分配缓冲区
     worker_format_buffer: []u8,
     worker_utf16_buffer: []u16,
     worker_file_buffer_data: []u8,
     worker_file_buffer_len: std.atomic.Value(usize),
-    last_flush_time: std.atomic.Value(i64),
+    // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
+    last_flush_time: if (supportsAtomicI64()) std.atomic.Value(i64) else i64,
+    last_flush_time_mutex: if (!supportsAtomicI64()) std.Thread.Mutex else void,
 
     /// 从配置文件初始化 AsyncLogger
     pub fn initFromConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !*AsyncLogger {
@@ -291,7 +326,8 @@ pub const AsyncLogger = struct {
             try allocator.alloc(u8, 0);
         errdefer allocator.free(worker_file_buffer_data);
 
-        self.* = AsyncLogger{
+        // 初始化结构体
+        self.* = .{
             .queue = try RingQueue.init(allocator, config.queue_capacity),
             .worker_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
@@ -301,19 +337,34 @@ pub const AsyncLogger = struct {
             .allocator = allocator,
             .log_file = null,
             .log_file_path = null,
-            .current_file_size = std.atomic.Value(u64).init(0),
+            .current_file_size = undefined,
+            .current_file_size_mutex = if (comptime !supportsAtomicU64()) std.Thread.Mutex{} else undefined,
             .output_target = .console,
             .drop_rate_warning_threshold = 10.0,
             .max_file_size = 100 * 1024 * 1024,
             .max_backup_files = 5,
-            .rotation_mutex = std.Thread.Mutex{},
+            .rotation_mutex = .{},
             .is_rotating = std.atomic.Value(bool).init(false),
             .worker_format_buffer = worker_format_buffer,
             .worker_utf16_buffer = worker_utf16_buffer,
             .worker_file_buffer_data = worker_file_buffer_data,
             .worker_file_buffer_len = std.atomic.Value(usize).init(0),
-            .last_flush_time = std.atomic.Value(i64).init(std.time.milliTimestamp()),
+            .last_flush_time = undefined,
+            .last_flush_time_mutex = if (comptime !supportsAtomicI64()) std.Thread.Mutex{} else undefined,
         };
+
+        // 根据平台初始化原子字段
+        if (comptime supportsAtomicU64()) {
+            self.current_file_size = std.atomic.Value(u64).init(0);
+        } else {
+            self.current_file_size = 0;
+        }
+
+        if (comptime supportsAtomicI64()) {
+            self.last_flush_time = std.atomic.Value(i64).init(std.time.milliTimestamp());
+        } else {
+            self.last_flush_time = std.time.milliTimestamp();
+        }
 
         // 启动后台工作线程
         self.worker_thread = try std.Thread.spawn(.{}, workerLoop, .{self});
@@ -352,6 +403,65 @@ pub const AsyncLogger = struct {
         // x86/x64 服务器，使用动态分配
         return .dynamic;
     }
+
+    // ===== ARMv6 兼容性: 封装原子操作函数 =====
+
+    /// 获取当前文件大小 (跨平台兼容)
+    fn getCurrentFileSize(self: *const AsyncLogger) u64 {
+        if (comptime supportsAtomicU64()) {
+            return self.current_file_size.load(.acquire);
+        } else {
+            // ARMv6: 无需锁保护,只读操作
+            return self.current_file_size;
+        }
+    }
+
+    /// 设置当前文件大小 (跨平台兼容)
+    fn setCurrentFileSize(self: *AsyncLogger, size: u64) void {
+        if (comptime supportsAtomicU64()) {
+            self.current_file_size.store(size, .release);
+        } else {
+            // ARMv6: 加锁保护
+            self.current_file_size_mutex.lock();
+            defer self.current_file_size_mutex.unlock();
+            self.current_file_size = size;
+        }
+    }
+
+    /// 增加文件大小 (跨平台兼容)
+    fn addCurrentFileSize(self: *AsyncLogger, delta: u64) void {
+        if (comptime supportsAtomicU64()) {
+            _ = self.current_file_size.fetchAdd(delta, .monotonic);
+        } else {
+            // ARMv6: 加锁保护
+            self.current_file_size_mutex.lock();
+            defer self.current_file_size_mutex.unlock();
+            self.current_file_size += delta;
+        }
+    }
+
+    /// 获取上次刷新时间 (跨平台兼容)
+    fn getLastFlushTime(self: *const AsyncLogger) i64 {
+        if (comptime supportsAtomicI64()) {
+            return self.last_flush_time.load(.acquire);
+        } else {
+            // ARMv6: 无需锁保护,只读操作
+            return self.last_flush_time;
+        }
+    }
+
+    /// 设置上次刷新时间 (跨平台兼容)
+    fn setLastFlushTime(self: *AsyncLogger, timestamp: i64) void {
+        if (comptime supportsAtomicI64()) {
+            self.last_flush_time.store(timestamp, .release);
+        } else {
+            // ARMv6: 加锁保护
+            self.last_flush_time_mutex.lock();
+            defer self.last_flush_time_mutex.unlock();
+            self.last_flush_time = timestamp;
+        }
+    }
+
     pub fn deinit(self: *AsyncLogger) void {
         // 标记停止
         self.should_stop.store(true, .release);
@@ -458,7 +568,7 @@ pub const AsyncLogger = struct {
 
             // 获取当前文件大小
             const stat = try self.log_file.?.stat();
-            self.current_file_size.store(stat.size, .release);
+            self.setCurrentFileSize(stat.size);
 
             // 定位到文件末尾
             try self.log_file.?.seekFromEnd(0);
@@ -473,7 +583,7 @@ pub const AsyncLogger = struct {
     fn checkRotation(self: *AsyncLogger) !void {
         if (self.max_file_size == 0) return; // 0 表示不限制
 
-        const current_size = self.current_file_size.load(.acquire);
+        const current_size = self.getCurrentFileSize();
         if (current_size < self.max_file_size) return;
 
         // 原子检查并设置轮转标志(防止多线程同时轮转)
@@ -483,7 +593,7 @@ pub const AsyncLogger = struct {
         defer self.is_rotating.store(false, .release);
 
         // 二次确认(Double-Check),避免误触发
-        if (self.current_file_size.load(.acquire) < self.max_file_size) {
+        if (self.getCurrentFileSize() < self.max_file_size) {
             return;
         }
 
@@ -672,7 +782,7 @@ pub const AsyncLogger = struct {
 
             // 更新文件大小
             const written_size: u64 = formatted.len;
-            _ = self.current_file_size.fetchAdd(written_size, .monotonic);
+            self.addCurrentFileSize(written_size);
         }
     }
 
@@ -702,14 +812,14 @@ pub const AsyncLogger = struct {
             } else {
                 // 单条日志超过缓冲区，直接写入
                 try self.log_file.?.writeAll(formatted);
-                _ = self.current_file_size.fetchAdd(formatted.len, .monotonic);
+                self.addCurrentFileSize(formatted.len);
             }
         }
 
         // 条件刷盘（缓冲区超过 80% 或超时）
         const buffer_threshold = self.worker_file_buffer_data.len * 4 / 5;
         const now = std.time.milliTimestamp();
-        const last_flush = self.last_flush_time.load(.acquire);
+        const last_flush = self.getLastFlushTime();
 
         if (new_len > buffer_threshold or (now - last_flush) > 100) { // 100ms 超时
             // 捕获错误,避免刷盘失败导致数据丢失
@@ -727,9 +837,9 @@ pub const AsyncLogger = struct {
 
         if (self.log_file) |file| {
             try file.writeAll(self.worker_file_buffer_data[0..len]);
-            _ = self.current_file_size.fetchAdd(len, .monotonic);
+            self.addCurrentFileSize(len);
             self.worker_file_buffer_len.store(0, .release);
-            self.last_flush_time.store(std.time.milliTimestamp(), .release);
+            self.setLastFlushTime(std.time.milliTimestamp());
         }
     }
 
