@@ -259,6 +259,86 @@ const version_15 = struct {
         const advanced_demo_step = b.step("advanced-demo", "演示动态队列、日志轮转、性能剖析综合场景");
         advanced_demo_step.dependOn(&run_advanced_demo.step);
 
+        // ========== JSON 解析器基础示例 ==========
+        const json_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "json_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        json_demo_module.addImport("zzig", zzig);
+
+        const json_demo_exe = b.addExecutable(.{
+            .name = "json_example",
+            .root_module = json_demo_module,
+        });
+        b.installArtifact(json_demo_exe);
+
+        const run_json_demo = b.addRunArtifact(json_demo_exe);
+        run_json_demo.step.dependOn(b.getInstallStep());
+
+        const json_demo_step = b.step("json-demo", "演示 JSON 解析器基础用法");
+        json_demo_step.dependOn(&run_json_demo.step);
+
+        // ========== JSON 解析器高级示例 ==========
+        const json_advanced_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "json_advanced_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        json_advanced_module.addImport("zzig", zzig);
+
+        const json_advanced_exe = b.addExecutable(.{
+            .name = "json_advanced_example",
+            .root_module = json_advanced_module,
+        });
+        b.installArtifact(json_advanced_exe);
+
+        const run_json_advanced = b.addRunArtifact(json_advanced_exe);
+        run_json_advanced.step.dependOn(b.getInstallStep());
+
+        const json_advanced_step = b.step("json-advanced", "演示 JSON 解析器高级特性（流式、紧凑、SIMD）");
+        json_advanced_step.dependOn(&run_json_advanced.step);
+
+        // JSON 性能基准测试
+        const json_benchmark_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "json_performance_benchmark.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        json_benchmark_module.addImport("zzig", zzig);
+
+        const json_benchmark_exe = b.addExecutable(.{
+            .name = "json_benchmark",
+            .root_module = json_benchmark_module,
+        });
+        b.installArtifact(json_benchmark_exe);
+
+        const run_json_benchmark = b.addRunArtifact(json_benchmark_exe);
+        run_json_benchmark.step.dependOn(b.getInstallStep());
+
+        const json_benchmark_step = b.step("json-bench", "运行 JSON 解析器性能基准测试");
+        json_benchmark_step.dependOn(&run_json_benchmark.step);
+
+        // JSON 大型文件测试
+        const json_large_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "json_large_test.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        json_large_module.addImport("zzig", zzig);
+
+        const json_large_exe = b.addExecutable(.{
+            .name = "json_large_test",
+            .root_module = json_large_module,
+        });
+        b.installArtifact(json_large_exe);
+
+        const run_json_large = b.addRunArtifact(json_large_exe);
+        run_json_large.step.dependOn(b.getInstallStep());
+
+        const json_large_step = b.step("json-large", "测试大型 JSON 紧凑格式自动回退");
+        json_large_step.dependOn(&run_json_large.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

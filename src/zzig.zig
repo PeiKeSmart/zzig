@@ -42,3 +42,46 @@ pub const logs = struct {
     pub const AdvancedRotationConfig = @import("logs/rotation_manager.zig").AdvancedRotationConfig;
     pub const RotationStrategy = @import("logs/rotation_manager.zig").RotationStrategy;
 };
+
+/// JSON 解析器（JSMN-like，流式解析，紧凑格式，SIMD 优化）
+pub const json = struct {
+    /// 从 jsmn_zig 模块导入所有核心类型
+    const jsmn = @import("json/jsmn_zig.zig");
+
+    /// JSON 解析器主类型（根据配置生成）
+    pub const Jsmn = jsmn.Jsmn;
+
+    /// JSON 解析器配置结构
+    pub const Config = jsmn.Config;
+
+    /// 默认配置（紧凑格式，SIMD 优化，完整功能）
+    pub const jsmn_default_config = jsmn.jsmn_default_config;
+
+    /// JSON 解析器构建器（支持链式配置）
+    pub const JsonParser = jsmn.Jsmn(jsmn.jsmn_default_config()).JsonParser;
+
+    /// 便捷函数：使用默认配置创建解析器实例
+    pub fn createParser() type {
+        return Jsmn(jsmn_default_config());
+    }
+
+    /// 便捷函数：为嵌入式环境创建解析器（紧凑模式，无 SIMD）
+    pub fn createEmbeddedParser() type {
+        return Jsmn(.{
+            .compact_tokens = true,
+            .use_simd = false,
+            .tiny_mode = true,
+            .enable_helpers = false,
+        });
+    }
+
+    /// 便捷函数：为桌面/服务器创建解析器（标准格式，SIMD 优化）
+    pub fn createDesktopParser() type {
+        return Jsmn(.{
+            .compact_tokens = false,
+            .use_simd = true,
+            .tiny_mode = false,
+            .enable_helpers = true,
+        });
+    }
+};
