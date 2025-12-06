@@ -29,6 +29,23 @@ pub const Level = enum {
     }
 };
 
+// ============ 时间偏移支持 ============
+
+/// 服务器时间偏移量（毫秒）
+/// server_time = local_time + time_offset_ms
+var time_offset_ms: i64 = 0;
+
+/// 设置时间偏移量（毫秒）
+/// 用于与服务器时间同步
+pub fn setTimeOffset(offset_ms: i64) void {
+    time_offset_ms = offset_ms;
+}
+
+/// 获取时间偏移量
+pub fn getTimeOffset() i64 {
+    return time_offset_ms;
+}
+
 /// 全局日志级别，可通过环境变量或配置调整
 var global_level: Level = .debug;
 
@@ -69,13 +86,19 @@ pub fn setLevel(level: Level) void {
 }
 
 /// 获取当前时间戳字符串 (格式: YYYY-MM-DD HH:MM:SS.nnnnnnnnn)
+/// 如果设置了时间偏移量，将应用服务器时间同步
 fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
     // 获取纳秒级时间戳
     const nanos: i128 = std.time.nanoTimestamp();
 
+    // 应用时间偏移量（毫秒转纳秒）
+    // server_time = local_time + time_offset_ms
+    const offset_nanos: i128 = @as(i128, time_offset_ms) * std.time.ns_per_ms;
+    const adjusted_nanos: i128 = nanos + offset_nanos;
+
     // 转换为秒和纳秒部分
-    const timestamp: i64 = @intCast(@divFloor(nanos, std.time.ns_per_s));
-    const nano_part: u32 = @intCast(@mod(nanos, std.time.ns_per_s));
+    const timestamp: i64 = @intCast(@divFloor(adjusted_nanos, std.time.ns_per_s));
+    const nano_part: u32 = @intCast(@mod(adjusted_nanos, std.time.ns_per_s));
 
     // 获取本地时区偏移（秒）
     const local_offset: i64 = getLocalTimezoneOffset();
