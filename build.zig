@@ -191,6 +191,44 @@ const version_15 = struct {
         const console_concurrent_test_step = b.step("console-concurrent-test", "测试 Console 并发初始化安全性");
         console_concurrent_test_step.dependOn(&run_console_concurrent_test.step);
 
+        // ========== Menu 模块演示 ==========
+        const menu_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "menu_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        menu_demo_module.addImport("zzig", zzig);
+
+        const menu_demo_exe = b.addExecutable(.{
+            .name = "menu_demo",
+            .root_module = menu_demo_module,
+        });
+        b.installArtifact(menu_demo_exe);
+
+        const run_menu_demo = b.addRunArtifact(menu_demo_exe);
+
+        const menu_demo_step = b.step("menu-demo", "运行 Menu 模块演示程序");
+        menu_demo_step.dependOn(&run_menu_demo.step);
+
+        // ========== Menu 动态菜单示例 ==========
+        const menu_dynamic_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "menu_dynamic_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        menu_dynamic_module.addImport("zzig", zzig);
+
+        const menu_dynamic_exe = b.addExecutable(.{
+            .name = "menu_dynamic_example",
+            .root_module = menu_dynamic_module,
+        });
+        b.installArtifact(menu_dynamic_exe);
+
+        const run_menu_dynamic = b.addRunArtifact(menu_dynamic_exe);
+
+        const menu_dynamic_step = b.step("menu-dynamic", "运行 Menu 动态菜单示例");
+        menu_dynamic_step.dependOn(&run_menu_dynamic.step);
+
         // ========== 功能扩展演示 ==========
         const feature_demo_module = b.createModule(.{
             .root_source_file = b.path(b.pathJoin(&.{ "examples", "feature_extension_demo.zig" })),
