@@ -22,6 +22,9 @@ pub const Console = @import("console/console.zig");
 /// 菜单与输入读取工具（跨平台、支持默认值、零外部依赖）
 pub const Menu = @import("menu/menu.zig");
 
+/// 单键输入工具（跨平台、无需按 Enter、支持 Windows / Linux / macOS）
+pub const Input = @import("input/input.zig");
+
 /// MPMC 队列（多生产者多消费者无锁队列）
 pub const MPMCQueue = @import("logs/mpmc_queue.zig").MPMCQueue;
 
