@@ -698,7 +698,7 @@ pub const AsyncLogger = struct {
     ///
     /// 时区固定为 UTC+8（中国标准时间）。buf 长度至少需要 23 字节。
     /// 使用 Howard Hinnant 公历算法（公共领域）将天数转换为年月日。
-    fn formatTimestampReadable(ns: i128, buf: []u8) []u8 {
+    fn formatTimestampReadable(ns: i128, buf: []u8) []const u8 {
         const offset_ns: i128 = 8 * 3600 * std.time.ns_per_s; // UTC+8
         const total_ns = ns + offset_ns;
         const total_secs: i64 = @intCast(@divFloor(total_ns, std.time.ns_per_s));
@@ -721,11 +721,11 @@ pub const AsyncLogger = struct {
         const mp: u32 = (5 * doy + 2) / 153;
         const d: u32 = doy - (153 * mp + 2) / 5 + 1;
         const m: u32 = if (mp < 10) mp + 3 else mp - 9;
-        const yr: i32 = if (m <= 2) y + 1 else y;
+        const yr: u32 = @intCast(if (m <= 2) y + 1 else y); // 转 u32 避免有符号整数格式化歧义
 
         return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
             yr, m, d, hh, mn, ss, ms_part,
-        }) catch buf[0..0];
+        }) catch "????-??-?? ??:??:??.???";
     }
 
     /// 实际写入日志（在后台线程执行）
@@ -735,7 +735,7 @@ pub const AsyncLogger = struct {
         const level_label = msg.level.label();
 
         // 转换为可读时间戳 YYYY-MM-DD HH:MM:SS.mmm
-        var ts_buf: [23]u8 = undefined;
+        var ts_buf: [32]u8 = undefined; // 32 字节余量足够大，实际输出 23 字节
         const ts = formatTimestampReadable(msg.timestamp, &ts_buf);
 
         // 零分配模式：使用预分配缓冲区
