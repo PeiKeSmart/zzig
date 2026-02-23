@@ -94,26 +94,49 @@ pub fn Writer(comptime OutWriter: type) type {
         }
 
         /// 输出文本内容时转义 XML 特殊字符
+        /// 批量写普通字节前缀，仅在特殊字符处理时逐个调用
         fn escapeText(self: *Self, s: []const u8) WriteError!void {
             var pos: usize = 0;
             while (pos < s.len) {
-                const c = s[pos];
+                // 找到下一个需要转义的字节
+                var next = pos;
+                while (next < s.len) {
+                    const c = s[next];
+                    if (c == '&' or c == '<' or c == '>' or c == '\r') break;
+                    next += 1;
+                }
+                // 普通前缀一次批量写入
+                if (next > pos) try self.write(s[pos..next]);
+                if (next >= s.len) break;
+                const c = s[next];
+                pos = next + 1;
                 switch (c) {
                     '&' => try self.write("&amp;"),
                     '<' => try self.write("&lt;"),
                     '>' => try self.write("&gt;"),
                     '\r' => {}, // 忽略 CR（规范化）
-                    else => try self.writeByte(c),
+                    else => unreachable,
                 }
-                pos += 1;
             }
         }
 
         /// 输出属性值时转义
+        /// 批量写普通字节前缀，仅在特殊字符处理时逐个调用
         fn escapeAttr(self: *Self, s: []const u8) WriteError!void {
             var pos: usize = 0;
             while (pos < s.len) {
-                const c = s[pos];
+                // 找到下一个需要转义的字节
+                var next = pos;
+                while (next < s.len) {
+                    const c = s[next];
+                    if (c == '&' or c == '<' or c == '"' or c == '\t' or c == '\n' or c == '\r') break;
+                    next += 1;
+                }
+                // 普通前缀一次批量写入
+                if (next > pos) try self.write(s[pos..next]);
+                if (next >= s.len) break;
+                const c = s[next];
+                pos = next + 1;
                 switch (c) {
                     '&' => try self.write("&amp;"),
                     '<' => try self.write("&lt;"),
@@ -121,9 +144,8 @@ pub fn Writer(comptime OutWriter: type) type {
                     '\t' => try self.write("&#9;"),
                     '\n' => try self.write("&#10;"),
                     '\r' => try self.write("&#13;"),
-                    else => try self.writeByte(c),
+                    else => unreachable,
                 }
-                pos += 1;
             }
         }
 

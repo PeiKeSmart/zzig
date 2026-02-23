@@ -144,16 +144,39 @@ pub const Scanner = struct {
     fn eat(self: *Scanner, comptime s: []const u8) bool {
         if (self.pos + s.len > self.src.len) return false;
         if (!std.mem.eql(u8, self.src[self.pos .. self.pos + s.len], s)) return false;
-        self.consumeN(s.len);
+        self.pos += s.len;
+        // 编译期判断前缀是否含换行：若无则批量加列号，避免逐字节循环
+        const has_nl = comptime blk: {
+            for (s) |c| {
+                if (c == '\n') break :blk true;
+            }
+            break :blk false;
+        };
+        if (comptime has_nl) {
+            for (s) |c| {
+                if (c == '\n') {
+                    self.loc.line += 1;
+                    self.loc.column = 1;
+                } else {
+                    self.loc.column += 1;
+                }
+            }
+        } else {
+            self.loc.column += s.len;
+        }
         return true;
     }
 
     /// 跳过空白字符（0x20、0x09、0x0D、0x0A）
     fn skipWhitespace(self: *Scanner) void {
-        while (self.peek()) |c| {
+        const start = self.pos;
+        // 直接 pos++ 无函数调用开销，最后统一 loc.update
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
             if (c != ' ' and c != '\t' and c != '\r' and c != '\n') break;
-            self.consume();
+            self.pos += 1;
         }
+        if (self.pos > start) self.loc.update(self.src[start..self.pos]);
     }
 
     /// 检查字节是否为 XML 名称起始字符
@@ -169,13 +192,14 @@ pub const Scanner = struct {
     /// 扫描 XML 名称，返回 (start, end) 偏移
     fn scanName(self: *Scanner) Error!struct { usize, usize } {
         const start = self.pos;
-        const first = self.peek() orelse return Error.UnexpectedEof;
-        if (!isNameStart(first)) return Error.MalformedXml;
-        self.consume();
-        while (self.peek()) |c| {
-            if (!isNameChar(c)) break;
-            self.consume();
+        if (self.pos >= self.src.len) return Error.UnexpectedEof;
+        if (!isNameStart(self.src[self.pos])) return Error.MalformedXml;
+        self.pos += 1;
+        // 直接 pos++ 无函数调用开销，最后统一 loc.update
+        while (self.pos < self.src.len and isNameChar(self.src[self.pos])) {
+            self.pos += 1;
         }
+        self.loc.update(self.src[start..self.pos]);
         return .{ start, self.pos };
     }
 
@@ -186,13 +210,11 @@ pub const Scanner = struct {
         if (q != '"' and q != '\'') return Error.MalformedXml;
         self.consume(); // consume opening quote
         const start = self.pos;
-        while (true) {
-            const c = self.peek() orelse return Error.UnexpectedEof;
-            if (c == q) break;
-            self.consume();
-        }
-        const end = self.pos;
-        self.consume(); // consume closing quote
+        // 用 indexOfScalarPos 直接定位闭合引号，避免逐字节 consume
+        const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, q) orelse
+            return Error.UnexpectedEof;
+        self.loc.update(self.src[self.pos .. end + 1]); // +1 将闭合引号计入位置
+        self.pos = end + 1; // 跳过闭合引号
         return .{ start, end, q };
     }
 
@@ -218,23 +240,21 @@ pub const Scanner = struct {
 
             // 注释: <!--
             if (self.eat("!--")) {
-                while (self.pos + 2 < self.src.len) {
-                    if (self.eat("-->")) break;
-                    self.consume();
-                } else {
+                // 用 indexOfPos 直接定位 "-->"，避免逐字节扫描
+                const end_pos = std.mem.indexOfPos(u8, self.src, self.pos, "-->") orelse
                     return Error.UnexpectedEof;
-                }
+                self.loc.update(self.src[self.pos .. end_pos + 3]);
+                self.pos = end_pos + 3;
                 return Token{ .typ = .comment, .start = start, .end = self.pos };
             }
 
             // CDATA: <![CDATA[
             if (self.eat("![CDATA[")) {
-                while (self.pos + 2 < self.src.len) {
-                    if (self.eat("]]>")) break;
-                    self.consume();
-                } else {
+                // 用 indexOfPos 直接定位 "]]>"，避免逐字节扫描
+                const end_pos = std.mem.indexOfPos(u8, self.src, self.pos, "]]>") orelse
                     return Error.UnexpectedEof;
-                }
+                self.loc.update(self.src[self.pos .. end_pos + 3]);
+                self.pos = end_pos + 3;
                 return Token{ .typ = .cdata, .start = start, .end = self.pos };
             }
 
@@ -268,21 +288,11 @@ pub const Scanner = struct {
                 else
                     false;
 
-                // 扫描至 ?>
-                while (self.pos + 1 < self.src.len) {
-                    if (self.src[self.pos] == '?' and self.src[self.pos + 1] == '>') {
-                        self.consumeN(2);
-                        break;
-                    }
-                    self.consume();
-                } else {
-                    // 单字节结尾时检查
-                    if (self.pos < self.src.len and self.src[self.pos] == '>') {
-                        self.consume();
-                    } else {
-                        return Error.UnexpectedEof;
-                    }
-                }
+                // 扫描至 ?>：用 indexOfPos 一次命中，避免逐字节循环
+                const pi_end = std.mem.indexOfPos(u8, self.src, self.pos, "?>") orelse
+                    return Error.UnexpectedEof;
+                self.loc.update(self.src[self.pos .. pi_end + 2]);
+                self.pos = pi_end + 2;
                 return Token{
                     .typ = if (is_xml_decl) .xml_declaration else .pi,
                     .start = start,
@@ -325,11 +335,10 @@ pub const Scanner = struct {
             }
         }
 
-        // 文本内容（非标签字符）
-        while (self.peek()) |ch| {
-            if (ch == '<') break;
-            self.consume();
-        }
+        // 文本内容（非标签字符）：用 indexOfScalarPos 加速（stdlib 内部可 SIMD 化）
+        const text_end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '<') orelse self.src.len;
+        self.loc.update(self.src[self.pos..text_end]);
+        self.pos = text_end;
         return Token{ .typ = .text, .start = start, .end = self.pos };
     }
 };

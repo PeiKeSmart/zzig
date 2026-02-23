@@ -175,9 +175,23 @@ pub const StructuredLog = struct {
         return buf.toOwnedSlice(self.allocator); // ✅ 传入 allocator
     }
 
-    /// JSON 转义字符串
+    /// JSON 转义字符串：批量写普通字节前缀，遇到需转义的字符刘处理
     fn writeEscapedString(writer: anytype, s: []const u8) !void {
-        for (s) |c| {
+        var pos: usize = 0;
+        while (pos < s.len) {
+            // 找到下一个需要转义的字节位置
+            var next = pos;
+            while (next < s.len) {
+                const c = s[next];
+                if (c == '"' or c == '\\' or c == '\n' or c == '\r' or c == '\t' or c < 32) break;
+                next += 1;
+            }
+            // 普通前缀一次批量写入
+            if (next > pos) try writer.writeAll(s[pos..next]);
+            if (next >= s.len) break;
+
+            const c = s[next];
+            pos = next + 1;
             switch (c) {
                 '"' => try writer.writeAll("\\\""),
                 '\\' => try writer.writeAll("\\\\"),
@@ -185,7 +199,7 @@ pub const StructuredLog = struct {
                 '\r' => try writer.writeAll("\\r"),
                 '\t' => try writer.writeAll("\\t"),
                 0...8, 11, 12, 14...31 => try writer.print("\\u{x:0>4}", .{c}), // ✅ 排除 \n \r \t
-                else => try writer.writeByte(c),
+                else => unreachable,
             }
         }
     }

@@ -84,7 +84,8 @@ pub const Reader = struct {
     scratch: std.ArrayList(u8),
 
     /// 元素名称栈（用于验证嵌套）
-    name_stack: std.ArrayList([]u8),
+    /// 存储指向 buf 的子切片，不进行顏外堆分配
+    name_stack: std.ArrayList([]const u8),
 
     /// XML 声明信息（若存在）
     xml_decl: ?scanner_mod.XmlDeclInfo,
@@ -168,7 +169,7 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         if (self.owns_buf) self.gpa.free(self.buf);
         self.scratch.deinit(self.gpa);
-        for (self.name_stack.items) |name| self.gpa.free(name);
+        // name_stack 存储的是 buf 内切片，无需逐个释放
         self.name_stack.deinit(self.gpa);
         self.* = undefined;
     }
@@ -182,11 +183,8 @@ pub const Reader = struct {
         if (self.pending_element_end) {
             self.pending_element_end = false;
             self.node = .element_end;
-            // 弹出名称栈
-            if (self.name_stack.items.len > 0) {
-                const name = self.name_stack.pop().?;
-                self.gpa.free(name);
-            }
+            // 弹出名称栈（切片直接丢弃，无需 free）
+            _ = self.name_stack.pop();
             return .element_end;
         }
 
@@ -218,14 +216,10 @@ pub const Reader = struct {
                 .element_start => {
                     self.attr_count = scanner_mod.parseElementAttrs(t.slice(self.buf), &self.attrs);
                     self.node = .element_start;
-                    // 将元素名压栈
+                    // 将元素名压栈（直接引用 buf 内切片，无需堆分配）
                     const nr = scanner_mod.elementNameRange(t.slice(self.buf));
                     const name = t.slice(self.buf)[nr.@"0"..nr.@"1"];
-                    const owned = self.gpa.dupe(u8, name) catch return ReadError.OutOfMemory;
-                    self.name_stack.append(self.gpa, owned) catch {
-                        self.gpa.free(owned);
-                        return ReadError.OutOfMemory;
-                    };
+                    self.name_stack.append(self.gpa, name) catch return ReadError.OutOfMemory;
                     return .element_start;
                 },
 
@@ -235,36 +229,22 @@ pub const Reader = struct {
                     // 空元素：先触发 element_start，再在下次 read 触发 element_end
                     const nr = scanner_mod.elementNameRange(t.slice(self.buf));
                     const name = t.slice(self.buf)[nr.@"0"..nr.@"1"];
-                    const owned = self.gpa.dupe(u8, name) catch return ReadError.OutOfMemory;
-                    self.name_stack.append(self.gpa, owned) catch {
-                        self.gpa.free(owned);
-                        return ReadError.OutOfMemory;
-                    };
+                    self.name_stack.append(self.gpa, name) catch return ReadError.OutOfMemory;
                     self.pending_element_end = true;
                     return .element_start;
                 },
 
                 .element_end => {
                     self.node = .element_end;
-                    // 弹出名称栈
-                    if (self.name_stack.items.len > 0) {
-                        const name = self.name_stack.pop().?;
-                        self.gpa.free(name);
-                    }
+                    // 弹出名称栈（切片直接丢弃，无需 free）
+                    _ = self.name_stack.pop();
                     return .element_end;
                 },
 
                 .text => {
                     // 跳过纯空白文本节点（只含空格/换行/制表）
                     const raw = t.slice(self.buf);
-                    var all_ws = true;
-                    for (raw) |c| {
-                        if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
-                            all_ws = false;
-                            break;
-                        }
-                    }
-                    if (all_ws and raw.len > 0) continue;
+                    if (raw.len > 0 and std.mem.trim(u8, raw, " \t\r\n").len == 0) continue;
                     self.node = .text;
                     return .text;
                 },

@@ -85,9 +85,9 @@ pub fn setLevel(level: Level) void {
     global_level = level;
 }
 
-/// 获取当前时间戳字符串 (格式: YYYY-MM-DD HH:MM:SS.nnnnnnnnn)
-/// 如果设置了时间偏移量，将应用服务器时间同步
-fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
+/// 将时间戳格式化到调用者提供的栈缓冲区（零堆分配）
+/// buf 至少 32 字节；格式固定为 YYYY-MM-DD HH:MM:SS.nnnnnnnnn（29 字节）
+fn formatTimestamp(buf: *[32]u8) []u8 {
     // 获取纳秒级时间戳
     const nanos: i128 = std.time.nanoTimestamp();
 
@@ -102,9 +102,7 @@ fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
 
     // 获取本地时区偏移（秒）
     const local_offset: i64 = getLocalTimezoneOffset();
-    const local_timestamp: i64 = timestamp + local_offset;
-
-    const seconds_since_epoch: i64 = local_timestamp;
+    const seconds_since_epoch: i64 = timestamp + local_offset;
 
     // 转换为本地时间
     const days_since_epoch = @divFloor(seconds_since_epoch, 86400);
@@ -117,9 +115,10 @@ fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
     // 准确的日期计算（考虑闰年）
     const date = epochDaysToDate(days_since_epoch);
 
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}", .{
+    // 直接写入栈缓冲区，无堆分配
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}", .{
         date.year, date.month, date.day, hour, minute, second, nano_part,
-    });
+    }) catch buf[0..29]; // bufPrint 不会失败（buf 足够大），catch 仅供编译器满足
 }
 
 /// 日期结构
@@ -129,54 +128,24 @@ const Date = struct {
     day: u32,
 };
 
-/// 判断是否为闰年
-fn isLeapYear(year: i64) bool {
-    return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
-}
-
-/// 获取指定月份的天数
-fn getDaysInMonth(year: i64, month: u32) u32 {
-    const days = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    if (month == 2 and isLeapYear(year)) {
-        return 29;
-    }
-    return days[month - 1];
-}
-
-/// 将 epoch 天数转换为日期
+/// 将 epoch 天数转换为日期（Howard Hinnant proleptic Gregorian 算法，O(1)）
+/// 替代原来从 1970 年逐年迭代的 O(N) 实现
 fn epochDaysToDate(days: i64) Date {
-    // 从 1970-01-01 开始计算
-    var year: i64 = 1970;
-    var remaining_days = days;
-
-    // 计算年份
-    while (true) {
-        const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
-        if (remaining_days < days_in_year) {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    // 计算月份和日期
-    var month: u32 = 1;
-    while (month <= 12) {
-        const days_in_month = getDaysInMonth(year, month);
-        if (remaining_days < days_in_month) {
-            break;
-        }
-        remaining_days -= days_in_month;
-        month += 1;
-    }
-
-    const day: u32 = @intCast(remaining_days + 1);
-
-    return Date{
-        .year = @intCast(year),
-        .month = month,
-        .day = day,
-    };
+    // 将历元平移到公历 0000-03-01，使闰年处理更简洁
+    const z: i64 = days + 719468;
+    // 400 年周期（每周期 146097 天）
+    const era: i64 = @divFloor(z, 146097);
+    const doe: u32 = @intCast(z - era * 146097); // 周期内天数 [0, 146096]
+    // 周期内年份（Hinnant 公式）
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // 年内天数 [0, 365]
+    // 月份（以 3 月为第 0 月）
+    const mp: u32 = (5 * doy + 2) / 153;
+    const d: u32 = doy - (153 * mp + 2) / 5 + 1; // 日 [1, 31]
+    const m: u32 = if (mp < 10) mp + 3 else mp - 9; // 月 [1, 12]
+    const yr: u32 = @intCast(y + @as(i64, if (m <= 2) 1 else 0));
+    return Date{ .year = yr, .month = m, .day = d };
 }
 
 /// 获取本地时区偏移量（秒）
@@ -226,7 +195,8 @@ fn getLocalTimezoneOffset() i64 {
 }
 
 /// 跨平台打印函数：Windows 使用 WriteConsoleW 确保中文正确显示
-fn printUtf8(text: []const u8) void {
+/// alloc 由调用方传入（复用外层 arena），避免 Windows 路径下的二次 arena 创建
+fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
     if (builtin.os.tag != .windows) {
         std.debug.print("{s}", .{text});
         return;
@@ -241,11 +211,7 @@ fn printUtf8(text: []const u8) void {
         return;
     }
 
-    // 转换为 UTF-16LE
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
+    // 转换为 UTF-16LE，复用调用方的 arena，无额外年算层开销
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch {
         std.debug.print("{s}", .{text});
         return;
@@ -272,8 +238,9 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // 获取时间戳
-    const timestamp = getTimestamp(allocator) catch "????-??-?? ??:??:??.?????????";
+    // 时间戳写入栈内存，无堆分配
+    var ts_buf: [32]u8 = undefined;
+    const timestamp = formatTimestamp(&ts_buf);
 
     // 格式化用户消息
     const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
@@ -289,7 +256,7 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
         .{ color_code, timestamp, color_code, level_label, reset_code, message },
     ) catch return;
 
-    printUtf8(full_message);
+    printUtf8(allocator, full_message);
 }
 
 /// 调试级别日志
@@ -324,8 +291,9 @@ pub fn always(comptime fmt: []const u8, args: anytype) void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // 获取时间戳
-    const timestamp = getTimestamp(allocator) catch "????-??-?? ??:??:??.?????????";
+    // 时间戳写入栈内存，无堆分配
+    var ts_buf: [32]u8 = undefined;
+    const timestamp = formatTimestamp(&ts_buf);
 
     // 格式化用户消息
     const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
@@ -341,7 +309,7 @@ pub fn always(comptime fmt: []const u8, args: anytype) void {
         .{ color_code, timestamp, color_code, level_label, reset_code, message },
     ) catch return;
 
-    printUtf8(full_message);
+    printUtf8(allocator, full_message);
 }
 
 /// 不带时间戳和级别的简单打印（用于替换原有的简单打印场景）
@@ -357,5 +325,5 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     const allocator = arena.allocator();
 
     const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
-    printUtf8(message);
+    printUtf8(allocator, message);
 }
