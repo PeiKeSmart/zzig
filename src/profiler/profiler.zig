@@ -131,10 +131,13 @@ pub const Profiler = struct {
     }
 
     /// 判断是否采样
+    /// prng 非线程安全，需在 mutex 保护下访问
     fn shouldSample(self: *Profiler) bool {
         if (self.config.sample_rate >= 1.0) return true;
         if (self.config.sample_rate <= 0.0) return false;
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const random_value = self.prng.random().float(f32);
         return random_value < self.config.sample_rate;
     }
@@ -199,6 +202,12 @@ pub const Profiler = struct {
                 .name = entry.key_ptr.*,
                 .metrics = entry.value_ptr.*,
             }) catch continue;
+        }
+
+        // 无数据时跳过排序，避免 entries.items[0] 越界 panic
+        if (entries.items.len == 0) {
+            std.debug.print("(无性能数据)\n", .{});
+            return;
         }
 
         std.mem.sort(@TypeOf(entries.items[0]), entries.items, {}, struct {

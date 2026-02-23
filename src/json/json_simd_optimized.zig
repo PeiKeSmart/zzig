@@ -88,8 +88,9 @@ fn simdFindCharSSE2(haystack: []const u8, needle: u8) ?usize {
         }
     }
 
-    // 标量处理剩余部分
-    return simdFindCharScalar(haystack[i..], needle);
+    // 标量处理剩余部分：返回值是子切片内索引，需加 i 还原为原始索引
+    if (simdFindCharScalar(haystack[i..], needle)) |j| return i + j;
+    return null;
 }
 
 /// ✅ AVX2 实现（x86_64，32 字节并行）
@@ -123,7 +124,9 @@ fn simdFindCharAVX2(haystack: []const u8, needle: u8) ?usize {
         }
     }
 
-    return simdFindCharSSE2(haystack[i..], needle); // 回退到 SSE2
+    // 回退到 SSE2：返回值是子切片内索引，需加 i 还原为原始索引
+    if (simdFindCharSSE2(haystack[i..], needle)) |j| return i + j;
+    return null;
 }
 
 /// ✅ NEON 实现（AArch64，16 字节并行）
@@ -154,7 +157,9 @@ fn simdFindCharNEON(haystack: []const u8, needle: u8) ?usize {
         }
     }
 
-    return simdFindCharScalar(haystack[i..], needle);
+    // 标量处理剩余部分：返回值是子切片内索引，需加 i 还原为原始索引
+    if (simdFindCharScalar(haystack[i..], needle)) |j| return i + j;
+    return null;
 }
 
 /// 标量回退实现

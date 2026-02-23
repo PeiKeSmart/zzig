@@ -234,22 +234,31 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
         defer log_mutex.unlock();
     }
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
     // 时间戳写入栈内存，无堆分配
     var ts_buf: [32]u8 = undefined;
     const timestamp = formatTimestamp(&ts_buf);
 
-    // 格式化用户消息
-    const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
-
-    // 组装完整日志
     const color_code = level.color();
     const reset_code = "\x1b[0m";
     const level_label = level.label();
 
+    // 非 Windows：直接两次写 stderr，零堆分配（无 arena、无 allocPrint）
+    // log_mutex（已在上方持有）保证同一进程内日志行不交错
+    if (builtin.os.tag != .windows) {
+        std.debug.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code });
+        std.debug.print(fmt ++ "\n", args);
+        return;
+    }
+
+    // Windows：需要 UTF-16 转换，使用 arena 承载中间字符串
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // 格式化用户消息
+    const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
+
+    // 组装完整日志（WriteConsoleW 需要一次性写入）
     const full_message = std.fmt.allocPrint(
         allocator,
         "{s}[{s}] {s}{s}{s} {s}\n",
