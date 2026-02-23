@@ -895,7 +895,18 @@ pub const AsyncLogger = struct {
 
         // 预留空间给代理对(Surrogate Pair),避免越界
         while (utf8_index < text.len and utf16_len + 2 <= self.worker_utf16_buffer.len) {
-            const char_len = std.unicode.utf8ByteSequenceLength(text[utf8_index]) catch break;
+            const first_byte = text[utf8_index];
+
+            // ASCII 快速路径：日志文本(含 ANSI 色彩码)绝大多数为 ASCII，
+            // 直接零扩展为 u16，跳过 utf8ByteSequenceLength + utf8Decode 开销
+            if (first_byte < 0x80) {
+                self.worker_utf16_buffer[utf16_len] = first_byte;
+                utf16_len += 1;
+                utf8_index += 1;
+                continue;
+            }
+
+            const char_len = std.unicode.utf8ByteSequenceLength(first_byte) catch break;
             if (utf8_index + char_len > text.len) break;
 
             const codepoint = std.unicode.utf8Decode(text[utf8_index..][0..char_len]) catch break;

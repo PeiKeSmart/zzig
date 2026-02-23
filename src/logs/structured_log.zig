@@ -175,17 +175,25 @@ pub const StructuredLog = struct {
         return buf.toOwnedSlice(self.allocator); // ✅ 传入 allocator
     }
 
-    /// JSON 转义字符串：批量写普通字节前缀，遇到需转义的字符刘处理
+    /// comptime 查表：标记所有需要 JSON 转义的字节（0=无需转义，1=需转义）
+    /// 包含 0-31 控制字符、'"'、'\\'，单次 bool 查表代替 6 次比较
+    const JSON_ESCAPE_TABLE: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        // 控制字符 0-31 全部需要转义
+        var i: u8 = 0;
+        while (i < 32) : (i += 1) table[i] = true;
+        table['"'] = true;
+        table['\\'] = true;
+        break :blk table;
+    };
+
+    /// JSON 转义字符串：批量写普通字节前缀，遇到需转义的字符处理
     fn writeEscapedString(writer: anytype, s: []const u8) !void {
         var pos: usize = 0;
         while (pos < s.len) {
-            // 找到下一个需要转义的字节位置
+            // 用 comptime 查表定位下一个需要转义的字节，单次 bool 查表代替 6 次比较
             var next = pos;
-            while (next < s.len) {
-                const c = s[next];
-                if (c == '"' or c == '\\' or c == '\n' or c == '\r' or c == '\t' or c < 32) break;
-                next += 1;
-            }
+            while (next < s.len and !JSON_ESCAPE_TABLE[s[next]]) : (next += 1) {}
             // 普通前缀一次批量写入
             if (next > pos) try writer.writeAll(s[pos..next]);
             if (next >= s.len) break;

@@ -83,6 +83,7 @@ pub fn showMenu(allocator: std.mem.Allocator, config: MenuConfig, items: []const
 
     // 如果输入为空，使用默认值
     if (input.len == 0) {
+        allocator.free(input); // 释放空输入的内存，避免泄漏
         if (config.default_key) |default| {
             return try allocator.dupe(u8, default);
         }
@@ -187,18 +188,32 @@ pub const MenuResult = union(enum) {
 };
 
 /// 清屏（跨平台）
+/// - Unix/Linux/macOS：直接写 ANSI 转义码（\x1b[2J\x1b[H），一次 write 系统调用
+/// - Windows：先检测虚拟终端是否已启用（ENABLE_VIRTUAL_TERMINAL_PROCESSING），
+///   已启用则使用 ANSI 序列（快速），未启用则 spawn cls 降级（兼容旧终端）
 pub fn clearScreen() void {
     const builtin = @import("builtin");
     if (builtin.os.tag == .windows) {
-        _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
-            .argv = &[_][]const u8{"cls"},
-        }) catch {};
+        const w = std.os.windows;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: w.DWORD = 0x0004;
+        const h = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+        var mode: w.DWORD = 0;
+        if (h != null and h != w.INVALID_HANDLE_VALUE and
+            w.kernel32.GetConsoleMode(h.?, &mode) != 0 and
+            (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0)
+        {
+            // 虚拟终端已启用，直接写 ANSI 转义序列（微秒级）
+            std.debug.print("\x1b[2J\x1b[H", .{});
+        } else {
+            // 降级：spawn cls（毫秒级，但兼容所有 Windows 终端）
+            _ = std.process.Child.run(.{
+                .allocator = std.heap.page_allocator,
+                .argv = &[_][]const u8{"cls"},
+            }) catch {};
+        }
     } else {
-        _ = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
-            .argv = &[_][]const u8{"clear"},
-        }) catch {};
+        // Unix/Linux/macOS 默认支持 ANSI，直接写转义码
+        std.debug.print("\x1b[2J\x1b[H", .{});
     }
 }
 
