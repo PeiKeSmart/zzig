@@ -743,22 +743,22 @@ pub const AsyncLogger = struct {
 
     /// 动态分配写入路径（兼容旧行为）
     fn writeLogDynamic(self: *AsyncLogger, msg: LogMessage, timestamp_s: i128, timestamp_ns: i128, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
-        const formatted = std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
-            .{
-                color_code,
-                timestamp_s,
-                timestamp_ns,
-                color_code,
-                level_label,
-                reset_code,
-                msg.message[0..msg.len],
-            },
-        ) catch return;
-
         switch (self.output_target) {
             .console => {
+                const formatted = std.fmt.allocPrint(
+                    std.heap.page_allocator,
+                    "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
+                    .{
+                        color_code,
+                        timestamp_s,
+                        timestamp_ns,
+                        color_code,
+                        level_label,
+                        reset_code,
+                        msg.message[0..msg.len],
+                    },
+                ) catch return;
+                defer std.heap.page_allocator.free(formatted);
                 printUtf8(formatted);
             },
             .file => {
@@ -767,6 +767,20 @@ pub const AsyncLogger = struct {
                 };
             },
             .both => {
+                const formatted = std.fmt.allocPrint(
+                    std.heap.page_allocator,
+                    "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
+                    .{
+                        color_code,
+                        timestamp_s,
+                        timestamp_ns,
+                        color_code,
+                        level_label,
+                        reset_code,
+                        msg.message[0..msg.len],
+                    },
+                ) catch return;
+                defer std.heap.page_allocator.free(formatted);
                 printUtf8(formatted);
                 self.writeToFile(msg, timestamp_s, timestamp_ns, level_label) catch |write_err| {
                     std.debug.print("❌ 写入日志文件失败: {}\n", .{write_err});

@@ -277,29 +277,24 @@ pub fn Jsmn(comptime cfg: Config) type {
             const start = pos_ptr.*;
             if (start >= input.len) return Error.InvalidString;
 
-            pos_ptr.* += 1;
-            var pos = pos_ptr.*;
-            var escaped = false;
+            // 批量跳过普通字符：直接定位到下一个 \ 或 "，避免逐字节检测
+            var pos: usize = @as(usize, pos_ptr.*) + 1;
             var has_esc = false;
 
             while (pos < input.len) {
-                const ch = input[pos];
-                if (ch == '\\' and !escaped) {
-                    escaped = true;
-                    has_esc = true;
-                    pos += 1;
-                    continue;
-                }
-                if (ch == '"' and !escaped) {
-                    pos_ptr.* = pos + 1;
+                const next = std.mem.indexOfAnyPos(u8, input, pos, "\\\"") orelse
+                    return Error.InvalidString;
+                if (input[next] == '"') {
+                    pos_ptr.* = @intCast(next + 1);
                     return .{
                         .start = start + 1,
-                        .end = pos,
+                        .end = @intCast(next),
                         .has_escapes = has_esc,
                     };
                 }
-                escaped = false;
-                pos += 1;
+                // 反斜杠：直接跳过转义字符对（\ + 被转义字符），无需 escaped 标志
+                has_esc = true;
+                pos = next + 2;
             }
             return Error.InvalidString;
         }
@@ -550,19 +545,18 @@ pub fn Jsmn(comptime cfg: Config) type {
                         // String token
                         c += 1;
                         i += 1;
-                        // Skip until closing quote
-                        var escaped = false;
+                        // 批量跳过普通字符：直接定位到下一个 \ 或 "，避免逐字节检测
                         while (i < len) {
-                            const ch = input[i];
-                            if (ch == '\\' and !escaped) {
-                                escaped = true;
-                            } else if (ch == '"' and !escaped) {
-                                i += 1;
+                            const next = std.mem.indexOfAnyPos(u8, input, i, "\\\"") orelse {
+                                i = len;
                                 break;
-                            } else {
-                                escaped = false;
+                            };
+                            if (input[next] == '"') {
+                                i = next + 1;
+                                break;
                             }
-                            i += 1;
+                            // 反斜杠：跳过转义字符对
+                            i = next + 2;
                         }
                     },
                     ',', ':', ' ', '\t', '\n', '\r' => {
