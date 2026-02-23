@@ -362,6 +362,42 @@ const version_15 = struct {
         const json_large_step = b.step("json-large", "测试大型 JSON 紧凑格式自动回退");
         json_large_step.dependOn(&run_json_large.step);
 
+        // ========== XML 模块示例 ==========
+        const xml_example_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "xml_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        xml_example_module.addImport("zzig", zzig);
+
+        const xml_example_exe = b.addExecutable(.{
+            .name = "xml_example",
+            .root_module = xml_example_module,
+        });
+        b.installArtifact(xml_example_exe);
+
+        const run_xml_example = b.addRunArtifact(xml_example_exe);
+
+        const xml_example_step = b.step("xml-demo", "运行 XML 解析和写入示例");
+        xml_example_step.dependOn(&run_xml_example.step);
+
+        // XML 模块单元测试
+        const xml_test_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "xml", "xml.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const xml_unit_tests = b.addTest(.{
+            .name = "xml-tests",
+            .root_module = xml_test_module,
+        });
+
+        const run_xml_tests = b.addRunArtifact(xml_unit_tests);
+
+        const xml_test_step = b.step("xml-test", "运行 XML 模块单元测试");
+        xml_test_step.dependOn(&run_xml_tests.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块
@@ -379,6 +415,7 @@ const version_15 = struct {
 
         const run_zzig_tests = b.addRunArtifact(zzig_unit_tests);
         test_step.dependOn(&run_zzig_tests.step);
+        test_step.dependOn(&run_xml_tests.step);
     }
     fn generateDocs(b: *Build, optimize: OptimizeMode, target: Build.ResolvedTarget) void {
         const sources = [_]struct { name: []const u8, path: []const []const u8 }{

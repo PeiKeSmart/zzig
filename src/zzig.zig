@@ -91,3 +91,18 @@ pub const json = struct {
         });
     }
 };
+
+/// XML 处理模块（解析 + 写入 + DOM，纯 Zig 实现，无外部依赖）
+///
+/// 三层 API：
+///   1. 底层扫描器  xml.Scanner         — 无分配、字节级扫描，适合嵌入式
+///   2. 流式读取器  xml.Reader          — 事件驱动，SAX 风格，适合大文件
+///   3. DOM 树      xml.Dom             — 解析后可随机访问，适合一般用途
+///
+/// 便捷函数：
+///   xml.parse(alloc, src)             — 内存切片 → DOM Document
+///   xml.parseFile(alloc, path)        — 文件路径 → DOM Document
+///   xml.createWriter(alloc, out, opt) — 创建 XML Writer
+///   xml.writeToFile(doc, alloc, path, opt) — DOM→文件
+///   xml.toString(doc, alloc, opt)     — DOM→字符串
+pub const xml = @import("xml/xml.zig");
