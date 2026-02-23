@@ -694,32 +694,67 @@ pub const AsyncLogger = struct {
         try self.openLogFile();
     }
 
+    /// 将纳秒时间戳转换为可读格式 YYYY-MM-DD HH:MM:SS.mmm
+    ///
+    /// 时区固定为 UTC+8（中国标准时间）。buf 长度至少需要 23 字节。
+    /// 使用 Howard Hinnant 公历算法（公共领域）将天数转换为年月日。
+    fn formatTimestampReadable(ns: i128, buf: []u8) []u8 {
+        const offset_ns: i128 = 8 * 3600 * std.time.ns_per_s; // UTC+8
+        const total_ns = ns + offset_ns;
+        const total_secs: i64 = @intCast(@divFloor(total_ns, std.time.ns_per_s));
+        const ms_part: u32 = @intCast(@mod(@divFloor(total_ns, std.time.ns_per_ms), 1000));
+
+        // 当天内时分秒
+        const day_secs: u32 = @intCast(@mod(total_secs, 86_400));
+        const hh: u32 = day_secs / 3600;
+        const mn: u32 = (day_secs % 3600) / 60;
+        const ss: u32 = day_secs % 60;
+
+        // Howard Hinnant 公历算法：Unix 天数 → 年月日
+        var z: i32 = @intCast(@divFloor(total_secs, 86_400));
+        z += 719_468;
+        const era: i32 = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+        const doe: u32 = @intCast(z - era * 146_097);
+        const yoe: u32 = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        const y: i32 = @as(i32, @intCast(yoe)) + era * 400;
+        const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const mp: u32 = (5 * doy + 2) / 153;
+        const d: u32 = doy - (153 * mp + 2) / 5 + 1;
+        const m: u32 = if (mp < 10) mp + 3 else mp - 9;
+        const yr: i32 = if (m <= 2) y + 1 else y;
+
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+            yr, m, d, hh, mn, ss, ms_part,
+        }) catch buf[0..0];
+    }
+
     /// 实际写入日志（在后台线程执行）
     fn writeLog(self: *AsyncLogger, msg: LogMessage) void {
         const color_code = msg.level.color();
         const reset_code = "\x1b[0m";
         const level_label = msg.level.label();
-        const timestamp_s = @divFloor(msg.timestamp, std.time.ns_per_s);
-        const timestamp_ns = @mod(msg.timestamp, std.time.ns_per_s);
+
+        // 转换为可读时间戳 YYYY-MM-DD HH:MM:SS.mmm
+        var ts_buf: [23]u8 = undefined;
+        const ts = formatTimestampReadable(msg.timestamp, &ts_buf);
 
         // 零分配模式：使用预分配缓冲区
         if (self.worker_format_buffer.len > 0) {
-            self.writeLogZeroAlloc(msg, timestamp_s, timestamp_ns, level_label, color_code, reset_code);
+            self.writeLogZeroAlloc(msg, ts, level_label, color_code, reset_code);
         } else {
-            self.writeLogDynamic(msg, timestamp_s, timestamp_ns, level_label, color_code, reset_code);
+            self.writeLogDynamic(msg, ts, level_label, color_code, reset_code);
         }
     }
 
     /// 零分配写入路径
-    fn writeLogZeroAlloc(self: *AsyncLogger, msg: LogMessage, timestamp_s: i128, timestamp_ns: i128, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
+    fn writeLogZeroAlloc(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
         // 使用预分配的 worker_format_buffer
         const formatted = std.fmt.bufPrint(
             self.worker_format_buffer,
-            "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
+            "{s}[{s}] {s}{s}{s} {s}\n",
             .{
                 color_code,
-                timestamp_s,
-                timestamp_ns,
+                ts,
                 color_code,
                 level_label,
                 reset_code,
@@ -742,16 +777,15 @@ pub const AsyncLogger = struct {
     }
 
     /// 动态分配写入路径（兼容旧行为）
-    fn writeLogDynamic(self: *AsyncLogger, msg: LogMessage, timestamp_s: i128, timestamp_ns: i128, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
+    fn writeLogDynamic(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
         switch (self.output_target) {
             .console => {
                 const formatted = std.fmt.allocPrint(
                     std.heap.page_allocator,
-                    "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
+                    "{s}[{s}] {s}{s}{s} {s}\n",
                     .{
                         color_code,
-                        timestamp_s,
-                        timestamp_ns,
+                        ts,
                         color_code,
                         level_label,
                         reset_code,
@@ -762,18 +796,17 @@ pub const AsyncLogger = struct {
                 printUtf8(formatted);
             },
             .file => {
-                self.writeToFile(msg, timestamp_s, timestamp_ns, level_label) catch |write_err| {
+                self.writeToFile(msg, ts, level_label) catch |write_err| {
                     std.debug.print("❌ 写入日志文件失败: {}\n", .{write_err});
                 };
             },
             .both => {
                 const formatted = std.fmt.allocPrint(
                     std.heap.page_allocator,
-                    "{s}[{d}.{d:0>9}] {s}{s}{s} {s}\n",
+                    "{s}[{s}] {s}{s}{s} {s}\n",
                     .{
                         color_code,
-                        timestamp_s,
-                        timestamp_ns,
+                        ts,
                         color_code,
                         level_label,
                         reset_code,
@@ -782,7 +815,7 @@ pub const AsyncLogger = struct {
                 ) catch return;
                 defer std.heap.page_allocator.free(formatted);
                 printUtf8(formatted);
-                self.writeToFile(msg, timestamp_s, timestamp_ns, level_label) catch |write_err| {
+                self.writeToFile(msg, ts, level_label) catch |write_err| {
                     std.debug.print("❌ 写入日志文件失败: {}\n", .{write_err});
                 };
             },
@@ -790,7 +823,7 @@ pub const AsyncLogger = struct {
     }
 
     /// 写入日志到文件
-    fn writeToFile(self: *AsyncLogger, msg: LogMessage, timestamp_s: i128, timestamp_ns: i128, level_label: []const u8) !void {
+    fn writeToFile(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8) !void {
         if (self.log_file) |file| {
             // 检查是否需要轮转
             try self.checkRotation();
@@ -798,10 +831,9 @@ pub const AsyncLogger = struct {
             // 格式化日志内容（不带颜色）
             const formatted = try std.fmt.allocPrint(
                 self.allocator,
-                "[{d}.{d:0>9}] {s} {s}\n",
+                "[{s}] {s} {s}\n",
                 .{
-                    timestamp_s,
-                    timestamp_ns,
+                    ts,
                     level_label,
                     msg.message[0..msg.len],
                 },
