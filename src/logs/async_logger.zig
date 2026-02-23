@@ -78,19 +78,32 @@ pub const Level = enum {
             .err => "ERROR",
         };
     }
+
+    /// 单字符类型标识，参考 NewLife 日志风格
+    /// D=调试 I=信息 W=警告 E=错误
+    pub fn kindChar(self: Level) u8 {
+        return switch (self) {
+            .debug => 'D',
+            .info => 'I',
+            .warn => 'W',
+            .err => 'E',
+        };
+    }
 };
 
 /// 日志消息（固定大小，避免跨线程内存管理复杂性）
 pub const LogMessage = struct {
     level: Level,
     timestamp: i128,
+    thread_id: u64, // 发起日志的线程 ID（调用 log() 时捕获）
     message: [1024]u8, // 1KB 缓冲区
     len: usize,
 
-    pub fn init(level: Level, timestamp: i128, formatted: []const u8) LogMessage {
+    pub fn init(level: Level, timestamp: i128, thread_id: u64, formatted: []const u8) LogMessage {
         var msg: LogMessage = undefined;
         msg.level = level;
         msg.timestamp = timestamp;
+        msg.thread_id = thread_id;
         msg.len = @min(formatted.len, msg.message.len);
         @memcpy(msg.message[0..msg.len], formatted[0..msg.len]);
         return msg;
@@ -732,7 +745,9 @@ pub const AsyncLogger = struct {
     fn writeLog(self: *AsyncLogger, msg: LogMessage) void {
         const color_code = msg.level.color();
         const reset_code = "\x1b[0m";
-        const level_label = msg.level.label();
+        const kind = msg.level.kindChar();
+        // 线程 ID 取低 4 位显示，避免过长
+        const tid: u32 = @intCast(msg.thread_id % 10000);
 
         // 转换为可读时间戳 YYYY-MM-DD HH:MM:SS.mmm
         var ts_buf: [32]u8 = undefined; // 32 字节余量足够大，实际输出 23 字节
@@ -740,23 +755,23 @@ pub const AsyncLogger = struct {
 
         // 零分配模式：使用预分配缓冲区
         if (self.worker_format_buffer.len > 0) {
-            self.writeLogZeroAlloc(msg, ts, level_label, color_code, reset_code);
+            self.writeLogZeroAlloc(msg, ts, tid, kind, color_code, reset_code);
         } else {
-            self.writeLogDynamic(msg, ts, level_label, color_code, reset_code);
+            self.writeLogDynamic(msg, ts, tid, kind, color_code, reset_code);
         }
     }
 
     /// 零分配写入路径
-    fn writeLogZeroAlloc(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
-        // 使用预分配的 worker_format_buffer
+    fn writeLogZeroAlloc(self: *AsyncLogger, msg: LogMessage, ts: []const u8, tid: u32, kind: u8, color_code: []const u8, reset_code: []const u8) void {
+        // 格式：{color}{ts} {tid:0>4} {kind}{reset} {message}
         const formatted = std.fmt.bufPrint(
             self.worker_format_buffer,
-            "{s}[{s}] {s}{s}{s} {s}\n",
+            "{s}{s} {d:0>4} {c}{s} {s}\n",
             .{
                 color_code,
                 ts,
-                color_code,
-                level_label,
+                tid,
+                kind,
                 reset_code,
                 msg.message[0..msg.len],
             },
@@ -777,17 +792,17 @@ pub const AsyncLogger = struct {
     }
 
     /// 动态分配写入路径（兼容旧行为）
-    fn writeLogDynamic(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8, color_code: []const u8, reset_code: []const u8) void {
+    fn writeLogDynamic(self: *AsyncLogger, msg: LogMessage, ts: []const u8, tid: u32, kind: u8, color_code: []const u8, reset_code: []const u8) void {
         switch (self.output_target) {
             .console => {
                 const formatted = std.fmt.allocPrint(
                     std.heap.page_allocator,
-                    "{s}[{s}] {s}{s}{s} {s}\n",
+                    "{s}{s} {d:0>4} {c}{s} {s}\n",
                     .{
                         color_code,
                         ts,
-                        color_code,
-                        level_label,
+                        tid,
+                        kind,
                         reset_code,
                         msg.message[0..msg.len],
                     },
@@ -796,26 +811,26 @@ pub const AsyncLogger = struct {
                 printUtf8(formatted);
             },
             .file => {
-                self.writeToFile(msg, ts, level_label) catch |write_err| {
+                self.writeToFile(msg, ts, tid, kind) catch |write_err| {
                     std.debug.print("❌ 写入日志文件失败: {}\n", .{write_err});
                 };
             },
             .both => {
                 const formatted = std.fmt.allocPrint(
                     std.heap.page_allocator,
-                    "{s}[{s}] {s}{s}{s} {s}\n",
+                    "{s}{s} {d:0>4} {c}{s} {s}\n",
                     .{
                         color_code,
                         ts,
-                        color_code,
-                        level_label,
+                        tid,
+                        kind,
                         reset_code,
                         msg.message[0..msg.len],
                     },
                 ) catch return;
                 defer std.heap.page_allocator.free(formatted);
                 printUtf8(formatted);
-                self.writeToFile(msg, ts, level_label) catch |write_err| {
+                self.writeToFile(msg, ts, tid, kind) catch |write_err| {
                     std.debug.print("❌ 写入日志文件失败: {}\n", .{write_err});
                 };
             },
@@ -823,18 +838,20 @@ pub const AsyncLogger = struct {
     }
 
     /// 写入日志到文件
-    fn writeToFile(self: *AsyncLogger, msg: LogMessage, ts: []const u8, level_label: []const u8) !void {
+    fn writeToFile(self: *AsyncLogger, msg: LogMessage, ts: []const u8, tid: u32, kind: u8) !void {
         if (self.log_file) |file| {
             // 检查是否需要轮转
             try self.checkRotation();
 
-            // 格式化日志内容（不带颜色）
+            // 文件格式：无 ANSI 颜色，纯文本
+            // 格式：{ts} {tid:0>4} {kind} {message}
             const formatted = try std.fmt.allocPrint(
                 self.allocator,
-                "[{s}] {s} {s}\n",
+                "{s} {d:0>4} {c} {s}\n",
                 .{
                     ts,
-                    level_label,
+                    tid,
+                    kind,
                     msg.message[0..msg.len],
                 },
             );
@@ -1030,8 +1047,8 @@ pub const AsyncLogger = struct {
             break :blk TLS.format_buffer[0 .. max_len + truncated.len];
         };
 
-        // 创建日志消息
-        const msg = LogMessage.init(level, std.time.nanoTimestamp(), formatted);
+        // 创建日志消息（在调用线程捕获线程 ID）
+        const msg = LogMessage.init(level, std.time.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
 
         // 尝试推入队列
         if (!self.queue.tryPush(msg)) {
@@ -1055,7 +1072,7 @@ pub const AsyncLogger = struct {
         };
 
         // 创建日志消息
-        const msg = LogMessage.init(level, std.time.nanoTimestamp(), formatted);
+        const msg = LogMessage.init(level, std.time.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
 
         // 尝试推入队列
         if (!self.queue.tryPush(msg)) {
