@@ -526,17 +526,7 @@ pub fn decodeText(src: []const u8, writer: anytype) !void {
         const entity = src[pos..semi];
         pos = semi + 1;
 
-        if (std.mem.eql(u8, entity, "amp")) {
-            try writer.writeByte('&');
-        } else if (std.mem.eql(u8, entity, "lt")) {
-            try writer.writeByte('<');
-        } else if (std.mem.eql(u8, entity, "gt")) {
-            try writer.writeByte('>');
-        } else if (std.mem.eql(u8, entity, "apos")) {
-            try writer.writeByte('\'');
-        } else if (std.mem.eql(u8, entity, "quot")) {
-            try writer.writeByte('"');
-        } else if (entity.len > 1 and entity[0] == '#') {
+        if (entity.len > 1 and entity[0] == '#') {
             // 字符引用
             const num_str = entity[1..];
             const code_point: u21 = blk: {
@@ -550,10 +540,29 @@ pub fn decodeText(src: []const u8, writer: anytype) !void {
             const len = std.unicode.utf8Encode(code_point, &buf) catch 1;
             try writer.writeAll(buf[0..len]);
         } else {
-            // 未知实体，原样输出
-            try writer.writeByte('&');
-            try writer.writeAll(entity);
-            try writer.writeByte(';');
+            const named_entity = switch (entity.len) {
+                2 => switch (entity[0]) {
+                    'l' => if (entity[1] == 't') @as(?u8, '<') else null,
+                    'g' => if (entity[1] == 't') @as(?u8, '>') else null,
+                    else => null,
+                },
+                3 => if (entity[0] == 'a' and entity[1] == 'm' and entity[2] == 'p') @as(?u8, '&') else null,
+                4 => switch (entity[0]) {
+                    'a' => if (entity[1] == 'p' and entity[2] == 'o' and entity[3] == 's') @as(?u8, '\'') else null,
+                    'q' => if (entity[1] == 'u' and entity[2] == 'o' and entity[3] == 't') @as(?u8, '"') else null,
+                    else => null,
+                },
+                else => null,
+            };
+
+            if (named_entity) |decoded| {
+                try writer.writeByte(decoded);
+            } else {
+                // 未知实体，原样输出
+                try writer.writeByte('&');
+                try writer.writeAll(entity);
+                try writer.writeByte(';');
+            }
         }
     }
 }
@@ -633,7 +642,18 @@ test "decodeText" {
     var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(std.testing.allocator);
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    errdefer buf = buf_writer.toArrayList();
     try decodeText("hello &amp; &lt;world&gt;", &buf_writer.writer);
     buf = buf_writer.toArrayList();
     try std.testing.expectEqualStrings("hello & <world>", buf.items);
+}
+
+test "decodeText mixed entities" {
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    errdefer buf = buf_writer.toArrayList();
+    try decodeText("&apos;x&quot; &#65; &#x42; &unknown;", &buf_writer.writer);
+    buf = buf_writer.toArrayList();
+    try std.testing.expectEqualStrings("'x\" A B &unknown;", buf.items);
 }

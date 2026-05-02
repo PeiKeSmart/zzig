@@ -257,7 +257,8 @@ pub const AsyncLoggerConfig = struct {
         var buffer: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buffer);
-        var writer = aw.writer;
+        errdefer buffer = aw.toArrayList();
+        const writer = &aw.writer;
 
         // 写入格式化的 JSON (带注释说明)
         try writer.writeAll("{\n");

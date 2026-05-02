@@ -25,7 +25,7 @@ pub fn main() !void {
     {
         var xml_buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &xml_buf);
         defer xml_buf = xml_buf_writer.toArrayList();
-        var w = xml.createWriter(gpa, xml_buf_writer.writer, .{ .indent = "  " });
+        var w = xml.createAllocatingWriter(gpa, &xml_buf_writer, .{ .indent = "  " });
         defer w.deinit();
 
         try w.xmlDeclaration("UTF-8", null);

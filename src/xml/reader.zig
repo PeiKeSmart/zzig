@@ -326,8 +326,12 @@ pub const Reader = struct {
     /// 返回第 n 个属性值（已解码实体引用，分配新内存）
     pub fn attributeValueAlloc(self: *Reader, n: usize) Allocator.Error![]u8 {
         const raw = self.attributeValueRaw(n);
+        if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+            return self.gpa.dupe(u8, raw);
+        }
         self.scratch.clearRetainingCapacity();
         var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &self.scratch);
+        errdefer self.scratch = scratch_writer.toArrayList();
         scanner_mod.decodeText(raw, &scratch_writer.writer) catch return Allocator.Error.OutOfMemory;
         self.scratch = scratch_writer.toArrayList();
         return self.gpa.dupe(u8, self.scratch.items);
@@ -354,8 +358,12 @@ pub const Reader = struct {
     /// 返回当前文本节点解码后的内容（分配新内存）
     pub fn textAlloc(self: *Reader) Allocator.Error![]u8 {
         const raw = self.textRaw();
+        if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+            return self.gpa.dupe(u8, raw);
+        }
         self.scratch.clearRetainingCapacity();
         var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &self.scratch);
+        errdefer self.scratch = scratch_writer.toArrayList();
         scanner_mod.decodeText(raw, &scratch_writer.writer) catch return Allocator.Error.OutOfMemory;
         self.scratch = scratch_writer.toArrayList();
         return self.gpa.dupe(u8, self.scratch.items);
@@ -456,7 +464,7 @@ pub const Reader = struct {
     pub fn readElementTextAlloc(self: *Reader) ReadError![]u8 {
         std.debug.assert(self.node == .element_start);
         var text_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
-        defer text_buf.deinit(self.gpa);
+        errdefer text_buf.deinit(self.gpa);
         var skip_depth: usize = 1;
         while (skip_depth > 0) {
             const node = try self.read();
@@ -465,10 +473,15 @@ pub const Reader = struct {
                 .element_end => skip_depth -= 1,
                 .text => {
                     const raw = self.textRaw();
-                    var text_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &text_buf);
-                    scanner_mod.decodeText(raw, &text_writer.writer) catch
-                        return ReadError.OutOfMemory;
-                    text_buf = text_writer.toArrayList();
+                    if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+                        text_buf.appendSlice(self.gpa, raw) catch return ReadError.OutOfMemory;
+                    } else {
+                        var text_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &text_buf);
+                        errdefer text_buf = text_writer.toArrayList();
+                        scanner_mod.decodeText(raw, &text_writer.writer) catch
+                            return ReadError.OutOfMemory;
+                        text_buf = text_writer.toArrayList();
+                    }
                 },
                 .cdata => {
                     text_buf.appendSlice(self.gpa, self.cdataContent()) catch
@@ -478,7 +491,7 @@ pub const Reader = struct {
                 else => {},
             }
         }
-        return self.gpa.dupe(u8, text_buf.items) catch ReadError.OutOfMemory;
+        return text_buf.toOwnedSlice(self.gpa) catch ReadError.OutOfMemory;
     }
 
     /// 跳过文档剩余所有内容（直到 eof）
@@ -592,4 +605,21 @@ test "Reader - attribute decoding" {
     const val = try reader.attributeValueAlloc(0);
     defer std.testing.allocator.free(val);
     try std.testing.expectEqualStrings("hello & <world>", val);
+}
+
+test "Reader - plain text and attribute alloc" {
+    const src = "<root attr=\"hello\">world</root>";
+    var reader = Reader.initSlice(std.testing.allocator, src);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Node.element_start, try reader.read());
+
+    const attr = try reader.attributeValueAlloc(0);
+    defer std.testing.allocator.free(attr);
+    try std.testing.expectEqualStrings("hello", attr);
+
+    try std.testing.expectEqual(Node.text, try reader.read());
+    const text = try reader.textAlloc();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("world", text);
 }

@@ -158,6 +158,7 @@ pub const Document = struct {
         errdefer buf.deinit(gpa);
 
         var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+        errdefer buf = buf_writer.toArrayList();
         var w = writer_mod.Writer(*std.Io.Writer).init(gpa, &buf_writer.writer, options);
         defer w.deinit();
 
@@ -182,6 +183,65 @@ pub const Document = struct {
         const file = try fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(output);
+    }
+
+    /// 将文档流式写入文件。
+    ///
+    /// 相比 `writeToFile`，此接口不会先把完整 XML 拼到内存里，
+    /// 更适合较大的 XML 输出场景。
+    ///
+    /// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+    pub fn writeToFileStreaming(self: *const Document, gpa: Allocator, path: []const u8, options: writer_mod.Options) !void {
+        var file = try fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        var out = BufferedFileWriter{ .file = file };
+        var w = writer_mod.Writer(*BufferedFileWriter).init(gpa, &out, options);
+        defer w.deinit();
+
+        if (self.version != null) {
+            try w.xmlDeclaration(self.encoding, self.standalone);
+        }
+
+        try serializeElementImpl(&w, self.root);
+        try w.eof();
+        try out.flush();
+    }
+};
+
+const BufferedFileWriter = struct {
+    file: fs.File,
+    buffer: [4096]u8 = undefined,
+    used: usize = 0,
+
+    pub fn flush(self: *@This()) !void {
+        if (self.used == 0) return;
+        try self.file.writeAll(self.buffer[0..self.used]);
+        self.used = 0;
+    }
+
+    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len >= self.buffer.len) {
+            try self.flush();
+            try self.file.writeAll(bytes);
+            return;
+        }
+
+        if (self.used + bytes.len > self.buffer.len) {
+            try self.flush();
+        }
+
+        @memcpy(self.buffer[self.used..][0..bytes.len], bytes);
+        self.used += bytes.len;
+    }
+
+    pub fn writeByte(self: *@This(), byte: u8) !void {
+        if (self.used == self.buffer.len) {
+            try self.flush();
+        }
+
+        self.buffer[self.used] = byte;
+        self.used += 1;
     }
 };
 
@@ -301,17 +361,23 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
     const ac = r.attributeCount();
     var attrs_list: std.ArrayList(Attribute) = std.ArrayList(Attribute).empty;
     defer attrs_list.deinit(alloc);
+    var attr_scratch: std.ArrayList(u8) = std.ArrayList(u8).empty;
+    defer attr_scratch.deinit(alloc);
     for (0..ac) |i| {
         const a_name = try alloc.dupe(u8, r.attributeName(i));
         const a_raw_val = r.attributeValueRaw(i);
-        // 解码实体引用
-        var scratch: std.ArrayList(u8) = std.ArrayList(u8).empty;
-        defer scratch.deinit(alloc);
-        const scanner_src = @import("scanner.zig");
-        var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &scratch);
-        scanner_src.decodeText(a_raw_val, &scratch_writer.writer) catch return ReadError.OutOfMemory;
-        scratch = scratch_writer.toArrayList();
-        const a_val = try alloc.dupe(u8, scratch.items);
+        const a_val = if (std.mem.indexOfScalar(u8, a_raw_val, '&') == null) blk: {
+            break :blk try alloc.dupe(u8, a_raw_val);
+        } else blk: {
+            // 解码实体引用
+            const scanner_src = @import("scanner.zig");
+            attr_scratch.clearRetainingCapacity();
+            var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &attr_scratch);
+            errdefer attr_scratch = scratch_writer.toArrayList();
+            scanner_src.decodeText(a_raw_val, &scratch_writer.writer) catch return ReadError.OutOfMemory;
+            attr_scratch = scratch_writer.toArrayList();
+            break :blk try alloc.dupe(u8, attr_scratch.items);
+        };
         try attrs_list.append(alloc, .{ .name = a_name, .value = a_val });
     }
     elem.attributes = try attrs_list.toOwnedSlice(alloc);
@@ -340,10 +406,15 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
             .text => {
                 // 解码文本实体并追加到 text_buf
                 const raw = r.textRaw();
-                const scanner_src = @import("scanner.zig");
-                var text_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &text_buf);
-                scanner_src.decodeText(raw, &text_writer.writer) catch return ReadError.OutOfMemory;
-                text_buf = text_writer.toArrayList();
+                if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+                    try text_buf.appendSlice(alloc, raw);
+                } else {
+                    const scanner_src = @import("scanner.zig");
+                    var text_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &text_buf);
+                    errdefer text_buf = text_writer.toArrayList();
+                    scanner_src.decodeText(raw, &text_writer.writer) catch return ReadError.OutOfMemory;
+                    text_buf = text_writer.toArrayList();
+                }
             },
             .cdata => {
                 if (text_buf.items.len > 0) {
@@ -396,6 +467,7 @@ pub fn documentToString(doc: *const Document, gpa: Allocator, options: writer_mo
     errdefer buf.deinit(gpa);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    errdefer buf = buf_writer.toArrayList();
     var w = writer_mod.Writer(*std.Io.Writer).init(gpa, &buf_writer.writer, options);
     defer w.deinit();
 
@@ -417,6 +489,10 @@ pub fn documentWriteToFile(doc: *const Document, gpa: Allocator, path: []const u
     const file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(output);
+}
+
+pub fn documentWriteToFileStreaming(doc: *const Document, gpa: Allocator, path: []const u8, options: writer_mod.Options) !void {
+    return doc.writeToFileStreaming(gpa, path, options);
 }
 
 // ─────────────────────────── 单元测试 ───────────────────────────
@@ -478,4 +554,41 @@ test "DOM - entity decoding in attributes" {
     var doc = try parseSlice(std.testing.allocator, src);
     defer doc.deinit();
     try std.testing.expectEqualStrings("a & b < c", doc.root.attr("attr").?);
+}
+
+test "DOM - entity decoding across multiple attributes" {
+    const src = "<root a=\"1 &amp; 2\" b=\"&lt;tag&gt;\" c=\"plain\"/>";
+    var doc = try parseSlice(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("1 & 2", doc.root.attr("a").?);
+    try std.testing.expectEqualStrings("<tag>", doc.root.attr("b").?);
+    try std.testing.expectEqualStrings("plain", doc.root.attr("c").?);
+}
+
+test "DOM - write to file streaming" {
+    const src =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<catalog>
+        \\  <book id="1">Hello &amp; World</book>
+        \\</catalog>
+    ;
+
+    var doc = try parseSlice(std.testing.allocator, src);
+    defer doc.deinit();
+
+    const path = "xml_streaming_write_test.xml";
+    defer fs.cwd().deleteFile(path) catch {};
+
+    try documentWriteToFileStreaming(&doc, std.testing.allocator, path, .{ .indent = "" });
+
+    const expected = try documentToString(&doc, std.testing.allocator, .{ .indent = "" });
+    defer std.testing.allocator.free(expected);
+
+    const file = try fs.cwd().openFile(path, .{});
+    defer file.close();
+    const actual = try file.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(actual);
+
+    try std.testing.expectEqualStrings(expected, actual);
 }

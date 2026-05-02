@@ -424,6 +424,7 @@ pub fn writeToFile(
     defer buffer.deinit(gpa);
 
     var buffer_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buffer);
+    errdefer buffer = buffer_writer.toArrayList();
     var w = Writer(*std.Io.Writer).init(gpa, &buffer_writer.writer, options);
     defer w.deinit();
     try content_fn(context, &w);
@@ -438,6 +439,7 @@ test "Writer - basic document" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    errdefer buf = buf_writer.toArrayList();
     var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "  " });
     defer w.deinit();
 
@@ -469,6 +471,7 @@ test "Writer - text escaping" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    errdefer buf = buf_writer.toArrayList();
     var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 
@@ -489,6 +492,7 @@ test "Writer - cdata and comment" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    errdefer buf = buf_writer.toArrayList();
     var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 

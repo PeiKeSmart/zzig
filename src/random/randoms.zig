@@ -6,9 +6,7 @@ const std = @import("std");
 ///
 /// 返回:
 /// - 随机生成的字符。
-fn RandomChar() u8 {
-    const io_source = std.Random.IoSource{ .io = std.Io.Threaded.global_single_threaded.io() };
-    const rand = io_source.interface();
+fn RandomChar(rand: std.Random) u8 {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     // 使用 uintLessThan 避免模偏差
     return chars[rand.uintLessThan(usize, chars.len)];
@@ -24,10 +22,12 @@ fn RandomChar() u8 {
 /// - 随机生成的字符串。
 pub fn RandomString(allocator: std.mem.Allocator, n: usize) ![]u8 {
     var result = try allocator.alloc(u8, n); // 申请内存分配
+    const io_source = std.Random.IoSource{ .io = std.Io.Threaded.global_single_threaded.io() };
+    const rand = io_source.interface();
 
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        result[i] = RandomChar();
+        result[i] = RandomChar(rand);
     }
 
     return result;

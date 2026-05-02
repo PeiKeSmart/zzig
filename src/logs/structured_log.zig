@@ -133,7 +133,8 @@ pub const StructuredLog = struct {
         errdefer buf.deinit(self.allocator); // ✅ 传入 allocator
 
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
-        var writer = aw.writer;
+        errdefer buf = aw.toArrayList();
+        const writer = &aw.writer;
 
         try writer.writeAll("{");
 
@@ -146,7 +147,7 @@ pub const StructuredLog = struct {
         // 消息
         if (self.message) |msg| {
             try writer.writeAll("\"message\":\"");
-            try writeEscapedString(&writer, msg);
+            try writeEscapedString(writer, msg);
             try writer.writeAll("\",");
         }
 
@@ -157,7 +158,7 @@ pub const StructuredLog = struct {
             switch (field.value) {
                 .string => |s| {
                     try writer.writeAll("\"");
-                    try writeEscapedString(&writer, s);
+                    try writeEscapedString(writer, s);
                     try writer.writeAll("\"");
                 },
                 .int => |v| try writer.print("{}", .{v}),

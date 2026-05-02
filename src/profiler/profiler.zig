@@ -153,7 +153,8 @@ pub const Profiler = struct {
         defer buf.deinit(self.allocator);
 
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
-        var writer = aw.writer;
+        errdefer buf = aw.toArrayList();
+        const writer = &aw.writer;
 
         try writer.writeAll("{\n");
         try writer.writeAll("  \"zones\": [\n");

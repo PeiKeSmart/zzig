@@ -106,6 +106,8 @@ pub const json = struct {
 ///   xml.parse(alloc, src)             — 内存切片 → DOM Document
 ///   xml.parseFile(alloc, path)        — 文件路径 → DOM Document
 ///   xml.createWriter(alloc, out, opt) — 创建 XML Writer
+///   xml.createAllocatingWriter(alloc, out, opt) — 为 std.Io.Writer.Allocating 创建安全 XML Writer
 ///   xml.writeToFile(doc, alloc, path, opt) — DOM→文件
+///   xml.writeToFileStreaming(doc, alloc, path, opt) — DOM→流式文件写出
 ///   xml.toString(doc, alloc, opt)     — DOM→字符串
 pub const xml = @import("xml/xml.zig");

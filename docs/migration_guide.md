@@ -184,6 +184,86 @@ A: 由于两者 API 差异较大且影响面小（当前无使用），直接迁
 **Q: 性能有影响吗？**  
 A: Logger 使用 ArenaAllocator 批量分配，性能优于 DebugLog。且支持级别过滤，生产环境可关闭 debug 输出。
 
+## Zig 0.16 迁移补充说明
+
+### 构建行为
+
+```bash
+# 默认库构建
+zig build
+
+# 运行测试
+zig build test
+
+# 构建全部示例
+zig build -Dexamples=true
+```
+
+说明:
+
+- Zig 0.16 下默认 `zig build` 只验证库与核心构建路径。
+- 示例程序需要显式传入 `-Dexamples=true` 才会完整编译安装。
+
+### XML Writer 迁移
+
+当输出目标是 `std.Io.Writer.Allocating` 时，不能把 `allocating.writer` 按值传给 XML Writer。
+这是因为 Zig 0.16 标准库中的 `std.Io.Writer.Allocating` 依赖内部 writer 与父对象的内存关系。
+
+**不安全写法:**
+
+```zig
+var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+var writer = zzig.xml.createWriter(allocator, allocating.writer, .{});
+```
+
+**安全写法 1: 使用专用辅助函数**
+
+```zig
+var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+var writer = zzig.xml.createAllocatingWriter(allocator, &allocating, .{});
+```
+
+**安全写法 2: 显式传递 writer 指针**
+
+```zig
+var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+var writer = zzig.xml.createWriter(allocator, &allocating.writer, .{});
+```
+
+### 动态缓冲区回写
+
+在使用 `std.Io.Writer.Allocating.fromArrayList(...)` 写入后，如果后续要读取 `buf.items` 或调用 `toOwnedSlice()`，必须先把 writer 状态回写到 `ArrayList`:
+
+```zig
+var buf = std.ArrayList(u8).empty;
+var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+
+// ... 执行写入 ...
+
+buf = allocating.toArrayList();
+```
+
+不要把这一步仅仅放到 `defer`，否则在中间需要读取缓冲区内容时会读到旧状态；错误路径下也应考虑回写以避免缓冲区泄漏。
+
+### 文件路径 API
+
+- `zzig.File.CurrentPath()` 继续返回 `[]u8`，兼容现有调用方。
+- `zzig.File.CurrentPathZ()` 新增返回 `[:0]u8`，适合需要保留 Zig 0.16 sentinel 路径、避免额外拷贝的场景。
+
+### XML 流式文件写出
+
+为降低大 XML 文档写文件时的峰值内存占用，新增：
+
+```zig
+try zzig.xml.writeToFileStreaming(&doc, allocator, "output.xml", .{ .indent = "  " });
+```
+
+说明：
+
+- `writeToFile()` 继续保持“先完整序列化到内存，再整体写文件”的旧语义。
+- `writeToFileStreaming()` 会直接写入目标文件，更省内存。
+- 若流式写出过程中发生错误，目标文件可能已经写入部分内容。
+
 ---
 
 **如有迁移问题，请提交 Issue 或联系维护者。**

@@ -31,6 +31,9 @@
 //   try w.text("Hello");
 //   try w.elementEnd();
 //   try w.eof();
+//
+// 若 writer 来自 std.Io.Writer.Allocating 一类会把 std.Io.Writer 内嵌到父结构中的对象，
+// 必须传 &allocating.writer，不能按值传递 writer 字段。
 const std = @import("std");
 
 // ─────────────────────────── 子模块重导出 ───────────────────────────
@@ -112,6 +115,11 @@ pub const WriteError = @import("writer.zig").WriteError;
 
 /// 创建一个写入到指定 Writer 的 XML Writer
 /// out: 任意支持 writeAll / writeByte 方法的 Writer 实例
+///
+/// 注意:
+/// - 常规 writer 可按值传递。
+/// - 若 writer 来自 `std.Io.Writer.Allocating` 等把 `std.Io.Writer` 内嵌在父结构中的类型，
+///   必须传 `&allocating.writer`，否则底层 writer 可能因内部父指针关系失效而触发未定义行为。
 pub fn createWriter(
     allocator: std.mem.Allocator,
     out: anytype,
@@ -121,12 +129,26 @@ pub fn createWriter(
 }
 
 /// 创建写入到 std.Io.Writer 的 XML Writer（动态分发版本）
+///
+/// `out` 使用指针形式，避免 `std.Io.Writer.Allocating.writer` 这类内嵌 writer 被按值拷贝。
 pub fn createAnyWriter(
     allocator: std.mem.Allocator,
     out: *std.Io.Writer,
     options: WriterOptions,
 ) WriterImpl.Writer(*std.Io.Writer) {
     return WriterImpl.Writer(*std.Io.Writer).init(allocator, out, options);
+}
+
+/// 为 `std.Io.Writer.Allocating` 创建 XML Writer 的安全辅助函数。
+///
+/// 适用于需要把输出先写入 `std.ArrayList(u8)` 等动态缓冲区的场景，
+/// 可避免手动传 `&allocating.writer` 时的误用。
+pub fn createAllocatingWriter(
+    allocator: std.mem.Allocator,
+    out: *std.Io.Writer.Allocating,
+    options: WriterOptions,
+) WriterImpl.Writer(*std.Io.Writer) {
+    return WriterImpl.Writer(*std.Io.Writer).init(allocator, &out.writer, options);
 }
 
 // ─────────────────────────── DOM ───────────────────────────
@@ -198,6 +220,21 @@ pub inline fn writeToFile(
     options: WriterOptions,
 ) !void {
     return Dom.documentWriteToFile(doc, allocator, path, options);
+}
+
+/// 将 DOM 文档流式写入文件（格式化）。
+///
+/// 相比 `writeToFile`，此接口不会先将完整 XML 拼接到内存中，
+/// 更适合较大的 XML 输出场景。
+///
+/// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+pub inline fn writeToFileStreaming(
+    doc: *const Dom.Document,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: WriterOptions,
+) !void {
+    return Dom.documentWriteToFileStreaming(doc, allocator, path, options);
 }
 
 /// 将 DOM 文档转为字符串（调用者负责释放）

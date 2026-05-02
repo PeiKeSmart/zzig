@@ -6,6 +6,8 @@
 
 高性能、零依赖的 Zig 通用工具库,提供日志、字符串、文件、随机数、控制台等常用功能。
 
+当前已兼容 Zig 0.15.2 及 Zig 0.16.0。
+
 ---
 
 ## ✨ 核心特性
@@ -167,6 +169,7 @@ pub fn main() !void {
 - [ARMv6 兼容性说明](docs/armv6_compatibility.md) ⭐ 新增
 - [JSON 快速参考](docs/json_quick_reference.md) ⭐ 新增
 - [迁移指南](docs/migration_guide.md)
+- [性能审计与语义分析报告](docs/performance_audit_20260502.md) ⭐ 新增
 - [实现状态报告](docs/IMPLEMENTATION_STATUS.md)
 
 ---
@@ -240,8 +243,43 @@ zig build -Doptimize=ReleaseFast
 # 运行测试
 zig build test
 
+# 构建全部示例 (Zig 0.16 下需显式开启)
+zig build -Dexamples=true
+
 # 生成文档
 zig build docs
+```
+
+### Zig 0.16 兼容说明
+
+- `zig build` 默认路径已兼容 Zig 0.16。
+- 在 Zig 0.16 下，示例程序默认不参与安装/构建；如需验证全部示例，请使用 `zig build -Dexamples=true`。
+- XML 模块在写入 `std.Io.Writer.Allocating` 时，不能按值传递 `allocating.writer`。请使用 `zzig.xml.createAllocatingWriter(allocator, &allocating, options)`，或手动传 `&allocating.writer`。
+- 若需要降低大型 XML 写文件时的峰值内存占用，可使用 `zzig.xml.writeToFileStreaming(...)` 进行流式写出。
+- `zzig.File.CurrentPath()` 仍保持原有 `[]u8` 返回语义；若调用方希望减少一次额外拷贝，可改用 `zzig.File.CurrentPathZ()` 获取 `[:0]u8` 路径。
+
+示例：
+
+```zig
+var buf = std.ArrayList(u8).empty;
+defer buf.deinit(allocator);
+
+var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+var writer = zzig.xml.createAllocatingWriter(allocator, &allocating, .{ .indent = "  " });
+defer writer.deinit();
+
+try writer.elementStart("root");
+try writer.text("hello");
+try writer.elementEnd();
+try writer.eof();
+
+buf = allocating.toArrayList();
+```
+
+流式写文件示例：
+
+```zig
+try zzig.xml.writeToFileStreaming(&doc, allocator, "output.xml", .{ .indent = "  " });
 ```
 
 ### 支持平台
