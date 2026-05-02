@@ -416,7 +416,7 @@ pub fn writeToFile(
     path: []const u8,
     options: Options,
     context: anytype,
-    comptime content_fn: fn (ctx: @TypeOf(context), w: *Writer(std.Io.Writer)) WriteError!void,
+    comptime content_fn: fn (ctx: @TypeOf(context), w: *Writer(*std.Io.Writer)) WriteError!void,
 ) !void {
     var file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
@@ -424,10 +424,10 @@ pub fn writeToFile(
     defer buffer.deinit(gpa);
 
     var buffer_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buffer);
-    defer buffer = buffer_writer.toArrayList();
-    var w = Writer(std.Io.Writer).init(gpa, buffer_writer.writer, options);
+    var w = Writer(*std.Io.Writer).init(gpa, &buffer_writer.writer, options);
     defer w.deinit();
     try content_fn(context, &w);
+    buffer = buffer_writer.toArrayList();
     try file.writeAll(buffer.items);
 }
 
@@ -438,8 +438,7 @@ test "Writer - basic document" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
-    defer buf = buf_writer.toArrayList();
-    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "  " });
+    var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "  " });
     defer w.deinit();
 
     try w.xmlDeclaration("UTF-8", null);
@@ -452,6 +451,7 @@ test "Writer - basic document" {
     try w.elementEndEmpty();
     try w.elementEnd();
     try w.eof();
+    buf = buf_writer.toArrayList();
 
     const expected =
         \\<?xml version="1.0" encoding="UTF-8"?>
@@ -469,14 +469,14 @@ test "Writer - text escaping" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
-    defer buf = buf_writer.toArrayList();
-    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "" });
+    var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 
     try w.elementStart("root");
     try w.text("a & b < c > d \"e\"");
     try w.elementEnd();
     try w.eof();
+    buf = buf_writer.toArrayList();
 
     try std.testing.expectEqualStrings(
         "<root>a &amp; b &lt; c &gt; d \"e\"</root>",
@@ -489,8 +489,7 @@ test "Writer - cdata and comment" {
     defer buf.deinit(std.testing.allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
-    defer buf = buf_writer.toArrayList();
-    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "" });
+    var w = Writer(*std.Io.Writer).init(std.testing.allocator, &buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 
     try w.elementStart("root");
@@ -498,6 +497,7 @@ test "Writer - cdata and comment" {
     try w.cdata("<raw>data</raw>");
     try w.elementEnd();
     try w.eof();
+    buf = buf_writer.toArrayList();
 
     try std.testing.expectEqualStrings(
         "<root><!-- test --><![CDATA[<raw>data</raw>]]></root>",

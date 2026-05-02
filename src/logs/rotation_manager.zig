@@ -300,7 +300,7 @@ pub const RotationManager = struct {
         errdefer self.allocator.free(backup_name);
 
         // 重命名当前文件
-        try std.fs.cwd().rename(current_log_path, backup_name);
+        try fs.cwd().rename(current_log_path, backup_name);
 
         // 更新状态
         self.current_file_size.store(0, .release);
@@ -414,7 +414,7 @@ pub const RotationManager = struct {
                 const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, file.name });
                 defer self.allocator.free(full_path);
 
-                std.fs.cwd().deleteFile(full_path) catch |err| {
+                fs.cwd().deleteFile(full_path) catch |err| {
                     std.debug.print("⚠️  删除旧文件失败 {s}: {}\n", .{ full_path, err });
                 };
             }

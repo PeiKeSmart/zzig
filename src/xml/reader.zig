@@ -327,7 +327,9 @@ pub const Reader = struct {
     pub fn attributeValueAlloc(self: *Reader, n: usize) Allocator.Error![]u8 {
         const raw = self.attributeValueRaw(n);
         self.scratch.clearRetainingCapacity();
-        scanner_mod.decodeText(raw, self.scratch.writer(self.gpa)) catch return Allocator.Error.OutOfMemory;
+        var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &self.scratch);
+        scanner_mod.decodeText(raw, &scratch_writer.writer) catch return Allocator.Error.OutOfMemory;
+        self.scratch = scratch_writer.toArrayList();
         return self.gpa.dupe(u8, self.scratch.items);
     }
 
@@ -353,7 +355,9 @@ pub const Reader = struct {
     pub fn textAlloc(self: *Reader) Allocator.Error![]u8 {
         const raw = self.textRaw();
         self.scratch.clearRetainingCapacity();
-        scanner_mod.decodeText(raw, self.scratch.writer(self.gpa)) catch return Allocator.Error.OutOfMemory;
+        var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &self.scratch);
+        scanner_mod.decodeText(raw, &scratch_writer.writer) catch return Allocator.Error.OutOfMemory;
+        self.scratch = scratch_writer.toArrayList();
         return self.gpa.dupe(u8, self.scratch.items);
     }
 
@@ -461,8 +465,10 @@ pub const Reader = struct {
                 .element_end => skip_depth -= 1,
                 .text => {
                     const raw = self.textRaw();
-                    scanner_mod.decodeText(raw, text_buf.writer(self.gpa)) catch
+                    var text_writer: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &text_buf);
+                    scanner_mod.decodeText(raw, &text_writer.writer) catch
                         return ReadError.OutOfMemory;
+                    text_buf = text_writer.toArrayList();
                 },
                 .cdata => {
                     text_buf.appendSlice(self.gpa, self.cdataContent()) catch

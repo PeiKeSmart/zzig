@@ -257,7 +257,6 @@ pub const AsyncLoggerConfig = struct {
         var buffer: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buffer);
-        defer buffer = aw.toArrayList();
         var writer = aw.writer;
 
         // 写入格式化的 JSON (带注释说明)
@@ -298,6 +297,7 @@ pub const AsyncLoggerConfig = struct {
         try writer.writeAll("  \"_max_backup_files_comment\": \"保留的旧日志文件数量 (0-100)\"\n");
 
         try writer.writeAll("}\n");
+        buffer = aw.toArrayList();
 
         // 写入文件
         try file.writeAll(buffer.items);

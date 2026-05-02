@@ -158,8 +158,7 @@ pub const Document = struct {
         errdefer buf.deinit(gpa);
 
         var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
-        defer buf = buf_writer.toArrayList();
-        var w = writer_mod.Writer(std.Io.Writer).init(gpa, buf_writer.writer, options);
+        var w = writer_mod.Writer(*std.Io.Writer).init(gpa, &buf_writer.writer, options);
         defer w.deinit();
 
         // XML 声明
@@ -170,6 +169,7 @@ pub const Document = struct {
         // 根元素
         try serializeElementImpl(&w, self.root);
         try w.eof();
+        buf = buf_writer.toArrayList();
 
         return buf.toOwnedSlice(gpa);
     }
@@ -309,8 +309,8 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
         defer scratch.deinit(alloc);
         const scanner_src = @import("scanner.zig");
         var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &scratch);
-        defer scratch = scratch_writer.toArrayList();
         scanner_src.decodeText(a_raw_val, &scratch_writer.writer) catch return ReadError.OutOfMemory;
+        scratch = scratch_writer.toArrayList();
         const a_val = try alloc.dupe(u8, scratch.items);
         try attrs_list.append(alloc, .{ .name = a_name, .value = a_val });
     }
@@ -342,8 +342,8 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
                 const raw = r.textRaw();
                 const scanner_src = @import("scanner.zig");
                 var text_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &text_buf);
-                defer text_buf = text_writer.toArrayList();
                 scanner_src.decodeText(raw, &text_writer.writer) catch return ReadError.OutOfMemory;
+                text_buf = text_writer.toArrayList();
             },
             .cdata => {
                 if (text_buf.items.len > 0) {
@@ -396,8 +396,7 @@ pub fn documentToString(doc: *const Document, gpa: Allocator, options: writer_mo
     errdefer buf.deinit(gpa);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
-    defer buf = buf_writer.toArrayList();
-    var w = writer_mod.Writer(std.Io.Writer).init(gpa, buf_writer.writer, options);
+    var w = writer_mod.Writer(*std.Io.Writer).init(gpa, &buf_writer.writer, options);
     defer w.deinit();
 
     if (doc.version != null) {
@@ -405,6 +404,7 @@ pub fn documentToString(doc: *const Document, gpa: Allocator, options: writer_mo
     }
     try serializeElementImpl(&w, doc.root);
     try w.eof();
+    buf = buf_writer.toArrayList();
 
     return buf.toOwnedSlice(gpa);
 }

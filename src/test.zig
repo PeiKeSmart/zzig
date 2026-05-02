@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 // 字符串处理测试
 test "Strings - AddString concatenates two strings" {
@@ -121,7 +122,7 @@ test "AsyncLogger - RingQueue basic operations" {
     try testing.expectEqual(@as(usize, 0), queue.size());
 
     // 测试推入
-    const msg1 = zzig.AsyncLogger.LogMessage.init(.info, 12345, "test message 1");
+    const msg1 = zzig.AsyncLogger.LogMessage.init(.info, 12345, 0, "test message 1");
     try testing.expect(queue.tryPush(msg1));
     try testing.expectEqual(@as(usize, 1), queue.size());
 
@@ -169,7 +170,7 @@ test "AsyncLogger - log messages are queued" {
     logger.warn("Test message 3", .{});
 
     // 短暂等待后台处理
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleep(100 * std.time.ns_per_ms);
 
     // 验证已处理（可能还有未处理的）
     try testing.expect(logger.getProcessedCount() > 0);
@@ -194,7 +195,7 @@ test "AsyncLogger - level filtering works" {
     logger.warn("Logged warn", .{});
     logger.err("Logged error", .{});
 
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleep(100 * std.time.ns_per_ms);
 
     // 应该只有 2 条被处理
     try testing.expectEqual(@as(usize, 2), logger.getProcessedCount());

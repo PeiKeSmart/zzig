@@ -174,6 +174,10 @@ pub const Dir = if (is_zig_016_or_newer) struct {
         return .{ .inner = try self.inner.openDir(currentIo(), sub_path, options) };
     }
 
+    pub fn realpathAlloc(self: @This(), allocator: std.mem.Allocator, sub_path: []const u8) ![:0]u8 {
+        return self.inner.realPathFileAlloc(currentIo(), sub_path, allocator);
+    }
+
     pub fn makePath(self: @This(), sub_path: []const u8) !void {
         try self.inner.createDirPath(currentIo(), sub_path);
     }

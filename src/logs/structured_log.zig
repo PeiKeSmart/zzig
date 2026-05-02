@@ -133,7 +133,6 @@ pub const StructuredLog = struct {
         errdefer buf.deinit(self.allocator); // ✅ 传入 allocator
 
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
-        defer buf = aw.toArrayList();
         var writer = aw.writer;
 
         try writer.writeAll("{");
@@ -174,6 +173,7 @@ pub const StructuredLog = struct {
         }
 
         try writer.writeAll("}");
+        buf = aw.toArrayList();
 
         return buf.toOwnedSlice(self.allocator); // ✅ 传入 allocator
     }

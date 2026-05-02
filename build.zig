@@ -385,7 +385,7 @@ const versions = struct {
 
         // XML 模块单元测试
         const xml_test_module = b.createModule(.{
-            .root_source_file = b.path(b.pathJoin(&.{ "src", "xml", "xml.zig" })),
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "xml_test.zig" })),
             .target = target,
             .optimize = optimize,
         });

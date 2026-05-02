@@ -153,7 +153,6 @@ pub const Profiler = struct {
         defer buf.deinit(self.allocator);
 
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
-        defer buf = aw.toArrayList();
         var writer = aw.writer;
 
         try writer.writeAll("{\n");
@@ -186,6 +185,7 @@ pub const Profiler = struct {
         }
 
         try writer.writeAll("\n  ]\n}\n");
+        buf = aw.toArrayList();
 
         // 写入文件
         try file.writeAll(buf.items);
@@ -323,9 +323,9 @@ test "Profiler - 导出报告" {
     }
 
     try profiler.exportReport("test_perf_report.json");
-    defer std.fs.cwd().deleteFile("test_perf_report.json") catch {};
+    defer compat.fs.cwd().deleteFile("test_perf_report.json") catch {};
 
     // 验证文件存在
-    const file = try std.fs.cwd().openFile("test_perf_report.json", .{});
+    const file = try compat.fs.cwd().openFile("test_perf_report.json", .{});
     file.close();
 }

@@ -123,10 +123,10 @@ pub fn createWriter(
 /// 创建写入到 std.Io.Writer 的 XML Writer（动态分发版本）
 pub fn createAnyWriter(
     allocator: std.mem.Allocator,
-    out: std.Io.Writer,
+    out: *std.Io.Writer,
     options: WriterOptions,
-) WriterImpl.Writer(std.Io.Writer) {
-    return WriterImpl.Writer(std.Io.Writer).init(allocator, out, options);
+) WriterImpl.Writer(*std.Io.Writer) {
+    return WriterImpl.Writer(*std.Io.Writer).init(allocator, out, options);
 }
 
 // ─────────────────────────── DOM ───────────────────────────

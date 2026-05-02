@@ -7,7 +7,8 @@ const std = @import("std");
 /// 返回:
 /// - 随机生成的字符。
 fn RandomChar() u8 {
-    const rand = std.crypto.random;
+    const io_source = std.Random.IoSource{ .io = std.Io.Threaded.global_single_threaded.io() };
+    const rand = io_source.interface();
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     // 使用 uintLessThan 避免模偏差
     return chars[rand.uintLessThan(usize, chars.len)];
