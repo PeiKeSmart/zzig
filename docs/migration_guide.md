@@ -258,10 +258,28 @@ buf = allocating.toArrayList();
 try zzig.xml.writeToFileStreaming(&doc, allocator, "output.xml", .{ .indent = "  " });
 ```
 
+若使用 callback 风格的底层 XML writer helper，也可使用：
+
+```zig
+const Ctx = struct {
+   fn write(_: void, w: anytype) !void {
+      try w.elementStart("root");
+      try w.text("hello");
+      try w.elementEnd();
+      try w.eof();
+   }
+};
+
+try zzig.xml.writeContentToFileStreaming(allocator, "output.xml", .{ .indent = "  " }, {}, Ctx.write);
+```
+
 说明：
 
 - `writeToFile()` 继续保持“先完整序列化到内存，再整体写文件”的旧语义。
 - `writeToFileStreaming()` 会直接写入目标文件，更省内存。
+- `xml.Dom.documentWriteToFileStreaming(...)` 提供与顶层 `zzig.xml.writeToFileStreaming(...)` 等价的 DOM 命名空间入口。
+- `xml.writeContentToFile(...)` 与 `xml.writeContentToFileStreaming(...)` 提供 callback 风格 XML 生成的顶层便捷入口。
+- `xml.WriterImpl.writeToFileStreaming(...)` 提供 callback 风格 XML 生成的流式写文件入口。
 - 若流式写出过程中发生错误，目标文件可能已经写入部分内容。
 
 ---

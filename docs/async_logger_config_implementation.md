@@ -24,6 +24,7 @@ pub const AsyncLoggerConfig = struct {
     pub fn loadOrCreate(...) !AsyncLoggerConfig
     pub fn loadFromFile(...) !AsyncLoggerConfig
     pub fn saveToFile(...) !void
+    pub fn saveToFileStreaming(...) !void
     pub fn print() void
     pub fn deinit() void
 };
@@ -35,6 +36,19 @@ pub const AsyncLoggerConfig = struct {
 - ✅ 配置文件内含中文注释说明每个字段
 - ✅ 类型安全验证 (队列容量必须是 2 的幂次)
 - ✅ 完整的单元测试覆盖
+- ✅ 提供流式保存接口，降低配置文件写出时的峰值内存占用
+
+### 1.1 保存接口说明
+
+```zig
+try config.saveToFile("logger.json");
+try config.saveToFileStreaming("logger-large.json");
+```
+
+说明:
+- `saveToFile()` 保持原有“先构建完整 JSON，再写文件”的语义。
+- `saveToFileStreaming()` 适合注释较多或路径较长时的低峰值内存写出场景。
+- 流式写出若中途失败，目标文件可能已包含部分内容。
 
 ### 2. AsyncLogger 集成
 

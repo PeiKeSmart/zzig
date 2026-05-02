@@ -256,6 +256,8 @@ zig build docs
 - 在 Zig 0.16 下，示例程序默认不参与安装/构建；如需验证全部示例，请使用 `zig build -Dexamples=true`。
 - XML 模块在写入 `std.Io.Writer.Allocating` 时，不能按值传递 `allocating.writer`。请使用 `zzig.xml.createAllocatingWriter(allocator, &allocating, options)`，或手动传 `&allocating.writer`。
 - 若需要降低大型 XML 写文件时的峰值内存占用，可使用 `zzig.xml.writeToFileStreaming(...)` 进行流式写出。
+- 若使用 callback 风格生成 XML，可直接使用 `zzig.xml.writeContentToFile(...)` 或 `zzig.xml.writeContentToFileStreaming(...)`。
+- 若使用 callback 风格的底层 XML writer helper，可使用 `zzig.xml.WriterImpl.writeToFileStreaming(...)` 进行流式文件写出。
 - `zzig.File.CurrentPath()` 仍保持原有 `[]u8` 返回语义；若调用方希望减少一次额外拷贝，可改用 `zzig.File.CurrentPathZ()` 获取 `[:0]u8` 路径。
 
 示例：
@@ -280,6 +282,21 @@ buf = allocating.toArrayList();
 
 ```zig
 try zzig.xml.writeToFileStreaming(&doc, allocator, "output.xml", .{ .indent = "  " });
+```
+
+callback 风格流式写文件示例：
+
+```zig
+const Ctx = struct {
+    fn write(_: void, w: anytype) !void {
+        try w.elementStart("root");
+        try w.text("hello");
+        try w.elementEnd();
+        try w.eof();
+    }
+};
+
+try zzig.xml.writeContentToFileStreaming(allocator, "output.xml", .{ .indent = "  " }, {}, Ctx.write);
 ```
 
 ### 支持平台

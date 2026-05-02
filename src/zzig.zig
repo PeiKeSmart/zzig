@@ -109,5 +109,9 @@ pub const json = struct {
 ///   xml.createAllocatingWriter(alloc, out, opt) — 为 std.Io.Writer.Allocating 创建安全 XML Writer
 ///   xml.writeToFile(doc, alloc, path, opt) — DOM→文件
 ///   xml.writeToFileStreaming(doc, alloc, path, opt) — DOM→流式文件写出
+///   xml.Dom.documentWriteToFileStreaming(doc, alloc, path, opt) — DOM 命名空间下的流式文件写出
+///   xml.writeContentToFile(alloc, path, opt, ctx, fn) — callback 风格 XML→文件
+///   xml.writeContentToFileStreaming(alloc, path, opt, ctx, fn) — callback 风格 XML→流式文件
+///   xml.WriterImpl.writeToFileStreaming(...) — callback 风格 XML→流式文件写出
 ///   xml.toString(doc, alloc, opt)     — DOM→字符串
 pub const xml = @import("xml/xml.zig");

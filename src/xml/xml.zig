@@ -35,6 +35,7 @@
 // 若 writer 来自 std.Io.Writer.Allocating 一类会把 std.Io.Writer 内嵌到父结构中的对象，
 // 必须传 &allocating.writer，不能按值传递 writer 字段。
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 // ─────────────────────────── 子模块重导出 ───────────────────────────
 
@@ -189,6 +190,8 @@ pub const Dom = struct {
     pub const documentToString = dom_mod.documentToString;
     /// 将 DOM 文档写入文件
     pub const documentWriteToFile = dom_mod.documentWriteToFile;
+    /// 将 DOM 文档流式写入文件
+    pub const documentWriteToFileStreaming = dom_mod.documentWriteToFileStreaming;
 };
 
 // ─────────────────────────── 便捷函数 ───────────────────────────
@@ -235,6 +238,33 @@ pub inline fn writeToFileStreaming(
     options: WriterOptions,
 ) !void {
     return Dom.documentWriteToFileStreaming(doc, allocator, path, options);
+}
+
+/// 使用 callback 风格内容生成函数将 XML 写入文件。
+///
+/// 适用于不需要先构建 DOM、而是直接通过 Writer 逐步输出 XML 的场景。
+pub inline fn writeContentToFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: WriterOptions,
+    context: anytype,
+    comptime content_fn: anytype,
+) !void {
+    return WriterImpl.writeToFile(allocator, path, options, context, content_fn);
+}
+
+/// 使用 callback 风格内容生成函数将 XML 流式写入文件。
+///
+/// 相比 `writeContentToFile`，此接口不会先将完整 XML 拼接到内存中。
+/// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+pub inline fn writeContentToFileStreaming(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: WriterOptions,
+    context: anytype,
+    comptime content_fn: anytype,
+) !void {
+    return WriterImpl.writeToFileStreaming(allocator, path, options, context, content_fn);
 }
 
 /// 将 DOM 文档转为字符串（调用者负责释放）
@@ -311,4 +341,38 @@ test "xml - streaming reader end-to-end" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), item_count);
+}
+
+test "xml - top-level callback write helpers" {
+    const buffered_path = "xml_top_level_write_helper.xml";
+    const streaming_path = "xml_top_level_write_helper_streaming.xml";
+    defer compat.fs.cwd().deleteFile(buffered_path) catch {};
+    defer compat.fs.cwd().deleteFile(streaming_path) catch {};
+
+    const Ctx = struct {
+        fn write(_: void, w: anytype) !void {
+            try w.xmlDeclaration("UTF-8", null);
+            try w.elementStart("root");
+            try w.elementStart("child");
+            try w.text("hello");
+            try w.elementEnd();
+            try w.elementEnd();
+            try w.eof();
+        }
+    };
+
+    try writeContentToFile(std.testing.allocator, buffered_path, .{ .indent = "  " }, {}, Ctx.write);
+    try writeContentToFileStreaming(std.testing.allocator, streaming_path, .{ .indent = "  " }, {}, Ctx.write);
+
+    const buffered_file = try compat.fs.cwd().openFile(buffered_path, .{});
+    defer buffered_file.close();
+    const buffered_content = try buffered_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(buffered_content);
+
+    const streaming_file = try compat.fs.cwd().openFile(streaming_path, .{});
+    defer streaming_file.close();
+    const streaming_content = try streaming_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(streaming_content);
+
+    try std.testing.expectEqualStrings(buffered_content, streaming_content);
 }

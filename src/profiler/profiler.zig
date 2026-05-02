@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
+const BufferedFileWriter = @import("../buffered_file_writer.zig").BufferedFileWriter;
 
 /// 性能剖析配置
 pub const ProfilerConfig = struct {
@@ -143,19 +144,7 @@ pub const Profiler = struct {
         return random_value < self.config.sample_rate;
     }
 
-    /// 导出性能报告（JSON 格式）
-    pub fn exportReport(self: *Profiler, file_path: []const u8) !void {
-        const file = try compat.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-
-        // 使用缓冲区来构建 JSON
-        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
-        defer buf.deinit(self.allocator);
-
-        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
-        errdefer buf = aw.toArrayList();
-        const writer = &aw.writer;
-
+    fn writeReportTo(self: *Profiler, writer: anytype) !void {
         try writer.writeAll("{\n");
         try writer.writeAll("  \"zones\": [\n");
 
@@ -186,10 +175,40 @@ pub const Profiler = struct {
         }
 
         try writer.writeAll("\n  ]\n}\n");
+    }
+
+    /// 导出性能报告（JSON 格式）
+    pub fn exportReport(self: *Profiler, file_path: []const u8) !void {
+        const file = try compat.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+
+        // 使用缓冲区来构建 JSON
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+
+        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        errdefer buf = aw.toArrayList();
+        const writer = &aw.writer;
+        try self.writeReportTo(writer);
         buf = aw.toArrayList();
 
         // 写入文件
         try file.writeAll(buf.items);
+    }
+
+    /// 流式导出性能报告（JSON 格式）。
+    ///
+    /// 相比 `exportReport`，此接口不会先把完整 JSON 报告拼接到内存中，
+    /// 更适合区域数量较多时的导出场景。
+    ///
+    /// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+    pub fn exportReportStreaming(self: *Profiler, file_path: []const u8) !void {
+        var file = try compat.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+
+        var out = BufferedFileWriter.init(file);
+        try self.writeReportTo(&out);
+        try out.flush();
     }
 
     /// 打印性能摘要（控制台）
@@ -329,4 +348,30 @@ test "Profiler - 导出报告" {
     // 验证文件存在
     const file = try compat.fs.cwd().openFile("test_perf_report.json", .{});
     file.close();
+}
+
+test "Profiler - 流式导出报告" {
+    const allocator = std.testing.allocator;
+    var profiler = try Profiler.init(allocator, .{
+        .enable = true,
+        .sample_rate = 1.0,
+    });
+    defer profiler.deinit();
+
+    {
+        const zone = profiler.beginZone("stream_export_test");
+        compat.sleep(100 * std.time.ns_per_us);
+        profiler.endZone(zone);
+    }
+
+    try profiler.exportReportStreaming("test_perf_report_streaming.json");
+    defer compat.fs.cwd().deleteFile("test_perf_report_streaming.json") catch {};
+
+    const file = try compat.fs.cwd().openFile("test_perf_report_streaming.json", .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"zones\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "stream_export_test") != null);
 }

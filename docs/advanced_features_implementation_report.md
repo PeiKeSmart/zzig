@@ -158,7 +158,13 @@ defer profiler.deinit();
 
 profiler.printSummary(); // 输出热点报告
 try profiler.exportReport("perf.json");
+try profiler.exportReportStreaming("perf-large.json"); // 低峰值内存导出
 ```
+
+说明:
+- `exportReport()` 保持原有“先构建完整 JSON，再写文件”的语义。
+- `exportReportStreaming()` 适合区域数量较多时的导出场景，可降低峰值内存占用。
+- 流式导出若中途失败，目标文件可能已包含部分内容。
 
 ---
 

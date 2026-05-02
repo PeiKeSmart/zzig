@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compat = @import("../compat.zig");
 const fs = compat.fs;
+const BufferedFileWriter = @import("../buffered_file_writer.zig").BufferedFileWriter;
 
 /// 写入过程中的错误类型
 pub const WriteError = error{
@@ -416,7 +417,7 @@ pub fn writeToFile(
     path: []const u8,
     options: Options,
     context: anytype,
-    comptime content_fn: fn (ctx: @TypeOf(context), w: *Writer(*std.Io.Writer)) WriteError!void,
+    comptime content_fn: anytype,
 ) !void {
     var file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
@@ -430,6 +431,29 @@ pub fn writeToFile(
     try content_fn(context, &w);
     buffer = buffer_writer.toArrayList();
     try file.writeAll(buffer.items);
+}
+
+/// 将 XML 文档流式写入文件（创建或覆盖）
+/// content_fn: 回调函数，接收 Writer 指针，在其中写入文档内容
+///
+/// 相比 `writeToFile`，此接口不会先将完整 XML 拼接到内存中。
+/// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+pub fn writeToFileStreaming(
+    gpa: Allocator,
+    path: []const u8,
+    options: Options,
+    context: anytype,
+    comptime content_fn: anytype,
+) !void {
+    var file = try fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    var out = BufferedFileWriter.init(file);
+    var w = Writer(*BufferedFileWriter).init(gpa, &out, options);
+    defer w.deinit();
+
+    try content_fn(context, &w);
+    try out.flush();
 }
 
 // ─────────────────────────── 单元测试 ───────────────────────────
@@ -507,4 +531,56 @@ test "Writer - cdata and comment" {
         "<root><!-- test --><![CDATA[<raw>data</raw>]]></root>",
         buf.items,
     );
+}
+
+test "Writer - writeToFile helper" {
+    const path = "writer_to_file_test.xml";
+    defer fs.cwd().deleteFile(path) catch {};
+
+    const Ctx = struct {
+        fn write(_: void, w: anytype) WriteError!void {
+            try w.xmlDeclaration("UTF-8", null);
+            try w.elementStart("root");
+            try w.elementStart("child");
+            try w.text("buffered");
+            try w.elementEnd();
+            try w.elementEnd();
+            try w.eof();
+        }
+    };
+
+    try writeToFile(std.testing.allocator, path, .{ .indent = "  " }, {}, Ctx.write);
+
+    const file = try fs.cwd().openFile(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "<root>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "buffered") != null);
+}
+
+test "Writer - writeToFileStreaming helper" {
+    const path = "writer_to_file_streaming_test.xml";
+    defer fs.cwd().deleteFile(path) catch {};
+
+    const Ctx = struct {
+        fn write(_: void, w: anytype) WriteError!void {
+            try w.xmlDeclaration("UTF-8", null);
+            try w.elementStart("root");
+            try w.elementStart("child");
+            try w.text("streaming");
+            try w.elementEnd();
+            try w.elementEnd();
+            try w.eof();
+        }
+    };
+
+    try writeToFileStreaming(std.testing.allocator, path, .{ .indent = "  " }, {}, Ctx.write);
+
+    const file = try fs.cwd().openFile(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "<root>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "streaming") != null);
 }

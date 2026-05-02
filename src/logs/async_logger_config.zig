@@ -18,6 +18,7 @@ const std = @import("std");
 const compat = @import("../compat.zig");
 const fs = compat.fs;
 const json = std.json;
+const BufferedFileWriter = @import("../buffered_file_writer.zig").BufferedFileWriter;
 
 /// 日志级别枚举 (与 AsyncLogger.Level 对应)
 pub const LogLevel = enum {
@@ -260,6 +261,36 @@ pub const AsyncLoggerConfig = struct {
         errdefer buffer = aw.toArrayList();
         const writer = &aw.writer;
 
+        try self.writeConfigTo(writer);
+        buffer = aw.toArrayList();
+
+        // 写入文件
+        try file.writeAll(buffer.items);
+    }
+
+    /// 流式保存配置到文件。
+    ///
+    /// 相比 `saveToFile`，此接口不会先把完整 JSON 配置拼接到内存中，
+    /// 更适合配置注释较多或路径较长时的低峰值内存写出场景。
+    ///
+    /// 注意：若写入过程中发生错误，目标文件可能已经写入部分内容。
+    pub fn saveToFileStreaming(self: AsyncLoggerConfig, config_path: []const u8) !void {
+        if (fs.path.dirname(config_path)) |dir| {
+            fs.cwd().makePath(dir) catch |make_err| {
+                if (make_err != error.PathAlreadyExists) return make_err;
+            };
+        }
+
+        var file = try fs.cwd().createFile(config_path, .{});
+        defer file.close();
+
+        var out = BufferedFileWriter.init(file);
+        try self.writeConfigTo(&out);
+        try out.flush();
+    }
+
+    fn writeConfigTo(self: AsyncLoggerConfig, writer: anytype) !void {
+
         // 写入格式化的 JSON (带注释说明)
         try writer.writeAll("{\n");
         try writer.print("  \"queue_capacity\": {d},\n", .{self.queue_capacity});
@@ -298,10 +329,6 @@ pub const AsyncLoggerConfig = struct {
         try writer.writeAll("  \"_max_backup_files_comment\": \"保留的旧日志文件数量 (0-100)\"\n");
 
         try writer.writeAll("}\n");
-        buffer = aw.toArrayList();
-
-        // 写入文件
-        try file.writeAll(buffer.items);
     }
 
     /// 释放资源
@@ -376,6 +403,37 @@ test "AsyncLoggerConfig - 保存和加载" {
         try std.testing.expectEqual(@as(u32, 8192), config.queue_capacity);
         try std.testing.expectEqual(LogLevel.info, config.min_level);
         try std.testing.expectEqual(OutputTarget.file, config.output_target);
+    }
+}
+
+test "AsyncLoggerConfig - 流式保存和加载" {
+    const allocator = std.testing.allocator;
+
+    const test_config_path = "test_logger_config_streaming.json";
+    defer fs.cwd().deleteFile(test_config_path) catch {};
+
+    {
+        var config = AsyncLoggerConfig{
+            .allocator = allocator,
+            .queue_capacity = 4096,
+            .min_level = .warn,
+            .output_target = .both,
+            .log_file_path = "logs/streaming.log",
+            .batch_size = 64,
+        };
+        try config.saveToFileStreaming(test_config_path);
+        config.deinit();
+    }
+
+    {
+        var config = try AsyncLoggerConfig.loadFromFile(allocator, test_config_path);
+        defer config.deinit();
+
+        try std.testing.expectEqual(@as(u32, 4096), config.queue_capacity);
+        try std.testing.expectEqual(LogLevel.warn, config.min_level);
+        try std.testing.expectEqual(OutputTarget.both, config.output_target);
+        try std.testing.expectEqualStrings("logs/streaming.log", config.log_file_path);
+        try std.testing.expectEqual(@as(u32, 64), config.batch_size);
     }
 }
 

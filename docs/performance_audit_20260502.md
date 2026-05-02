@@ -47,6 +47,14 @@
    - `Reader.readElementTextAlloc()` 直接返回局部聚合缓冲的 `owned slice`，去掉返回前的最终重复复制
 6. **已落地的一处实体匹配优化**：
    - `scanner.decodeText()` 将命名实体匹配从串行多次 `std.mem.eql` 调整为按长度和首字符分支，减少常见实体解码时的比较开销
+7. **已落地的一处 DOM 文本提交优化**：
+   - `parseElement()` 在提交待落地文本节点时，直接将 `text_buf` 转为 owned slice，去掉落入 DOM 节点前的额外复制
+8. **已落地的一处增量导出 API**：
+   - 新增 `Profiler.exportReportStreaming()`，用于降低性能报告导出时的峰值内存占用，同时保留原 `exportReport()` 语义不变
+9. **已落地的一处增量配置写出 API**：
+   - 新增 `AsyncLoggerConfig.saveToFileStreaming()`，用于降低配置文件保存时的峰值内存占用，同时保留原 `saveToFile()` 语义不变
+10. **已落地的一处底层 XML 写出 API**：
+   - 新增 `xml.WriterImpl.writeToFileStreaming()`，为 callback 风格 XML 生成路径提供低峰值内存的文件写出方式
 
 ---
 
@@ -157,6 +165,80 @@ zig build -Dexamples=true
 - **语义不变**
 - **减少常见命名实体的比较次数**
 - **数字实体与未知实体行为保持原实现**
+
+### 3.6 DOM 文本节点提交优化
+
+文件：
+- `src/xml/dom.zig`
+
+#### 优化前
+- `parseElement()` 先把连续文本累计到局部 `ArrayList`
+- 在遇到子元素、CDATA、注释、PI 或结束标签时，再 `dupe(text_buf.items)` 生成 DOM 文本节点
+
+#### 优化后
+- 保持累计与边界切分逻辑不变
+- 在提交文本节点时直接 `toOwnedSlice()` 转移 `text_buf` 所有权
+
+#### 影响
+- **语义不变**
+- **减少 DOM 文本节点构建时的一次额外复制**
+- **已补充跨 CDATA / comment / PI 边界的回归测试**
+
+### 3.7 Profiler 流式报告导出 API
+
+文件：
+- `src/profiler/profiler.zig`
+
+#### 优化前
+- `exportReport()` 会先把完整 JSON 报告拼接到内存
+- 报告构建完成后再一次性写入文件
+
+#### 优化后
+- 保留原 `exportReport()` 语义不变
+- 新增 `exportReportStreaming()`，通过小缓冲直接流式写入文件
+
+#### 影响
+- **现有 API 语义不变**
+- **为较大性能报告新增更低峰值内存的导出路径**
+- **流式写出若中途失败，目标文件可能已包含部分内容**
+- **已补充流式导出的回归测试**
+
+### 3.8 AsyncLoggerConfig 流式保存 API
+
+文件：
+- `src/logs/async_logger_config.zig`
+
+#### 优化前
+- `saveToFile()` 会先把完整 JSON 配置及注释拼接到内存
+- 配置构建完成后再一次性写入文件
+
+#### 优化后
+- 保留原 `saveToFile()` 语义不变
+- 新增 `saveToFileStreaming()`，通过小缓冲直接流式写入配置文件
+
+#### 影响
+- **现有 API 语义不变**
+- **为配置文件写出新增更低峰值内存的路径**
+- **流式写出若中途失败，目标文件可能已包含部分内容**
+- **已补充流式保存后再加载的回归测试**
+
+### 3.9 XML Writer 底层流式写文件 API
+
+文件：
+- `src/xml/writer.zig`
+
+#### 优化前
+- callback 风格的 `writeToFile()` helper 仅提供“先构建完整缓冲，再写文件”的路径
+
+#### 优化后
+- 保留原 `writeToFile()` 语义不变
+- 新增 `writeToFileStreaming()`，直接基于共享 `BufferedFileWriter` 流式写出 XML
+
+#### 影响
+- **现有 API 语义不变**
+- **为底层 callback 风格 XML 生成提供更低峰值内存的文件写出路径**
+- **流式写出若中途失败，目标文件可能已包含部分内容**
+- **已补充缓冲/流式 helper 的回归测试**
 
 ---
 

@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compat = @import("../compat.zig");
 const fs = compat.fs;
+const BufferedFileWriter = @import("../buffered_file_writer.zig").BufferedFileWriter;
 
 const reader_mod = @import("reader.zig");
 pub const ReadError = reader_mod.ReadError;
@@ -195,7 +196,7 @@ pub const Document = struct {
         var file = try fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
 
-        var out = BufferedFileWriter{ .file = file };
+        var out = BufferedFileWriter.init(file);
         var w = writer_mod.Writer(*BufferedFileWriter).init(gpa, &out, options);
         defer w.deinit();
 
@@ -206,42 +207,6 @@ pub const Document = struct {
         try serializeElementImpl(&w, self.root);
         try w.eof();
         try out.flush();
-    }
-};
-
-const BufferedFileWriter = struct {
-    file: fs.File,
-    buffer: [4096]u8 = undefined,
-    used: usize = 0,
-
-    pub fn flush(self: *@This()) !void {
-        if (self.used == 0) return;
-        try self.file.writeAll(self.buffer[0..self.used]);
-        self.used = 0;
-    }
-
-    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
-        if (bytes.len >= self.buffer.len) {
-            try self.flush();
-            try self.file.writeAll(bytes);
-            return;
-        }
-
-        if (self.used + bytes.len > self.buffer.len) {
-            try self.flush();
-        }
-
-        @memcpy(self.buffer[self.used..][0..bytes.len], bytes);
-        self.used += bytes.len;
-    }
-
-    pub fn writeByte(self: *@This(), byte: u8) !void {
-        if (self.used == self.buffer.len) {
-            try self.flush();
-        }
-
-        self.buffer[self.used] = byte;
-        self.used += 1;
     }
 };
 
@@ -394,11 +359,7 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
         switch (node) {
             .element_start => {
                 // 先提交累积文本
-                if (text_buf.items.len > 0) {
-                    const t = try alloc.dupe(u8, text_buf.items);
-                    try children_list.append(alloc, .{ .text = t });
-                    text_buf.clearRetainingCapacity();
-                }
+                try flushPendingText(alloc, &text_buf, &children_list);
                 const child_elem = try parseElement(alloc, r);
                 try children_list.append(alloc, .{ .element = child_elem });
             },
@@ -417,29 +378,17 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
                 }
             },
             .cdata => {
-                if (text_buf.items.len > 0) {
-                    const t = try alloc.dupe(u8, text_buf.items);
-                    try children_list.append(alloc, .{ .text = t });
-                    text_buf.clearRetainingCapacity();
-                }
+                try flushPendingText(alloc, &text_buf, &children_list);
                 const cd = try alloc.dupe(u8, r.cdataContent());
                 try children_list.append(alloc, .{ .cdata = cd });
             },
             .comment => {
-                if (text_buf.items.len > 0) {
-                    const t = try alloc.dupe(u8, text_buf.items);
-                    try children_list.append(alloc, .{ .text = t });
-                    text_buf.clearRetainingCapacity();
-                }
+                try flushPendingText(alloc, &text_buf, &children_list);
                 const cm = try alloc.dupe(u8, r.commentContent());
                 try children_list.append(alloc, .{ .comment = cm });
             },
             .pi => {
-                if (text_buf.items.len > 0) {
-                    const t = try alloc.dupe(u8, text_buf.items);
-                    try children_list.append(alloc, .{ .text = t });
-                    text_buf.clearRetainingCapacity();
-                }
+                try flushPendingText(alloc, &text_buf, &children_list);
                 const pt = try alloc.dupe(u8, r.piTarget());
                 const pd = try alloc.dupe(u8, r.piData());
                 try children_list.append(alloc, .{ .pi = .{ .target = pt, .data = pd } });
@@ -450,13 +399,17 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
     }
 
     // 提交最后的文本
-    if (text_buf.items.len > 0) {
-        const t = try alloc.dupe(u8, text_buf.items);
-        try children_list.append(alloc, .{ .text = t });
-    }
+    try flushPendingText(alloc, &text_buf, &children_list);
 
     elem.children = try children_list.toOwnedSlice(alloc);
     return elem;
+}
+
+fn flushPendingText(alloc: Allocator, text_buf: *std.ArrayList(u8), children_list: *std.ArrayList(Node)) Allocator.Error!void {
+    if (text_buf.items.len == 0) return;
+
+    const t = try text_buf.toOwnedSlice(alloc);
+    try children_list.append(alloc, .{ .text = t });
 }
 
 // ─────────────────────────── Document 序列化实现（填充内部函数） ───────────────────────────
@@ -564,6 +517,22 @@ test "DOM - entity decoding across multiple attributes" {
     try std.testing.expectEqualStrings("1 & 2", doc.root.attr("a").?);
     try std.testing.expectEqualStrings("<tag>", doc.root.attr("b").?);
     try std.testing.expectEqualStrings("plain", doc.root.attr("c").?);
+}
+
+test "DOM - flush text around cdata comment and pi" {
+    const src = "<root>ab<![CDATA[cdata]]>cd<!--note-->ef<?go now?>gh</root>";
+    var doc = try parseSlice(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqual(@as(usize, 7), doc.root.children.len);
+    try std.testing.expectEqualStrings("ab", doc.root.children[0].text);
+    try std.testing.expectEqualStrings("cdata", doc.root.children[1].cdata);
+    try std.testing.expectEqualStrings("cd", doc.root.children[2].text);
+    try std.testing.expectEqualStrings("note", doc.root.children[3].comment);
+    try std.testing.expectEqualStrings("ef", doc.root.children[4].text);
+    try std.testing.expectEqualStrings("go", doc.root.children[5].pi.target);
+    try std.testing.expectEqualStrings("now", doc.root.children[5].pi.data);
+    try std.testing.expectEqualStrings("gh", doc.root.children[6].text);
 }
 
 test "DOM - write to file streaming" {
