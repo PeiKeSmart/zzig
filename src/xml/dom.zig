@@ -4,6 +4,8 @@
 // 所有资源由 arena allocator 统一管理，释放时整体销毁
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 
 const reader_mod = @import("reader.zig");
 pub const ReadError = reader_mod.ReadError;
@@ -90,7 +92,7 @@ pub const Element = struct {
         child_name: []const u8,
         gpa: Allocator,
     ) Allocator.Error![]const *Element {
-        var result: std.ArrayList(*Element) = .{};
+        var result: std.ArrayList(*Element) = std.ArrayList(*Element).empty;
         defer result.deinit(gpa);
         for (self.children) |c| {
             if (c.asElement()) |e| {
@@ -104,7 +106,7 @@ pub const Element = struct {
 
     /// 返回所有子文本内容拼接（不递归，只看直接文本子节点）
     pub fn innerText(self: *const Element, gpa: Allocator) Allocator.Error![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(gpa);
         for (self.children) |c| {
             if (c.asText()) |t| try buf.appendSlice(gpa, t);
@@ -114,7 +116,7 @@ pub const Element = struct {
 
     /// 递归收集所有文本内容
     pub fn innerTextDeep(self: *const Element, gpa: Allocator) Allocator.Error![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(gpa);
         try collectText(self, gpa, &buf);
         return buf.toOwnedSlice(gpa);
@@ -152,14 +154,12 @@ pub const Document = struct {
 
     /// 将文档序列化为 XML 字符串（调用者负责释放）
     pub fn toStringAlloc(self: *const Document, gpa: Allocator, options: writer_mod.Options) WriteError![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         errdefer buf.deinit(gpa);
 
-        var w = writer_mod.Writer(std.io.AnyWriter).init(
-            gpa,
-            buf.writer(gpa).any(),
-            options,
-        );
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+        defer buf = buf_writer.toArrayList();
+        var w = writer_mod.Writer(std.Io.Writer).init(gpa, buf_writer.writer, options);
         defer w.deinit();
 
         // XML 声明
@@ -179,7 +179,7 @@ pub const Document = struct {
         // 先序列化到内存，再整块写入文件（与项目其他模块保持一致）
         const output = try self.toStringAlloc(gpa, options);
         defer gpa.free(output);
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(output);
     }
@@ -237,7 +237,7 @@ pub fn parseFile(gpa: Allocator, path: []const u8) (ReadError || Allocator.Error
 }
 
 /// 从 std.fs.File 解析 XML 文档
-pub fn parseFileHandle(gpa: Allocator, file: std.fs.File) (ReadError || Allocator.Error)!Document {
+pub fn parseFileHandle(gpa: Allocator, file: fs.File) (ReadError || Allocator.Error)!Document {
     var r = try reader_mod.Reader.initFileHandle(gpa, file);
     defer r.deinit();
     return parseFromReader(gpa, &r);
@@ -299,26 +299,28 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
 
     // 保存属性
     const ac = r.attributeCount();
-    var attrs_list: std.ArrayList(Attribute) = .{};
+    var attrs_list: std.ArrayList(Attribute) = std.ArrayList(Attribute).empty;
     defer attrs_list.deinit(alloc);
     for (0..ac) |i| {
         const a_name = try alloc.dupe(u8, r.attributeName(i));
         const a_raw_val = r.attributeValueRaw(i);
         // 解码实体引用
-        var scratch: std.ArrayList(u8) = .{};
+        var scratch: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer scratch.deinit(alloc);
         const scanner_src = @import("scanner.zig");
-        scanner_src.decodeText(a_raw_val, scratch.writer(alloc)) catch return ReadError.OutOfMemory;
+        var scratch_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &scratch);
+        defer scratch = scratch_writer.toArrayList();
+        scanner_src.decodeText(a_raw_val, &scratch_writer.writer) catch return ReadError.OutOfMemory;
         const a_val = try alloc.dupe(u8, scratch.items);
         try attrs_list.append(alloc, .{ .name = a_name, .value = a_val });
     }
     elem.attributes = try attrs_list.toOwnedSlice(alloc);
 
     // 解析子节点
-    var children_list: std.ArrayList(Node) = .{};
+    var children_list: std.ArrayList(Node) = std.ArrayList(Node).empty;
     defer children_list.deinit(alloc);
 
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer text_buf.deinit(alloc);
 
     while (true) {
@@ -339,7 +341,9 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
                 // 解码文本实体并追加到 text_buf
                 const raw = r.textRaw();
                 const scanner_src = @import("scanner.zig");
-                scanner_src.decodeText(raw, text_buf.writer(alloc)) catch return ReadError.OutOfMemory;
+                var text_writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &text_buf);
+                defer text_buf = text_writer.toArrayList();
+                scanner_src.decodeText(raw, &text_writer.writer) catch return ReadError.OutOfMemory;
             },
             .cdata => {
                 if (text_buf.items.len > 0) {
@@ -388,15 +392,12 @@ fn parseElement(alloc: Allocator, r: *reader_mod.Reader) (ReadError || Allocator
 
 /// 重新实现 Document.toStringAlloc，绕过泛型 Writer 问题
 pub fn documentToString(doc: *const Document, gpa: Allocator, options: writer_mod.Options) WriteError![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
 
-    const AnyW = std.io.AnyWriter;
-    var w = writer_mod.Writer(AnyW).init(
-        gpa,
-        buf.writer(gpa).any(),
-        options,
-    );
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer buf = buf_writer.toArrayList();
+    var w = writer_mod.Writer(std.Io.Writer).init(gpa, buf_writer.writer, options);
     defer w.deinit();
 
     if (doc.version != null) {
@@ -413,7 +414,7 @@ pub fn documentWriteToFile(doc: *const Document, gpa: Allocator, path: []const u
     // 先序列化到内存，再整块写入文件
     const output = try documentToString(doc, gpa, options);
     defer gpa.free(output);
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    const file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(output);
 }

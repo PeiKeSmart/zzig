@@ -1,9 +1,10 @@
 /// 测试 "both" 输出模式
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -26,7 +27,7 @@ pub fn main() !void {
     logger.err("测试消息 #{d} - 错误级别", .{4});
 
     // 等待处理完成
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    compat.sleep(1 * std.time.ns_per_s);
 
     std.debug.print("\n✅ 测试完成!\n", .{});
     std.debug.print("📁 请检查 logs/app.log 文件\n", .{});

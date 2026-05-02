@@ -15,7 +15,8 @@
 // ============================================================================
 
 const std = @import("std");
-const fs = std.fs;
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 const json = std.json;
 
 /// 日志级别枚举 (与 AsyncLogger.Level 对应)
@@ -253,9 +254,11 @@ pub const AsyncLoggerConfig = struct {
         defer file.close();
 
         // 使用动态缓冲区避免溢出
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
-        const writer = buffer.writer(self.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buffer);
+        defer buffer = aw.toArrayList();
+        var writer = aw.writer;
 
         // 写入格式化的 JSON (带注释说明)
         try writer.writeAll("{\n");

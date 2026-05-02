@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 
 // 导入配置模块类型
 const config_mod = @import("async_logger_config.zig");
@@ -263,19 +265,19 @@ pub const AsyncLogger = struct {
     allocator: std.mem.Allocator,
 
     // 文件输出相关
-    log_file: ?std.fs.File,
+    log_file: ?fs.File,
     log_file_path: ?[]const u8,
     // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
     // 其他平台继续使用高性能原子操作
     current_file_size: if (supportsAtomicU64()) std.atomic.Value(u64) else u64,
-    current_file_size_mutex: if (!supportsAtomicU64()) std.Thread.Mutex else void,
+    current_file_size_mutex: if (!supportsAtomicU64()) compat.Mutex else void,
     output_target: ConfigOutputTarget,
     drop_rate_warning_threshold: f32,
     max_file_size: u64,
     max_backup_files: u32,
 
     // 文件轮转保护
-    rotation_mutex: std.Thread.Mutex,
+    rotation_mutex: compat.Mutex,
     is_rotating: std.atomic.Value(bool),
 
     // 零分配模式:工作线程预分配缓冲区
@@ -285,7 +287,7 @@ pub const AsyncLogger = struct {
     worker_file_buffer_len: std.atomic.Value(usize),
     // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
     last_flush_time: if (supportsAtomicI64()) std.atomic.Value(i64) else i64,
-    last_flush_time_mutex: if (!supportsAtomicI64()) std.Thread.Mutex else void,
+    last_flush_time_mutex: if (!supportsAtomicI64()) compat.Mutex else void,
 
     /// 从配置文件初始化 AsyncLogger
     pub fn initFromConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !*AsyncLogger {
@@ -368,7 +370,7 @@ pub const AsyncLogger = struct {
             .log_file = null,
             .log_file_path = null,
             .current_file_size = undefined,
-            .current_file_size_mutex = if (comptime !supportsAtomicU64()) std.Thread.Mutex{} else undefined,
+            .current_file_size_mutex = if (comptime !supportsAtomicU64()) compat.Mutex{} else undefined,
             .output_target = .console,
             .drop_rate_warning_threshold = 10.0,
             .max_file_size = 100 * 1024 * 1024,
@@ -380,7 +382,7 @@ pub const AsyncLogger = struct {
             .worker_file_buffer_data = worker_file_buffer_data,
             .worker_file_buffer_len = std.atomic.Value(usize).init(0),
             .last_flush_time = undefined,
-            .last_flush_time_mutex = if (comptime !supportsAtomicI64()) std.Thread.Mutex{} else undefined,
+            .last_flush_time_mutex = if (comptime !supportsAtomicI64()) compat.Mutex{} else undefined,
         };
 
         // 根据平台初始化原子字段
@@ -391,9 +393,9 @@ pub const AsyncLogger = struct {
         }
 
         if (comptime supportsAtomicI64()) {
-            self.last_flush_time = std.atomic.Value(i64).init(std.time.milliTimestamp());
+            self.last_flush_time = std.atomic.Value(i64).init(compat.milliTimestamp());
         } else {
-            self.last_flush_time = std.time.milliTimestamp();
+            self.last_flush_time = compat.milliTimestamp();
         }
 
         // 启动后台工作线程
@@ -552,12 +554,12 @@ pub const AsyncLogger = struct {
 
             // 如果这轮没处理任何消息，短暂休眠避免空转
             if (processed_this_round == 0) {
-                std.Thread.sleep(self.config.idle_sleep_us * std.time.ns_per_us);
+                compat.sleep(self.config.idle_sleep_us * std.time.ns_per_us);
             }
 
             // 定期检查丢弃率并告警
             if (self.config.enable_drop_counter) {
-                const now = std.time.nanoTimestamp();
+                const now = compat.nanoTimestamp();
                 if (now - last_warning_time >= warning_interval_ns) {
                     const stats = self.getStats();
                     if (stats.drop_rate >= self.drop_rate_warning_threshold) {
@@ -584,14 +586,14 @@ pub const AsyncLogger = struct {
     fn openLogFile(self: *AsyncLogger) !void {
         if (self.log_file_path) |path| {
             // 确保目录存在
-            if (std.fs.path.dirname(path)) |dir| {
-                std.fs.cwd().makePath(dir) catch |make_err| {
+            if (fs.path.dirname(path)) |dir| {
+                fs.cwd().makePath(dir) catch |make_err| {
                     if (make_err != error.PathAlreadyExists) return make_err;
                 };
             }
 
             // 打开或创建日志文件（追加模式）
-            self.log_file = try std.fs.cwd().createFile(path, .{
+            self.log_file = try fs.cwd().createFile(path, .{
                 .read = true,
                 .truncate = false,
             });
@@ -656,7 +658,7 @@ pub const AsyncLogger = struct {
             );
             defer self.allocator.free(oldest_backup);
 
-            std.fs.cwd().deleteFile(oldest_backup) catch |del_err| {
+            fs.cwd().deleteFile(oldest_backup) catch |del_err| {
                 if (del_err != error.FileNotFound) {
                     std.debug.print("⚠️  删除旧备份失败: {}\n", .{del_err});
                 }
@@ -680,7 +682,7 @@ pub const AsyncLogger = struct {
             );
             defer self.allocator.free(new_name);
 
-            std.fs.cwd().rename(old_name, new_name) catch |rename_err| {
+            fs.cwd().rename(old_name, new_name) catch |rename_err| {
                 if (rename_err != error.FileNotFound) {
                     std.debug.print("⚠️  重命名备份失败: {s} -> {s}\n", .{ old_name, new_name });
                 }
@@ -696,11 +698,11 @@ pub const AsyncLogger = struct {
             );
             defer self.allocator.free(backup_name);
 
-            try std.fs.cwd().rename(path, backup_name);
+            try fs.cwd().rename(path, backup_name);
             std.debug.print("✅ 已备份: {s} -> {s}\n", .{ path, backup_name });
         } else {
             // 如果不保留备份，直接删除
-            try std.fs.cwd().deleteFile(path);
+            try fs.cwd().deleteFile(path);
         }
 
         // 重新打开新文件
@@ -898,7 +900,7 @@ pub const AsyncLogger = struct {
 
         // 条件刷盘（缓冲区超过 80% 或超时）
         const buffer_threshold = self.worker_file_buffer_data.len * 4 / 5;
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         const last_flush = self.getLastFlushTime();
 
         if (new_len > buffer_threshold or (now - last_flush) > 100) { // 100ms 超时
@@ -919,7 +921,7 @@ pub const AsyncLogger = struct {
             try file.writeAll(self.worker_file_buffer_data[0..len]);
             self.addCurrentFileSize(len);
             self.worker_file_buffer_len.store(0, .release);
-            self.setLastFlushTime(std.time.milliTimestamp());
+            self.setLastFlushTime(compat.milliTimestamp());
         }
     }
 
@@ -931,7 +933,7 @@ pub const AsyncLogger = struct {
         }
 
         const w = std.os.windows;
-        const h = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+        const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
         if (h == null or h == w.INVALID_HANDLE_VALUE) {
             std.debug.print("{s}", .{text});
             return;
@@ -994,13 +996,7 @@ pub const AsyncLogger = struct {
         }
 
         var written: w.DWORD = 0;
-        _ = w.kernel32.WriteConsoleW(
-            h.?,
-            self.worker_utf16_buffer.ptr,
-            @as(w.DWORD, @intCast(utf16_len)),
-            &written,
-            null,
-        );
+        _ = compat.windows.writeConsoleW(h.?, self.worker_utf16_buffer[0..utf16_len], &written);
     }
 
     /// 异步记录日志
@@ -1048,7 +1044,7 @@ pub const AsyncLogger = struct {
         };
 
         // 创建日志消息（在调用线程捕获线程 ID）
-        const msg = LogMessage.init(level, std.time.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
+        const msg = LogMessage.init(level, compat.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
 
         // 尝试推入队列
         if (!self.queue.tryPush(msg)) {
@@ -1072,7 +1068,7 @@ pub const AsyncLogger = struct {
         };
 
         // 创建日志消息
-        const msg = LogMessage.init(level, std.time.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
+        const msg = LogMessage.init(level, compat.nanoTimestamp(), std.Thread.getCurrentId(), formatted);
 
         // 尝试推入队列
         if (!self.queue.tryPush(msg)) {
@@ -1155,7 +1151,7 @@ fn printUtf8(text: []const u8) void {
     }
 
     const w = std.os.windows;
-    const h = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+    const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
     if (h == null or h == w.INVALID_HANDLE_VALUE) {
         std.debug.print("{s}", .{text});
         return;
@@ -1171,5 +1167,5 @@ fn printUtf8(text: []const u8) void {
     };
 
     var written: w.DWORD = 0;
-    _ = w.kernel32.WriteConsoleW(h.?, utf16.ptr, @as(w.DWORD, @intCast(utf16.len)), &written, null);
+    _ = compat.windows.writeConsoleW(h.?, utf16, &written);
 }

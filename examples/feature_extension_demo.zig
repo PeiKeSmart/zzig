@@ -1,5 +1,6 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 const MPMCQueue = zzig.MPMCQueue;
 const StructuredLog = zzig.StructuredLog;
 
@@ -78,7 +79,7 @@ fn testMPMCQueue(allocator: std.mem.Allocator) !void {
         }
     }.run;
 
-    const start_time = std.time.milliTimestamp();
+    const start_time = compat.milliTimestamp();
 
     // 启动生产者
     for (&producers, 0..) |*thread, i| {
@@ -103,7 +104,7 @@ fn testMPMCQueue(allocator: std.mem.Allocator) !void {
     for (producers) |thread| thread.join();
     for (consumers) |thread| thread.join();
 
-    const duration = std.time.milliTimestamp() - start_time;
+    const duration = compat.milliTimestamp() - start_time;
 
     std.debug.print("\n  ✅ MPMC 队列测试通过:\n", .{});
     std.debug.print("     - 生产者数量: {}\n", .{producer_count});

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 
 /// 日志级别
 pub const Level = enum {
@@ -50,7 +51,7 @@ pub fn getTimeOffset() i64 {
 var global_level: Level = .debug;
 
 /// 线程安全互斥锁
-var log_mutex: std.Thread.Mutex = .{};
+var log_mutex: compat.Mutex = .{};
 
 /// 线程安全开关（默认关闭以保持性能）
 var thread_safe_enabled: bool = false;
@@ -89,7 +90,7 @@ pub fn setLevel(level: Level) void {
 /// buf 至少 32 字节；格式固定为 YYYY-MM-DD HH:MM:SS.nnnnnnnnn（29 字节）
 fn formatTimestamp(buf: *[32]u8) []u8 {
     // 获取纳秒级时间戳
-    const nanos: i128 = std.time.nanoTimestamp();
+    const nanos: i128 = compat.nanoTimestamp();
 
     // 应用时间偏移量（毫秒转纳秒）
     // server_time = local_time + time_offset_ms
@@ -204,7 +205,7 @@ fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
 
     // Windows 平台：使用 WriteConsoleW 保证中文显示
     const w = std.os.windows;
-    const h = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+    const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
     if (h == null or h == w.INVALID_HANDLE_VALUE) {
         // 降级到普通打印
         std.debug.print("{s}", .{text});
@@ -218,7 +219,7 @@ fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
     };
 
     var written: w.DWORD = 0;
-    _ = w.kernel32.WriteConsoleW(h.?, utf16.ptr, @as(w.DWORD, @intCast(utf16.len)), &written, null);
+    _ = compat.windows.writeConsoleW(h.?, utf16, &written);
 }
 
 /// 通用日志打印函数

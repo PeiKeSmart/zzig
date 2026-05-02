@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// 性能剖析配置
 pub const ProfilerConfig = struct {
@@ -64,7 +65,7 @@ pub const Profiler = struct {
 
     // 性能数据
     zones: std.StringHashMap(Metrics),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     // 随机数生成器（采样用）
     prng: std.Random.DefaultPrng,
@@ -75,7 +76,7 @@ pub const Profiler = struct {
             .config = config,
             .zones = std.StringHashMap(Metrics).init(allocator),
             .mutex = .{},
-            .prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp())),
+            .prng = std.Random.DefaultPrng.init(@intCast(compat.milliTimestamp())),
         };
     }
 
@@ -101,7 +102,7 @@ pub const Profiler = struct {
         return .{
             .profiler = self,
             .zone_name = zone_name,
-            .start_time = std.time.nanoTimestamp(),
+            .start_time = compat.nanoTimestamp(),
             .should_record = true,
         };
     }
@@ -110,7 +111,7 @@ pub const Profiler = struct {
     pub fn endZone(self: *Profiler, zone: Zone) void {
         if (!zone.should_record) return;
 
-        const end_time = std.time.nanoTimestamp();
+        const end_time = compat.nanoTimestamp();
         const duration = @as(u64, @intCast(end_time - zone.start_time));
 
         self.recordMetrics(zone.zone_name, duration);
@@ -144,14 +145,16 @@ pub const Profiler = struct {
 
     /// 导出性能报告（JSON 格式）
     pub fn exportReport(self: *Profiler, file_path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(file_path, .{});
+        const file = try compat.fs.cwd().createFile(file_path, .{});
         defer file.close();
 
         // 使用缓冲区来构建 JSON
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        const writer = buf.writer(self.allocator);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        defer buf = aw.toArrayList();
+        var writer = aw.writer;
 
         try writer.writeAll("{\n");
         try writer.writeAll("  \"zones\": [\n");
@@ -193,7 +196,8 @@ pub const Profiler = struct {
         std.debug.print("\n=== 性能剖析报告 ===\n\n", .{});
 
         // 收集并排序（按总耗时）
-        var entries: std.ArrayList(struct { name: []const u8, metrics: Metrics }) = .{};
+        const SummaryEntry = struct { name: []const u8, metrics: Metrics };
+        var entries: std.ArrayList(SummaryEntry) = std.ArrayList(SummaryEntry).empty;
         defer entries.deinit(self.allocator);
 
         var iter = self.zones.iterator();
@@ -275,7 +279,7 @@ test "Profiler - 基本功能" {
     // 模拟性能区域
     {
         const zone = profiler.beginZone("test_func");
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        compat.sleep(1 * std.time.ns_per_ms);
         profiler.endZone(zone);
     }
 
@@ -314,7 +318,7 @@ test "Profiler - 导出报告" {
 
     {
         const zone = profiler.beginZone("export_test");
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        compat.sleep(100 * std.time.ns_per_us);
         profiler.endZone(zone);
     }
 

@@ -3,11 +3,12 @@
 
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 pub fn main() !void {
     std.debug.print("=== JSON 解析器高级示例 ===\n\n", .{});
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -98,12 +99,12 @@ fn example2_hybrid_mode(allocator: std.mem.Allocator) !void {
     std.debug.print("  小型 JSON (栈): owned={}, count={}\n", .{ small_result.owned, small_result.count() });
 
     // 大型 JSON - 使用堆内存
-    var large_json_builder: std.ArrayList(u8) = .{};
+    var large_json_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
 
     try large_json_builder.appendSlice(allocator, "{\"data\":[");
     for (0..100) |i| {
         if (i > 0) try large_json_builder.appendSlice(allocator, ",");
-        try large_json_builder.writer(allocator).print("{{\"id\":{}}}", .{i});
+        try large_json_builder.print(allocator, "{{\"id\":{}}}", .{i});
     }
     try large_json_builder.appendSlice(allocator, "]}");
 
@@ -246,13 +247,13 @@ fn example7_performance_comparison(allocator: std.mem.Allocator) !void {
     std.debug.print("--- 示例 7: 性能对比测试 ---\n", .{});
 
     // 生成测试数据
-    var json_builder: std.ArrayList(u8) = .{};
+    var json_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer json_builder.deinit(allocator);
 
     try json_builder.appendSlice(allocator, "[");
     for (0..1000) |i| {
         if (i > 0) try json_builder.appendSlice(allocator, ",");
-        try json_builder.writer(allocator).print("{{\"id\":{},\"value\":\"{}\"}}", .{ i, i * 2 });
+        try json_builder.print(allocator, "{{\"id\":{},\"value\":\"{}\"}}", .{ i, i * 2 });
     }
     try json_builder.appendSlice(allocator, "]");
 
@@ -266,9 +267,9 @@ fn example7_performance_comparison(allocator: std.mem.Allocator) !void {
         .use_simd = true,
         .enable_helpers = true,
     });
-    const start1 = std.time.nanoTimestamp();
+    const start1 = compat.nanoTimestamp();
     var result1 = try StandardParser.parseHybrid(allocator, json);
-    const end1 = std.time.nanoTimestamp();
+    const end1 = compat.nanoTimestamp();
     defer result1.deinit(allocator);
 
     const time1 = end1 - start1;
@@ -281,9 +282,9 @@ fn example7_performance_comparison(allocator: std.mem.Allocator) !void {
         .enable_helpers = false,
         .tiny_mode = true,
     });
-    const start2 = std.time.nanoTimestamp();
+    const start2 = compat.nanoTimestamp();
     var result2 = try LeanParser.parseHybrid(allocator, json);
-    const end2 = std.time.nanoTimestamp();
+    const end2 = compat.nanoTimestamp();
     defer result2.deinit(allocator);
 
     const time2 = end2 - start2;

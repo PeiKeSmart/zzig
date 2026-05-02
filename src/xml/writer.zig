@@ -4,6 +4,8 @@
 // 参考 ianprime0509/zig-xml 的 API 设计（0BSD License）
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 
 /// 写入过程中的错误类型
 pub const WriteError = error{
@@ -65,7 +67,7 @@ pub fn Writer(comptime OutWriter: type) type {
                 .state = .start,
                 .indent_depth = 0,
                 .gpa = gpa,
-                .element_names = .{},
+                .element_names = std.ArrayList([]u8).empty,
             };
         }
 
@@ -391,7 +393,7 @@ pub fn Writer(comptime OutWriter: type) type {
 /// 创建输出到 `std.ArrayList(u8)` 的 Writer 便捷函数
 /// 返回值包含 Writer 本身和底层 ArrayList
 pub fn bufferWriter(gpa: Allocator, options: Options) BufferWriterResult {
-    const al: std.ArrayList(u8) = .{};
+    const al: std.ArrayList(u8) = std.ArrayList(u8).empty;
     return .{ .buf = al, .options = options, .gpa = gpa };
 }
 
@@ -414,28 +416,30 @@ pub fn writeToFile(
     path: []const u8,
     options: Options,
     context: anytype,
-    comptime content_fn: fn (ctx: @TypeOf(context), w: *Writer(std.io.AnyWriter)) WriteError!void,
+    comptime content_fn: fn (ctx: @TypeOf(context), w: *Writer(std.Io.Writer)) WriteError!void,
 ) !void {
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    var file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
-    var bw = std.io.bufferedWriter(file.deprecatedWriter());
-    var w = Writer(std.io.AnyWriter).init(gpa, bw.writer().any(), options);
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(gpa);
+
+    var buffer_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &buffer);
+    defer buffer = buffer_writer.toArrayList();
+    var w = Writer(std.Io.Writer).init(gpa, buffer_writer.writer, options);
     defer w.deinit();
     try content_fn(context, &w);
-    try bw.flush();
+    try file.writeAll(buffer.items);
 }
 
 // ─────────────────────────── 单元测试 ───────────────────────────
 
 test "Writer - basic document" {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(std.testing.allocator);
 
-    var w = Writer(std.io.AnyWriter).init(
-        std.testing.allocator,
-        buf.writer(std.testing.allocator).any(),
-        .{ .indent = "  " },
-    );
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = buf_writer.toArrayList();
+    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "  " });
     defer w.deinit();
 
     try w.xmlDeclaration("UTF-8", null);
@@ -461,14 +465,12 @@ test "Writer - basic document" {
 }
 
 test "Writer - text escaping" {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(std.testing.allocator);
 
-    var w = Writer(std.io.AnyWriter).init(
-        std.testing.allocator,
-        buf.writer(std.testing.allocator).any(),
-        .{ .indent = "" },
-    );
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = buf_writer.toArrayList();
+    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 
     try w.elementStart("root");
@@ -483,14 +485,12 @@ test "Writer - text escaping" {
 }
 
 test "Writer - cdata and comment" {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(std.testing.allocator);
 
-    var w = Writer(std.io.AnyWriter).init(
-        std.testing.allocator,
-        buf.writer(std.testing.allocator).any(),
-        .{ .indent = "" },
-    );
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    defer buf = buf_writer.toArrayList();
+    var w = Writer(std.Io.Writer).init(std.testing.allocator, buf_writer.writer, .{ .indent = "" });
     defer w.deinit();
 
     try w.elementStart("root");

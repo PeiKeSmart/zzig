@@ -1,5 +1,6 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 /// 性能测试：过滤场景（日志被过滤，测量最小开销）
 fn benchmarkFiltered(iterations: usize, thread_safe: bool) !void {
@@ -12,14 +13,14 @@ fn benchmarkFiltered(iterations: usize, thread_safe: bool) !void {
     // 设置为 err 级别，debug 日志会被过滤
     zzig.Logger.setLevel(.err);
 
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         zzig.Logger.debug("测试消息 {d}", .{i});
     }
 
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
     const duration = end - start;
     const avg_ns = @divTrunc(duration, @as(i128, @intCast(iterations)));
 
@@ -42,14 +43,14 @@ fn benchmarkActual(iterations: usize, thread_safe: bool) !void {
     // 全部启用，会实际输出
     zzig.Logger.setLevel(.debug);
 
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         zzig.Logger.info("测试 {d}", .{i});
     }
 
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
     const duration = end - start;
     const avg_us = @divTrunc(duration, @as(i128, @intCast(iterations)) * 1000);
 
@@ -71,7 +72,7 @@ pub fn main() !void {
     std.debug.print("\n【测试 2】实际输出场景 (包含格式化 + IO，真实开销)\n", .{});
     std.debug.print("迭代: 1,000 次 (输出到控制台)\n", .{});
     try benchmarkActual(1_000, false);
-    
+
     std.debug.print("\n启用线程安全...\n", .{});
     try benchmarkActual(1_000, true);
 

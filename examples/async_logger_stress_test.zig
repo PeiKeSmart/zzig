@@ -1,9 +1,10 @@
 const std = @import("std");
 const AsyncLogger = @import("zzig").AsyncLogger;
+const compat = @import("zzig").compat;
 
 /// 模拟百万级设备的高负载日志测试
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -32,13 +33,13 @@ pub fn main() !void {
     std.debug.print("🚀 测试 1: 顺序压测（单线程）\n", .{});
 
     const sequential_count = 100_000; // 10万条
-    const start_seq = std.time.nanoTimestamp();
+    const start_seq = compat.nanoTimestamp();
 
     for (0..sequential_count) |i| {
         logger.info("设备{d}: 状态正常, 温度: {d}°C, 内存: {d}MB", .{ i, 45 + (i % 20), 256 - (i % 100) });
     }
 
-    const end_seq = std.time.nanoTimestamp();
+    const end_seq = compat.nanoTimestamp();
     const duration_seq_ns = @as(u64, @intCast(end_seq - start_seq));
     const duration_seq_us = duration_seq_ns / std.time.ns_per_us;
     const qps_seq = (sequential_count * std.time.ns_per_s) / duration_seq_ns;
@@ -51,7 +52,7 @@ pub fn main() !void {
 
     // 等待队列处理
     std.debug.print("⏳ 等待日志队列处理...\n", .{});
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     // ========================================
     // 测试 2: 多线程并发（模拟多设备并发上报）
@@ -63,7 +64,7 @@ pub fn main() !void {
     const total_logs = thread_count * logs_per_thread; // 总共 80 万条
 
     var threads: [thread_count]std.Thread = undefined;
-    const start_concurrent = std.time.nanoTimestamp();
+    const start_concurrent = compat.nanoTimestamp();
 
     // 启动工作线程
     for (0..thread_count) |i| {
@@ -75,7 +76,7 @@ pub fn main() !void {
         thread.join();
     }
 
-    const end_concurrent = std.time.nanoTimestamp();
+    const end_concurrent = compat.nanoTimestamp();
     const duration_concurrent_ns = @as(u64, @intCast(end_concurrent - start_concurrent));
     const duration_concurrent_us = duration_concurrent_ns / std.time.ns_per_us;
     const qps_concurrent = (total_logs * std.time.ns_per_s) / duration_concurrent_ns;
@@ -88,7 +89,7 @@ pub fn main() !void {
 
     // 等待队列完全清空
     std.debug.print("⏳ 等待队列完全处理...\n", .{});
-    std.Thread.sleep(3 * std.time.ns_per_s);
+    compat.sleep(3 * std.time.ns_per_s);
 
     // ========================================
     // 统计报告

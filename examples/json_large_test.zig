@@ -3,14 +3,14 @@ const std = @import("std");
 const zzig = @import("zzig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     std.debug.print("=== 大型 JSON 紧凑格式自动回退测试 ===\n\n", .{});
 
     // 生成一个超过 1MB 起始位置的 JSON
-    var json_builder: std.ArrayList(u8) = .{};
+    var json_builder: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer json_builder.deinit(allocator);
 
     // 先填充大量空白符，让后续 token 的起始位置超过 1MB

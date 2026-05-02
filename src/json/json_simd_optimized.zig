@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 
 /// SIMD 配置
 pub const SimdConfig = struct {
@@ -310,14 +311,14 @@ test "SIMD vs 标量字符查找" {
     const haystack = "Hello, World! This is a test string with many characters.";
 
     // SIMD 版本
-    const start1 = std.time.nanoTimestamp();
+    const start1 = compat.nanoTimestamp();
     _ = simdFindChar(haystack, 'z');
-    const end1 = std.time.nanoTimestamp();
+    const end1 = compat.nanoTimestamp();
 
     // 标量版本
-    const start2 = std.time.nanoTimestamp();
+    const start2 = compat.nanoTimestamp();
     _ = simdFindCharScalar(haystack, 'z');
-    const end2 = std.time.nanoTimestamp();
+    const end2 = compat.nanoTimestamp();
 
     const simd_time = end1 - start1;
     const scalar_time = end2 - start2;

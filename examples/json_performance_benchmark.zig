@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 const jsmn = zzig.json.Jsmn;
 
 // 测试数据大小枚举
@@ -10,7 +11,7 @@ const SizeType = enum { small, medium, large };
 
 // 测试数据生成器
 fn generateTestJson(allocator: std.mem.Allocator, size: SizeType) ![]const u8 {
-    var list: std.ArrayList(u8) = .{};
+    var list: std.ArrayList(u8) = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
 
     switch (size) {
@@ -19,7 +20,7 @@ fn generateTestJson(allocator: std.mem.Allocator, size: SizeType) ![]const u8 {
             try list.appendSlice(allocator, "{\"users\":[");
             for (0..10) |i| {
                 if (i > 0) try list.appendSlice(allocator, ",");
-                try list.writer(allocator).print("{{\"id\":{},\"name\":\"user_{}\"}}", .{ i, i });
+                try list.print(allocator, "{{\"id\":{},\"name\":\"user_{}\"}}", .{ i, i });
             }
             try list.appendSlice(allocator, "]}");
         },
@@ -28,7 +29,8 @@ fn generateTestJson(allocator: std.mem.Allocator, size: SizeType) ![]const u8 {
             try list.appendSlice(allocator, "{\"data\":[");
             for (0..100) |i| {
                 if (i > 0) try list.appendSlice(allocator, ",");
-                try list.writer(allocator).print(
+                try list.print(
+                    allocator,
                     "{{\"id\":{},\"name\":\"item_{}\",\"value\":{},\"active\":true}}",
                     .{ i, i, i * 2 },
                 );
@@ -40,7 +42,8 @@ fn generateTestJson(allocator: std.mem.Allocator, size: SizeType) ![]const u8 {
             try list.appendSlice(allocator, "{\"records\":[");
             for (0..1000) |i| {
                 if (i > 0) try list.appendSlice(allocator, ",");
-                try list.writer(allocator).print(
+                try list.print(
+                    allocator,
                     "{{\"id\":{},\"name\":\"record_{}\",\"value\":{},\"tags\":[\"a\",\"b\",\"c\"]}}",
                     .{ i, i, i * 3 },
                 );
@@ -97,12 +100,12 @@ fn benchmarkOriginal(allocator: std.mem.Allocator, json_text: []const u8, iterat
     var total_allocs: usize = 0;
 
     for (0..iterations) |_| {
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         var result = try Parser.parseHybrid(allocator, json_text);
         defer result.deinit(allocator);
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
 
         total_time += end - start;
         total_tokens = result.count();
@@ -141,11 +144,11 @@ fn benchmarkZeroAlloc(allocator: std.mem.Allocator, json_text: []const u8, itera
         var tokens: [16384]Parser.Token = undefined;
         var parents: [16384]Parser.IndexT = undefined;
 
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         const count = try Parser.parseTokens(&tokens, &parents, json_text);
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
 
         total_time += end - start;
         total_tokens = count;
@@ -174,12 +177,12 @@ fn benchmarkCompact(allocator: std.mem.Allocator, json_text: []const u8, iterati
     var total_allocs: usize = 0;
 
     for (0..iterations) |_| {
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         var result = try Parser.parseHybrid(allocator, json_text);
         defer result.deinit(allocator);
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
 
         total_time += end - start;
         total_tokens = result.count();
@@ -229,7 +232,7 @@ fn compareMemoryUsage() void {
 
 // 主基准测试程序
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

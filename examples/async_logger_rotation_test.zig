@@ -2,12 +2,13 @@
 /// 用于测试文件大小达到阈值时的自动轮转功能
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 const AsyncLogger = zzig.AsyncLogger;
 const LogLevel = AsyncLogger.LogLevel;
 
 pub fn main() !void {
     // 使用通用分配器
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -54,13 +55,13 @@ pub fn main() !void {
 
         // 给工作线程一些处理时间
         if (batch_num % 20 == 0) {
-            std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms
+            compat.sleep(100 * std.time.ns_per_ms); // 100ms
         }
     }
 
     // 等待处理完成
     std.debug.print("\n⏳ 等待日志处理完成...\n", .{});
-    std.Thread.sleep(3 * std.time.ns_per_s); // 等待3秒
+    compat.sleep(3 * std.time.ns_per_s); // 等待3秒
 
     // 打印统计信息
     std.debug.print("\n📈 最终统计信息:\n", .{});

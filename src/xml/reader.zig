@@ -4,6 +4,8 @@
 // 参考 ianprime0509/zig-xml 的 API 设计（0BSD License）
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 
 const scanner_mod = @import("scanner.zig");
 pub const Scanner = scanner_mod.Scanner;
@@ -108,8 +110,8 @@ pub const Reader = struct {
             .pending_end_name = "",
             .attrs = undefined,
             .attr_count = 0,
-            .scratch = .{},
-            .name_stack = .{},
+            .scratch = std.ArrayList(u8).empty,
+            .name_stack = std.ArrayList([]const u8).empty,
             .xml_decl = null,
             .initialized = true,
         };
@@ -117,7 +119,7 @@ pub const Reader = struct {
 
     /// 从文件路径读取全部内容并初始化（Reader 管理缓冲区生命周期）
     pub fn initFile(gpa: Allocator, path: []const u8) (ReadError || Allocator.Error)!Reader {
-        const file = std.fs.cwd().openFile(path, .{}) catch return ReadError.ReadFailed;
+        const file = fs.cwd().openFile(path, .{}) catch return ReadError.ReadFailed;
         defer file.close();
         const content = file.readToEndAlloc(gpa, std.math.maxInt(usize)) catch |err| switch (err) {
             error.OutOfMemory => return ReadError.OutOfMemory,
@@ -134,15 +136,15 @@ pub const Reader = struct {
             .pending_end_name = "",
             .attrs = undefined,
             .attr_count = 0,
-            .scratch = .{},
-            .name_stack = .{},
+            .scratch = std.ArrayList(u8).empty,
+            .name_stack = std.ArrayList([]const u8).empty,
             .xml_decl = null,
             .initialized = true,
         };
     }
 
-    /// 从 `std.fs.File` 初始化（Reader 管理缓冲区生命周期）
-    pub fn initFileHandle(gpa: Allocator, file: std.fs.File) (ReadError || Allocator.Error)!Reader {
+    /// 从文件句柄初始化（Reader 管理缓冲区生命周期）
+    pub fn initFileHandle(gpa: Allocator, file: fs.File) (ReadError || Allocator.Error)!Reader {
         const content = file.readToEndAlloc(gpa, std.math.maxInt(usize)) catch |err| switch (err) {
             error.OutOfMemory => return ReadError.OutOfMemory,
             else => return ReadError.ReadFailed,
@@ -158,8 +160,8 @@ pub const Reader = struct {
             .pending_end_name = "",
             .attrs = undefined,
             .attr_count = 0,
-            .scratch = .{},
-            .name_stack = .{},
+            .scratch = std.ArrayList(u8).empty,
+            .name_stack = std.ArrayList([]const u8).empty,
             .xml_decl = null,
             .initialized = true,
         };
@@ -449,7 +451,7 @@ pub const Reader = struct {
     /// 返回内存由调用者负责释放
     pub fn readElementTextAlloc(self: *Reader) ReadError![]u8 {
         std.debug.assert(self.node == .element_start);
-        var text_buf: std.ArrayList(u8) = .{};
+        var text_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         defer text_buf.deinit(self.gpa);
         var skip_depth: usize = 1;
         while (skip_depth > 0) {

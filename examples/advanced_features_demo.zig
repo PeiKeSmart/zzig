@@ -1,5 +1,6 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 const DynamicQueue = @import("zzig").logs.DynamicQueue;
 const RotationManager = @import("zzig").logs.RotationManager;
 const Profiler = @import("zzig").profiler.Profiler;
@@ -11,7 +12,7 @@ const Profiler = @import("zzig").profiler.Profiler;
 /// 2. RotationManager - 多策略日志轮转
 /// 3. Profiler - 零开销性能剖析
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -73,19 +74,19 @@ pub fn main() !void {
             {
                 const zone = profiler.beginZone("queue_push");
                 defer profiler.endZone(zone);
-                std.Thread.sleep(1 * std.time.ns_per_us);
+                compat.sleep(1 * std.time.ns_per_us);
             }
 
             {
                 const zone = profiler.beginZone("format_log");
                 defer profiler.endZone(zone);
-                std.Thread.sleep(5 * std.time.ns_per_us);
+                compat.sleep(5 * std.time.ns_per_us);
             }
 
             {
                 const zone = profiler.beginZone("write_file");
                 defer profiler.endZone(zone);
-                std.Thread.sleep(20 * std.time.ns_per_us);
+                compat.sleep(20 * std.time.ns_per_us);
             }
         }
 
@@ -98,7 +99,7 @@ pub fn main() !void {
         var profiler = try Profiler.init(allocator, .{ .enable = false });
         defer profiler.deinit();
 
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         // 100万次操作
         for (0..1_000_000) |_| {
@@ -107,7 +108,7 @@ pub fn main() !void {
             // 空操作
         }
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
         const duration_ns = @as(u64, @intCast(end - start));
 
         std.debug.print("100 万次剖析调用耗时: {} ns\n", .{duration_ns});

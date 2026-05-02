@@ -1,8 +1,9 @@
 const std = @import("std");
 const AsyncLogger = @import("../src/logs/async_logger.zig");
+const compat = @import("../src/compat.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15,11 +16,11 @@ pub fn main() !void {
     logger.info("测试 1: 基本消息", .{});
     logger.warn("测试 2: 格式化 {s}", .{"成功"});
 
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
     for (0..1000) |i| {
         logger.info("消息 {d}", .{i});
     }
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
 
     const duration_ns = @as(u64, @intCast(end - start));
     const avg_ns = duration_ns / 1000;
@@ -29,7 +30,7 @@ pub fn main() !void {
     std.debug.print("✓ 平均延迟: {d} ns\n", .{avg_ns});
     std.debug.print("✓ QPS: {d} 条/秒\n", .{qps});
 
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    compat.sleep(1 * std.time.ns_per_s);
 
     std.debug.print("\n已处理: {d} 条\n", .{logger.getProcessedCount()});
     std.debug.print("已丢弃: {d} 条\n", .{logger.getDroppedCount()});

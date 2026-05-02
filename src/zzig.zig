@@ -38,6 +38,9 @@ pub const profiler = struct {
     pub const Metrics = @import("profiler/profiler.zig").Metrics;
 };
 
+/// Zig 版本兼容辅助
+pub const compat = @import("compat.zig");
+
 /// 动态队列（自动扩容的 SPSC 队列）
 pub const logs = struct {
     pub const DynamicQueue = @import("logs/dynamic_queue.zig").DynamicQueue;

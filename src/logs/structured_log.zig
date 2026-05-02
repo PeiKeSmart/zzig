@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// 结构化日志等级
 pub const Level = enum {
@@ -61,8 +62,8 @@ pub const StructuredLog = struct {
             .allocator = allocator,
             .level = level,
             .message = null,
-            .fields = .{}, // ✅ Zig 0.15.2 空字面量初始化
-            .timestamp = std.time.milliTimestamp(),
+            .fields = std.ArrayList(Field).empty,
+            .timestamp = compat.milliTimestamp(),
         };
     }
 
@@ -128,10 +129,12 @@ pub const StructuredLog = struct {
     /// # 返回
     /// 返回的字符串需要手动释放：`allocator.free(json);`
     pub fn build(self: *const StructuredLog) ![]u8 {
-        var buf: std.ArrayList(u8) = .{}; // ✅ Zig 0.15.2 空字面量
+        var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
         errdefer buf.deinit(self.allocator); // ✅ 传入 allocator
 
-        const writer = buf.writer(self.allocator); // ✅ 传入 allocator
+        var aw: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        defer buf = aw.toArrayList();
+        var writer = aw.writer;
 
         try writer.writeAll("{");
 
@@ -144,7 +147,7 @@ pub const StructuredLog = struct {
         // 消息
         if (self.message) |msg| {
             try writer.writeAll("\"message\":\"");
-            try writeEscapedString(writer, msg);
+            try writeEscapedString(&writer, msg);
             try writer.writeAll("\",");
         }
 
@@ -155,7 +158,7 @@ pub const StructuredLog = struct {
             switch (field.value) {
                 .string => |s| {
                     try writer.writeAll("\"");
-                    try writeEscapedString(writer, s);
+                    try writeEscapedString(&writer, s);
                     try writer.writeAll("\"");
                 },
                 .int => |v| try writer.print("{}", .{v}),
@@ -188,7 +191,7 @@ pub const StructuredLog = struct {
     };
 
     /// JSON 转义字符串：批量写普通字节前缀，遇到需转义的字符处理
-    fn writeEscapedString(writer: anytype, s: []const u8) !void {
+    fn writeEscapedString(writer: *std.Io.Writer, s: []const u8) !void {
         var pos: usize = 0;
         while (pos < s.len) {
             // 用 comptime 查表定位下一个需要转义的字节，单次 bool 查表代替 6 次比较
@@ -257,7 +260,7 @@ pub const StructuredLogZeroAlloc = struct {
             .message_len = 0,
             .fields = undefined,
             .field_count = 0,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.milliTimestamp(),
         };
     }
 
@@ -298,8 +301,7 @@ pub const StructuredLogZeroAlloc = struct {
 
     /// 构建 JSON 到固定缓冲区
     pub fn buildToBuffer(self: *const StructuredLogZeroAlloc, buffer: []u8) ![]const u8 {
-        var stream = std.io.fixedBufferStream(buffer);
-        const writer = stream.writer();
+        var writer: std.Io.Writer = .fixed(buffer);
 
         try writer.writeAll("{");
         try writer.print("\"timestamp\":{},", .{self.timestamp});
@@ -307,7 +309,7 @@ pub const StructuredLogZeroAlloc = struct {
 
         if (self.message_len > 0) {
             try writer.writeAll(",\"message\":\"");
-            try StructuredLog.writeEscapedString(writer, self.message[0..self.message_len]);
+            try StructuredLog.writeEscapedString(&writer, self.message[0..self.message_len]);
             try writer.writeAll("\"");
         }
 
@@ -317,7 +319,7 @@ pub const StructuredLogZeroAlloc = struct {
             switch (field.value) {
                 .string => |s| {
                     try writer.writeAll("\"");
-                    try StructuredLog.writeEscapedString(writer, s.data[0..s.len]);
+                    try StructuredLog.writeEscapedString(&writer, s.data[0..s.len]);
                     try writer.writeAll("\"");
                 },
                 .int => |v| try writer.print("{}", .{v}),
@@ -329,7 +331,7 @@ pub const StructuredLogZeroAlloc = struct {
         }
 
         try writer.writeAll("}");
-        return stream.getWritten();
+        return buffer[0..writer.end];
     }
 };
 

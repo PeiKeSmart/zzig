@@ -1,9 +1,10 @@
 const std = @import("std");
 const AsyncLogger = @import("zzig").AsyncLogger;
+const compat = @import("zzig").compat;
 
 /// 零分配模式演示（适用于 ARM/嵌入式设备）
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -38,7 +39,7 @@ pub fn main() !void {
         logger_auto.info("自动检测模式测试", .{});
         logger_auto.warn("内存占用: {d} KB", .{256});
 
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        compat.sleep(200 * std.time.ns_per_ms);
         std.debug.print("   统计: 已处理 {d}, 已丢弃 {d}\n\n", .{
             logger_auto.getProcessedCount(),
             logger_auto.getDroppedCount(),
@@ -66,13 +67,13 @@ pub fn main() !void {
 
         // 性能测试
         const count = 10_000;
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         for (0..count) |i| {
             logger_zero.info("设备{d}: 温度 {d}°C, 内存 {d}MB", .{ i, 45 + (i % 20), 256 - (i % 100) });
         }
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
         const duration_ns = @as(u64, @intCast(end - start));
         const latency_ns = duration_ns / count;
         const qps = (count * std.time.ns_per_s) / duration_ns;
@@ -81,7 +82,7 @@ pub fn main() !void {
         std.debug.print("   平均延迟: {d} ns (≈ {d:.2} μs)\n", .{ latency_ns, @as(f64, @floatFromInt(latency_ns)) / 1000.0 });
         std.debug.print("   QPS: {d} 条/秒\n\n", .{qps});
 
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        compat.sleep(1 * std.time.ns_per_s);
 
         std.debug.print("   统计: 已处理 {d}, 已丢弃 {d}\n\n", .{
             logger_zero.getProcessedCount(),
@@ -106,13 +107,13 @@ pub fn main() !void {
 
         // 性能测试
         const count = 10_000;
-        const start = std.time.nanoTimestamp();
+        const start = compat.nanoTimestamp();
 
         for (0..count) |i| {
             logger_dynamic.info("服务器{d}: CPU {d}%, 连接数 {d}", .{ i, 30 + (i % 70), 100 + (i % 500) });
         }
 
-        const end = std.time.nanoTimestamp();
+        const end = compat.nanoTimestamp();
         const duration_ns = @as(u64, @intCast(end - start));
         const latency_ns = duration_ns / count;
         const qps = (count * std.time.ns_per_s) / duration_ns;
@@ -121,7 +122,7 @@ pub fn main() !void {
         std.debug.print("   平均延迟: {d} ns (≈ {d:.2} μs)\n", .{ latency_ns, @as(f64, @floatFromInt(latency_ns)) / 1000.0 });
         std.debug.print("   QPS: {d} 条/秒\n\n", .{qps});
 
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        compat.sleep(1 * std.time.ns_per_s);
 
         std.debug.print("   统计: 已处理 {d}, 已丢弃 {d}\n\n", .{
             logger_dynamic.getProcessedCount(),

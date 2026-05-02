@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// 动态扩容队列配置
 pub const DynamicQueueConfig = struct {
@@ -53,7 +54,7 @@ pub fn DynamicQueue(comptime T: type) type {
         // 预扩容相关
         resize_threshold_count: usize, // 预计算的扩容阈值
         is_resizing: std.atomic.Value(bool), // 扩容标志
-        resize_mutex: std.Thread.Mutex, // ✅ 保护扩容操作的互斥锁
+        resize_mutex: compat.Mutex, // ✅ 保护扩容操作的互斥锁
 
         const Self = @This();
 

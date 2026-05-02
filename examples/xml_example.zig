@@ -4,9 +4,10 @@
 const std = @import("std");
 const zzig = @import("zzig");
 const xml = zzig.xml;
+const compat = zzig.compat;
 
 pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
@@ -18,11 +19,13 @@ pub fn main() !void {
 
     std.debug.print("── 1. 使用 Writer 构建 XML 文档 ──\n\n", .{});
 
-    var xml_buf: std.ArrayList(u8) = .{};
+    var xml_buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer xml_buf.deinit(gpa);
 
     {
-        var w = xml.createWriter(gpa, xml_buf.writer(gpa).any(), .{ .indent = "  " });
+        var xml_buf_writer: std.Io.Writer.Allocating = .fromArrayList(gpa, &xml_buf);
+        defer xml_buf = xml_buf_writer.toArrayList();
+        var w = xml.createWriter(gpa, xml_buf_writer.writer, .{ .indent = "  " });
         defer w.deinit();
 
         try w.xmlDeclaration("UTF-8", null);
@@ -78,7 +81,7 @@ pub fn main() !void {
     // 将生成的 XML 写入临时文件
     const tmp_path = "xml_example_output.xml";
     {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        const f = try compat.fs.cwd().createFile(tmp_path, .{ .truncate = true });
         defer f.close();
         try f.writeAll(xml_buf.items);
     }
@@ -204,8 +207,8 @@ pub fn main() !void {
     }
 
     // 清理临时文件
-    std.fs.cwd().deleteFile(tmp_path) catch {};
-    std.fs.cwd().deleteFile("xml_dom_roundtrip.xml") catch {};
+    compat.fs.cwd().deleteFile(tmp_path) catch {};
+    compat.fs.cwd().deleteFile("xml_dom_roundtrip.xml") catch {};
 
     std.debug.print("\n✓ XML 模块演示完成\n\n", .{});
 }

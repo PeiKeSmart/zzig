@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 /// 菜单选项结构
 pub const MenuItem = struct {
@@ -23,11 +24,11 @@ pub fn readLine(allocator: std.mem.Allocator) ![]u8 {
     var buffer: [4096]u8 = undefined;
     const bytes_read = if (builtin.os.tag == .windows) blk: {
         const w = std.os.windows;
-        const stdin_handle = w.kernel32.GetStdHandle(w.STD_INPUT_HANDLE) orelse return error.InvalidHandle;
+        const stdin_handle = compat.windows.getStdHandle(compat.windows.STD_INPUT_HANDLE) orelse return error.InvalidHandle;
         if (stdin_handle == w.INVALID_HANDLE_VALUE) return error.InvalidHandle;
 
         var bytes: w.DWORD = 0;
-        if (w.kernel32.ReadFile(stdin_handle, &buffer, buffer.len, &bytes, null) == 0) {
+        if (!compat.windows.readFile(stdin_handle, buffer[0..], &bytes).toBool()) {
             return error.ReadFailed;
         }
         break :blk @as(usize, bytes);
@@ -39,7 +40,9 @@ pub fn readLine(allocator: std.mem.Allocator) ![]u8 {
 
     // 去除换行符（\r\n 或 \n）
     const line = buffer[0..bytes_read];
-    const trimmed = std.mem.trimRight(u8, line, &[_]u8{ '\r', '\n' });
+    var end = line.len;
+    while (end > 0 and (line[end - 1] == '\r' or line[end - 1] == '\n')) : (end -= 1) {}
+    const trimmed = line[0..end];
     return try allocator.dupe(u8, trimmed);
 }
 
@@ -196,10 +199,10 @@ pub fn clearScreen() void {
     if (builtin.os.tag == .windows) {
         const w = std.os.windows;
         const ENABLE_VIRTUAL_TERMINAL_PROCESSING: w.DWORD = 0x0004;
-        const h = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+        const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
         var mode: w.DWORD = 0;
         if (h != null and h != w.INVALID_HANDLE_VALUE and
-            w.kernel32.GetConsoleMode(h.?, &mode) != 0 and
+            compat.windows.getConsoleMode(h.?, &mode).toBool() and
             (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0)
         {
             // 虚拟终端已启用，直接写 ANSI 转义序列（微秒级）

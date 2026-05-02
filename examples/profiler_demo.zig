@@ -1,5 +1,6 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 const Profiler = zzig.profiler.Profiler;
 
 /// 模拟日志处理函数
@@ -14,7 +15,7 @@ fn processLog(profiler: *Profiler, msg: []const u8) void {
     }
     std.mem.doNotOptimizeAway(&hash); // 防止编译器优化掉
 
-    std.Thread.sleep(10 * std.time.ns_per_us); // 模拟耗时操作
+    compat.sleep(10 * std.time.ns_per_us); // 模拟耗时操作
 }
 
 /// 模拟文件写入
@@ -22,7 +23,7 @@ fn writeToFile(profiler: *Profiler) void {
     const zone = profiler.beginZone("file_write");
     defer profiler.endZone(zone);
 
-    std.Thread.sleep(100 * std.time.ns_per_us);
+    compat.sleep(100 * std.time.ns_per_us);
 }
 
 /// 模拟队列操作
@@ -30,11 +31,11 @@ fn queueOperation(profiler: *Profiler) void {
     const zone = profiler.beginZone("queue_push");
     defer profiler.endZone(zone);
 
-    std.Thread.sleep(5 * std.time.ns_per_us);
+    compat.sleep(5 * std.time.ns_per_us);
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -119,14 +120,14 @@ pub fn main() !void {
     std.debug.print("【场景 5】性能对比测试\n", .{});
 
     // 基线测试（无剖析）
-    const baseline_start = std.time.nanoTimestamp();
+    const baseline_start = compat.nanoTimestamp();
     for (0..100000) |_| {
         var hash: u64 = 0;
         for ("test message") |byte| {
             hash = hash *% 31 +% byte;
         }
     }
-    const baseline_end = std.time.nanoTimestamp();
+    const baseline_end = compat.nanoTimestamp();
     const baseline_duration = @as(u64, @intCast(baseline_end - baseline_start));
 
     // 禁用剖析测试
@@ -134,7 +135,7 @@ pub fn main() !void {
         var profiler = try Profiler.init(allocator, .{ .enable = false });
         defer profiler.deinit();
 
-        const disabled_start = std.time.nanoTimestamp();
+        const disabled_start = compat.nanoTimestamp();
         for (0..100000) |_| {
             const zone = profiler.beginZone("test");
             defer profiler.endZone(zone);
@@ -144,7 +145,7 @@ pub fn main() !void {
                 hash = hash *% 31 +% byte;
             }
         }
-        const disabled_end = std.time.nanoTimestamp();
+        const disabled_end = compat.nanoTimestamp();
         const disabled_duration = @as(u64, @intCast(disabled_end - disabled_start));
 
         const overhead = if (baseline_duration > 0)
@@ -166,7 +167,7 @@ pub fn main() !void {
         });
         defer profiler.deinit();
 
-        const sampled_start = std.time.nanoTimestamp();
+        const sampled_start = compat.nanoTimestamp();
         for (0..100000) |_| {
             const zone = profiler.beginZone("test");
             defer profiler.endZone(zone);
@@ -176,7 +177,7 @@ pub fn main() !void {
                 hash = hash *% 31 +% byte;
             }
         }
-        const sampled_end = std.time.nanoTimestamp();
+        const sampled_end = compat.nanoTimestamp();
         const sampled_duration = @as(u64, @intCast(sampled_end - sampled_start));
 
         const overhead = if (baseline_duration > 0)

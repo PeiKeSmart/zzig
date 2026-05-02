@@ -14,9 +14,10 @@
 
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -65,7 +66,7 @@ pub fn main() !void {
     }
 
     // 等待日志全部输出
-    std.Thread.sleep(100_000_000); // 100ms
+    compat.sleep(100_000_000); // 100ms
 
     // ========================================================================
     // 打印统计信息

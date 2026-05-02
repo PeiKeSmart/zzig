@@ -1,9 +1,10 @@
 const std = @import("std");
 const AsyncLogger = @import("zzig").AsyncLogger;
+const compat = @import("zzig").compat;
 
 /// 异步日志器基本使用示例
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -30,13 +31,13 @@ pub fn main() !void {
 
     // 4. 性能测试：快速写入
     std.debug.print("\n📝 测试 3: 高频日志写入 (10000 条)\n", .{});
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
     for (0..10000) |i| {
         logger.info("消息 #{d}: 系统运行正常", .{i});
     }
 
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
     const duration_ns = @as(u64, @intCast(end - start));
     const duration_us = duration_ns / std.time.ns_per_us;
     const qps = (10000 * std.time.ns_per_s) / duration_ns;
@@ -48,7 +49,7 @@ pub fn main() !void {
 
     // 5. 等待日志处理完成
     std.debug.print("\n⏳ 等待后台线程处理日志...\n", .{});
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     // 6. 查看统计信息
     std.debug.print("\n📊 统计信息:\n", .{});
@@ -67,7 +68,7 @@ pub fn main() !void {
     logger.err("这条 error 会显示", .{});
 
     // 等待最后的日志
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    compat.sleep(500 * std.time.ns_per_ms);
 
     std.debug.print("\n=== 示例完成 ===\n", .{});
     std.debug.print("\n💡 提示:\n", .{});

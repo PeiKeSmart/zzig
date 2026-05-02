@@ -1,5 +1,6 @@
 const std = @import("std");
 const Console = @import("zzig").Console;
+const compat = @import("zzig").compat;
 
 /// 测试 Console 并发初始化安全性
 pub fn main() !void {
@@ -36,5 +37,5 @@ fn workerThread() void {
     std.mem.doNotOptimizeAway(&dummy);
 
     // 模拟一些工作
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 }

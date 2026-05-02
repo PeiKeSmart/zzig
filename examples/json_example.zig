@@ -8,7 +8,7 @@ pub fn main() !void {
     std.debug.print("=== JSON 解析器基础示例 ===\n\n", .{});
 
     // 创建内存分配器
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

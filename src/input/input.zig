@@ -5,6 +5,7 @@
 /// macOS   : 同 Linux，使用 POSIX termios
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 
 /// 读取单个按键，不需要用户按 Enter 即可返回。
 /// 返回按下的字节值（u8）。
@@ -49,7 +50,7 @@ fn readKeyWindows() !u8 {
         ) callconv(winapi) w.BOOL;
     }.FlushConsoleInputBuffer;
 
-    const stdin = w.kernel32.GetStdHandle(w.STD_INPUT_HANDLE) orelse
+    const stdin = compat.windows.getStdHandle(compat.windows.STD_INPUT_HANDLE) orelse
         return error.InvalidHandle;
     if (stdin == w.INVALID_HANDLE_VALUE) return error.InvalidHandle;
 
@@ -65,7 +66,7 @@ fn readKeyWindows() !u8 {
     // 读取一个字节
     var ch: [1]u8 = undefined;
     var bytes_read: w.DWORD = 0;
-    if (w.kernel32.ReadFile(stdin, &ch, 1, &bytes_read, null) == 0 or bytes_read == 0) {
+    if (!compat.windows.readFile(stdin, ch[0..], &bytes_read).toBool() or bytes_read == 0) {
         return error.ReadFailed;
     }
 

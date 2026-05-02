@@ -1,8 +1,9 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -27,14 +28,14 @@ pub fn main() !void {
     std.debug.print("✓ 日志记录成功\n", .{});
 
     // 3. 性能测试
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
     const count = 10_000;
 
     for (0..count) |i| {
         logger.info("Performance test {d}", .{i});
     }
 
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
     const duration_ns = @as(u64, @intCast(end - start));
     const avg_latency_ns = duration_ns / count;
     const qps = (count * std.time.ns_per_s) / duration_ns;
@@ -45,7 +46,7 @@ pub fn main() !void {
 
     // 4. 等待处理
     std.debug.print("\n⏳ 等待后台处理...\n", .{});
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     // 5. 统计信息
     std.debug.print("\n📊 统计:\n", .{});

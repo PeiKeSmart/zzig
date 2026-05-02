@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 
 /// Windows API 声明
 const windows = std.os.windows;
@@ -7,7 +8,8 @@ extern "kernel32" fn SetConsoleOutputCP(wCodePageID: u32) callconv(@import("std"
 extern "kernel32" fn SetConsoleCP(wCodePageID: u32) callconv(@import("std").builtin.CallingConvention.winapi) windows.BOOL;
 
 /// 全局初始化状态（线程安全）
-var init_once = std.once(initImpl);
+var init_mutex: compat.Mutex = .{};
+var init_done = false;
 var global_init_result: InitResult = .{};
 
 /// 控制台功能标志
@@ -37,7 +39,7 @@ pub const InitResult = struct {
 /// - **Unix/Linux/macOS**: 通常默认支持，无需特殊处理
 ///
 /// # 线程安全
-/// - 多线程并发调用安全，使用 `std.once` 确保只初始化一次
+/// - 多线程并发调用安全，使用互斥保护确保只初始化一次
 ///
 /// # 示例
 /// ```zig
@@ -60,10 +62,19 @@ pub const InitResult = struct {
 /// # 返回
 /// - `InitResult`: 初始化结果，包含各功能的启用状态
 pub fn init(features: ConsoleFeatures) InitResult {
-    // 使用 std.once 确保线程安全的单次初始化
-    init_once.call();
+    ensureInit();
     _ = features; // 当前忽略参数，全局初始化使用默认配置
     return global_init_result;
+}
+
+fn ensureInit() void {
+    init_mutex.lock();
+    defer init_mutex.unlock();
+
+    if (init_done) return;
+
+    initImpl();
+    init_done = true;
 }
 
 /// 内部实现：实际的初始化逻辑（仅执行一次）
@@ -80,15 +91,15 @@ fn initImpl() void {
             const CP_UTF8 = 65001;
             const output_ok = SetConsoleOutputCP(CP_UTF8);
             const input_ok = SetConsoleCP(CP_UTF8);
-            result.utf8_enabled = (output_ok != 0 and input_ok != 0);
+            result.utf8_enabled = output_ok.toBool() and input_ok.toBool();
         }
 
         // 2. 启用虚拟终端处理（ANSI 转义序列）
         if (features.virtual_terminal or features.ansi_colors) {
-            const stdout_handle = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+            const stdout_handle = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
             if (stdout_handle != null and stdout_handle != w.INVALID_HANDLE_VALUE) {
                 var mode: w.DWORD = 0;
-                if (w.kernel32.GetConsoleMode(stdout_handle.?, &mode) != 0) {
+                if (compat.windows.getConsoleMode(stdout_handle.?, &mode).toBool()) {
                     // 保存原始模式（用于恢复）
                     result.original_mode = mode;
 
@@ -96,7 +107,7 @@ fn initImpl() void {
                     const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
                     const new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 
-                    if (w.kernel32.SetConsoleMode(stdout_handle.?, new_mode) != 0) {
+                    if (compat.windows.setConsoleMode(stdout_handle.?, new_mode).toBool()) {
                         result.ansi_enabled = true;
                     }
                 }
@@ -129,9 +140,9 @@ pub fn deinit(result: InitResult) void {
     if (builtin.os.tag == .windows) {
         if (result.original_mode) |original| {
             const w = std.os.windows;
-            const stdout_handle = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+            const stdout_handle = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
             if (stdout_handle != null and stdout_handle != w.INVALID_HANDLE_VALUE) {
-                _ = w.kernel32.SetConsoleMode(stdout_handle.?, original);
+                _ = compat.windows.setConsoleMode(stdout_handle.?, original);
             }
         }
     }
@@ -165,10 +176,10 @@ pub fn supportsAnsiColors() bool {
     if (builtin.os.tag == .windows) {
         // Windows 需要检查虚拟终端是否启用
         const w = std.os.windows;
-        const stdout_handle = w.kernel32.GetStdHandle(w.STD_OUTPUT_HANDLE);
+        const stdout_handle = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
         if (stdout_handle != null and stdout_handle != w.INVALID_HANDLE_VALUE) {
             var mode: w.DWORD = 0;
-            if (w.kernel32.GetConsoleMode(stdout_handle.?, &mode) != 0) {
+            if (compat.windows.getConsoleMode(stdout_handle.?, &mode).toBool()) {
                 const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
                 return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
             }

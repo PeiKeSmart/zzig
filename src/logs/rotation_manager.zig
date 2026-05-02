@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
+const fs = compat.fs;
 
 // ===== ARMv6 兼容性: 平台原子操作能力检测 =====
 // ARMv6 及部分嵌入式平台不支持 64 位原子操作,需使用 Mutex 代替
@@ -140,11 +142,11 @@ pub const RotationManager = struct {
     current_file_size: std.atomic.Value(usize),
     // ARMv6 兼容性: ARMv6 不支持 64 位原子操作,使用 Mutex 保护
     last_rotation_time: if (supportsAtomicI64()) std.atomic.Value(i64) else i64,
-    last_rotation_time_mutex: if (!supportsAtomicI64()) std.Thread.Mutex else void,
+    last_rotation_time_mutex: if (!supportsAtomicI64()) compat.Mutex else void,
     rotation_count: std.atomic.Value(usize),
 
     // 互斥锁
-    rotation_mutex: std.Thread.Mutex,
+    rotation_mutex: compat.Mutex,
     is_rotating: std.atomic.Value(bool),
 
     // 压缩任务队列（后台线程）
@@ -155,7 +157,7 @@ pub const RotationManager = struct {
     pub fn init(allocator: std.mem.Allocator, config: AdvancedRotationConfig) !RotationManager {
         var compression_queue: ?std.ArrayList([]const u8) = null;
         if (config.enable_compression) {
-            compression_queue = .{}; // ✅ Zig 0.15.2 空字面量
+            compression_queue = std.ArrayList([]const u8).empty;
         }
 
         var manager: RotationManager = .{
@@ -163,7 +165,7 @@ pub const RotationManager = struct {
             .config = config,
             .current_file_size = std.atomic.Value(usize).init(0),
             .last_rotation_time = undefined,
-            .last_rotation_time_mutex = if (comptime !supportsAtomicI64()) std.Thread.Mutex{} else undefined,
+            .last_rotation_time_mutex = if (comptime !supportsAtomicI64()) compat.Mutex{} else undefined,
             .rotation_count = std.atomic.Value(usize).init(0),
             .rotation_mutex = .{},
             .is_rotating = std.atomic.Value(bool).init(false),
@@ -174,9 +176,9 @@ pub const RotationManager = struct {
 
         // 根据平台初始化 last_rotation_time
         if (comptime supportsAtomicI64()) {
-            manager.last_rotation_time = std.atomic.Value(i64).init(std.time.timestamp());
+            manager.last_rotation_time = std.atomic.Value(i64).init(compat.timestamp());
         } else {
-            manager.last_rotation_time = std.time.timestamp();
+            manager.last_rotation_time = compat.timestamp();
         }
 
         return manager;
@@ -251,7 +253,7 @@ pub const RotationManager = struct {
 
     /// 按时间判断是否轮转
     fn shouldRotateByTime(self: *const RotationManager) bool {
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
         const last_rotation = self.getLastRotationTime();
 
         switch (self.config.time_interval) {
@@ -302,7 +304,7 @@ pub const RotationManager = struct {
 
         // 更新状态
         self.current_file_size.store(0, .release);
-        self.setLastRotationTime(std.time.timestamp());
+        self.setLastRotationTime(compat.timestamp());
         _ = self.rotation_count.fetchAdd(1, .monotonic);
 
         // 添加到压缩队列（异步）
@@ -325,7 +327,7 @@ pub const RotationManager = struct {
     fn generateBackupName(self: *RotationManager, base_path: []const u8) ![]const u8 {
         switch (self.config.naming_style) {
             .timestamp => {
-                const now = std.time.timestamp();
+                const now = compat.timestamp();
                 const date = timestampToDate(now);
 
                 // app.log → app.2025-01-02.log
@@ -347,11 +349,11 @@ pub const RotationManager = struct {
         const dir_path = std.fs.path.dirname(self.config.log_file_path) orelse ".";
         const file_name = std.fs.path.basename(self.config.log_file_path);
 
-        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        var dir = try fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
         // 收集所有日志文件
-        var files: std.ArrayList(FileInfo) = .{}; // ✅ 空字面量
+        var files: std.ArrayList(FileInfo) = std.ArrayList(FileInfo).empty;
         defer files.deinit(self.allocator); // ✅ 传入 allocator
 
         var iter = dir.iterate();
@@ -384,7 +386,7 @@ pub const RotationManager = struct {
 
         // 删除超出限制的文件
         var total_size: usize = 0;
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
 
         for (files.items, 0..) |file, i| {
             var should_delete = false;
@@ -427,7 +429,7 @@ pub const RotationManager = struct {
     /// 压缩工作线程
     fn compressionWorker(self: *RotationManager) void {
         while (!self.should_stop_compression.load(.acquire)) {
-            std.Thread.sleep(std.time.ns_per_s); // 每秒检查一次
+            compat.sleep(std.time.ns_per_s); // 每秒检查一次
 
             if (self.compression_queue) |*queue| {
                 if (queue.items.len == 0) continue;
@@ -437,7 +439,7 @@ pub const RotationManager = struct {
                 defer self.allocator.free(file_path);
 
                 // 等待延迟（避免立即压缩）
-                std.Thread.sleep(self.config.compression_delay_secs * std.time.ns_per_s);
+                compat.sleep(self.config.compression_delay_secs * std.time.ns_per_s);
 
                 // 执行压缩（简化实现，实际生产需要真实的 gzip）
                 self.compressFile(file_path) catch |err| {

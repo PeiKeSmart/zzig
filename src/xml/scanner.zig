@@ -630,7 +630,7 @@ test "scanner - cdata and comment" {
 }
 
 test "decodeText" {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = std.ArrayList(u8).empty;
     defer buf.deinit(std.testing.allocator);
     try decodeText("hello &amp; &lt;world&gt;", buf.writer(std.testing.allocator));
     try std.testing.expectEqualStrings("hello & <world>", buf.items);

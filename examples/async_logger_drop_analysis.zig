@@ -1,9 +1,10 @@
 const std = @import("std");
 const zzig = @import("zzig");
+const compat = zzig.compat;
 
 /// 演示如何避免日志丢弃
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -23,18 +24,18 @@ pub fn main() !void {
     defer logger1.deinit();
 
     // 快速发送 10000 条
-    const start1 = std.time.nanoTimestamp();
+    const start1 = compat.nanoTimestamp();
     for (0..10_000) |i| {
         logger1.info("消息 {d}", .{i});
     }
-    const end1 = std.time.nanoTimestamp();
+    const end1 = compat.nanoTimestamp();
     const send_time_ms = @as(f64, @floatFromInt(@as(u64, @intCast(end1 - start1)))) / 1_000_000.0;
 
     std.debug.print("  发送耗时: {d:.2} ms\n", .{send_time_ms});
     std.debug.print("  发送速度: {d:.0} 条/秒\n", .{10_000.0 / (send_time_ms / 1000.0)});
 
     // 等待处理
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     std.debug.print("  已处理: {d}\n", .{logger1.getProcessedCount()});
     std.debug.print("  已丢弃: {d} ❌\n", .{logger1.getDroppedCount()});
@@ -60,7 +61,7 @@ pub fn main() !void {
         logger2.info("消息 {d}", .{i});
     }
 
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     std.debug.print("  队列容量: 16384\n", .{});
     std.debug.print("  已处理: {d}\n", .{logger2.getProcessedCount()});
@@ -88,10 +89,10 @@ pub fn main() !void {
         for (0..batch_size) |i| {
             logger3.info("批次{d} 消息{d}", .{ batch, i });
         }
-        std.Thread.sleep(batch_interval_ms * std.time.ns_per_ms);
+        compat.sleep(batch_interval_ms * std.time.ns_per_ms);
     }
 
-    std.Thread.sleep(1 * std.time.ns_per_s);
+    compat.sleep(1 * std.time.ns_per_s);
 
     std.debug.print("  已处理: {d}\n", .{logger3.getProcessedCount()});
     std.debug.print("  已丢弃: {d} ✅\n", .{logger3.getDroppedCount()});
@@ -140,7 +141,7 @@ pub fn main() !void {
         }
     }
 
-    std.Thread.sleep(2 * std.time.ns_per_s);
+    compat.sleep(2 * std.time.ns_per_s);
 
     std.debug.print("  已处理: {d}\n", .{logger4.getProcessedCount()});
     std.debug.print("  已丢弃: {d}\n", .{logger4.getDroppedCount()});

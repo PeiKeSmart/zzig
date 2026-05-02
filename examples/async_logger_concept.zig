@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../src/compat.zig");
 
 /// 异步日志设计方案（概念验证）
 ///
@@ -148,7 +149,7 @@ pub const AsyncLogger = struct {
         // 在调用线程格式化消息（避免跨线程内存问题）
         var msg: LogMessage = undefined;
         msg.level = level;
-        msg.timestamp = std.time.nanoTimestamp();
+        msg.timestamp = compat.nanoTimestamp();
 
         // 格式化到固定缓冲区
         const formatted = std.fmt.bufPrint(&msg.message, fmt, args) catch {
@@ -185,7 +186,7 @@ pub const Level = enum {
 // ============================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -197,14 +198,14 @@ pub fn main() !void {
 
     // 测试 1: 单线程高速写入
     std.debug.print("测试 1: 写入 10000 条日志...\n", .{});
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
     var i: usize = 0;
     while (i < 10000) : (i += 1) {
         logger.log(.info, "测试消息 {d}\n", .{i});
     }
 
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
     const duration_us = @divTrunc(end - start, std.time.ns_per_us);
     const avg_ns = @divTrunc(end - start, 10000);
 

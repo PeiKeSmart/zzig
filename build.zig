@@ -19,12 +19,13 @@ comptime {
 
 pub fn build(b: *std.Build) void {
     switch (current_zig.minor) {
-        15 => version_15.build(b),
+        15 => versions.build(b),
+        16 => versions.build(b),
         else => @compileError("unknown version!"),
     }
 }
 
-const version_15 = struct {
+const versions = struct {
     const Build = std.Build;
     const Module = Build.Module;
     const OptimizeMode = std.builtin.OptimizeMode;
@@ -32,6 +33,7 @@ const version_15 = struct {
     pub fn build(b: *std.Build) void {
         const target = b.standardTargetOptions(.{});
         const optimize = b.standardOptimizeOption(.{});
+        const build_examples = b.option(bool, "examples", "Build example executables and demo binaries") orelse (current_zig.minor <= 15);
 
         const zzig = b.addModule("zzig", .{
             .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
@@ -51,7 +53,7 @@ const version_15 = struct {
             .name = "async_logger_demo",
             .root_module = async_demo_module,
         });
-        b.installArtifact(async_demo);
+        if (build_examples) b.installArtifact(async_demo);
 
         const run_async_demo = b.addRunArtifact(async_demo);
 
@@ -70,7 +72,7 @@ const version_15 = struct {
             .name = "async_logger_config_demo",
             .root_module = config_demo_module,
         });
-        b.installArtifact(config_demo);
+        if (build_examples) b.installArtifact(config_demo);
 
         const run_config_demo = b.addRunArtifact(config_demo);
 
@@ -89,7 +91,7 @@ const version_15 = struct {
             .name = "async_logger_file_output_demo",
             .root_module = file_output_demo_module,
         });
-        b.installArtifact(file_output_demo);
+        if (build_examples) b.installArtifact(file_output_demo);
 
         const run_file_output_demo = b.addRunArtifact(file_output_demo);
 
@@ -108,7 +110,7 @@ const version_15 = struct {
             .name = "async_logger_rotation_test",
             .root_module = rotation_test_module,
         });
-        b.installArtifact(rotation_test);
+        if (build_examples) b.installArtifact(rotation_test);
 
         const run_rotation_test = b.addRunArtifact(rotation_test);
 
@@ -127,7 +129,7 @@ const version_15 = struct {
             .name = "async_logger_both_test",
             .root_module = both_test_module,
         });
-        b.installArtifact(both_test);
+        if (build_examples) b.installArtifact(both_test);
 
         const run_both_test = b.addRunArtifact(both_test);
 
@@ -146,7 +148,7 @@ const version_15 = struct {
             .name = "async_logger_zero_alloc_demo",
             .root_module = zero_alloc_demo_module,
         });
-        b.installArtifact(zero_alloc_demo);
+        if (build_examples) b.installArtifact(zero_alloc_demo);
 
         const run_zero_alloc_demo = b.addRunArtifact(zero_alloc_demo);
 
@@ -165,7 +167,7 @@ const version_15 = struct {
             .name = "console_example",
             .root_module = console_demo_module,
         });
-        b.installArtifact(console_demo);
+        if (build_examples) b.installArtifact(console_demo);
 
         const run_console_demo = b.addRunArtifact(console_demo);
 
@@ -184,7 +186,7 @@ const version_15 = struct {
             .name = "console_concurrent_test",
             .root_module = console_concurrent_module,
         });
-        b.installArtifact(console_concurrent_test_exe);
+        if (build_examples) b.installArtifact(console_concurrent_test_exe);
 
         const run_console_concurrent_test = b.addRunArtifact(console_concurrent_test_exe);
 
@@ -203,7 +205,7 @@ const version_15 = struct {
             .name = "menu_demo",
             .root_module = menu_demo_module,
         });
-        b.installArtifact(menu_demo_exe);
+        if (build_examples) b.installArtifact(menu_demo_exe);
 
         const run_menu_demo = b.addRunArtifact(menu_demo_exe);
 
@@ -222,7 +224,7 @@ const version_15 = struct {
             .name = "menu_dynamic_example",
             .root_module = menu_dynamic_module,
         });
-        b.installArtifact(menu_dynamic_exe);
+        if (build_examples) b.installArtifact(menu_dynamic_exe);
 
         const run_menu_dynamic = b.addRunArtifact(menu_dynamic_exe);
 
@@ -241,7 +243,7 @@ const version_15 = struct {
             .name = "feature_extension_demo",
             .root_module = feature_demo_module,
         });
-        b.installArtifact(feature_demo_exe);
+        if (build_examples) b.installArtifact(feature_demo_exe);
 
         const run_feature_demo = b.addRunArtifact(feature_demo_exe);
 
@@ -260,7 +262,7 @@ const version_15 = struct {
             .name = "profiler_demo",
             .root_module = profiler_demo_module,
         });
-        b.installArtifact(profiler_demo_exe);
+        if (build_examples) b.installArtifact(profiler_demo_exe);
 
         const run_profiler_demo = b.addRunArtifact(profiler_demo_exe);
 
@@ -279,7 +281,7 @@ const version_15 = struct {
             .name = "advanced_features_demo",
             .root_module = advanced_demo_module,
         });
-        b.installArtifact(advanced_demo_exe);
+        if (build_examples) b.installArtifact(advanced_demo_exe);
 
         const run_advanced_demo = b.addRunArtifact(advanced_demo_exe);
 
@@ -298,7 +300,7 @@ const version_15 = struct {
             .name = "json_example",
             .root_module = json_demo_module,
         });
-        b.installArtifact(json_demo_exe);
+        if (build_examples) b.installArtifact(json_demo_exe);
 
         const run_json_demo = b.addRunArtifact(json_demo_exe);
 
@@ -317,7 +319,7 @@ const version_15 = struct {
             .name = "json_advanced_example",
             .root_module = json_advanced_module,
         });
-        b.installArtifact(json_advanced_exe);
+        if (build_examples) b.installArtifact(json_advanced_exe);
 
         const run_json_advanced = b.addRunArtifact(json_advanced_exe);
 
@@ -336,7 +338,7 @@ const version_15 = struct {
             .name = "json_benchmark",
             .root_module = json_benchmark_module,
         });
-        b.installArtifact(json_benchmark_exe);
+        if (build_examples) b.installArtifact(json_benchmark_exe);
 
         const run_json_benchmark = b.addRunArtifact(json_benchmark_exe);
 
@@ -355,7 +357,7 @@ const version_15 = struct {
             .name = "json_large_test",
             .root_module = json_large_module,
         });
-        b.installArtifact(json_large_exe);
+        if (build_examples) b.installArtifact(json_large_exe);
 
         const run_json_large = b.addRunArtifact(json_large_exe);
 
@@ -374,7 +376,7 @@ const version_15 = struct {
             .name = "xml_example",
             .root_module = xml_example_module,
         });
-        b.installArtifact(xml_example_exe);
+        if (build_examples) b.installArtifact(xml_example_exe);
 
         const run_xml_example = b.addRunArtifact(xml_example_exe);
 
