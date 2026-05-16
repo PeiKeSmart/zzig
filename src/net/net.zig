@@ -208,6 +208,44 @@ fn parseLinuxInterfaceName(line: []const u8) ?[]const u8 {
     return name;
 }
 
+fn appendInterface(allocator: std.mem.Allocator, interfaces: *std.ArrayList(NetworkInterface), name: []const u8, description: []const u8, ip: u32, prefix_len: u8) !void {
+    const ip_octets = [4]u8{
+        @intCast((ip >> 24) & 0xFF),
+        @intCast((ip >> 16) & 0xFF),
+        @intCast((ip >> 8) & 0xFF),
+        @intCast(ip & 0xFF),
+    };
+
+    if (ip_octets[0] == 127 or (ip_octets[0] == 169 and ip_octets[1] == 254)) return;
+    if (prefix_len > 32) return;
+
+    const host_bits: u5 = @intCast(32 - prefix_len);
+    const mask: u32 = if (prefix_len == 0) 0 else ~@as(u32, 0) << host_bits;
+    const network_ip = ip & mask;
+
+    const network_octets = [4]u8{
+        @intCast((network_ip >> 24) & 0xFF),
+        @intCast((network_ip >> 16) & 0xFF),
+        @intCast((network_ip >> 8) & 0xFF),
+        @intCast(network_ip & 0xFF),
+    };
+
+    var cidr_buf: [20]u8 = undefined;
+    const cidr = try std.fmt.bufPrint(&cidr_buf, "{d}.{d}.{d}.{d}/{d}", .{ network_octets[0], network_octets[1], network_octets[2], network_octets[3], prefix_len });
+
+    const resolved_description = if (description.len > 0) description else name;
+    const is_virtual = isVirtualAdapter(resolved_description);
+
+    try interfaces.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .description = try allocator.dupe(u8, resolved_description),
+        .ip = ip,
+        .cidr = try allocator.dupe(u8, cidr),
+        .prefix_len = prefix_len,
+        .is_virtual = is_virtual,
+    });
+}
+
 /// 使用 ARP 检测主机并获取 MAC 地址
 pub fn arpScan(ip: u32, mac_out: *[6]u8) bool {
     const builtin = @import("builtin");
@@ -238,6 +276,41 @@ pub fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
     const builtin = @import("builtin");
 
     if (builtin.os.tag == .windows) {
+        const ps_result = compat.process.run(allocator, .{
+            .argv = &[_][]const u8{
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | ForEach-Object { foreach ($ipv4 in $_.IPv4Address) { \"{0}`t{1}`t{2}`t{3}\" -f $_.InterfaceAlias, $_.InterfaceDescription, $ipv4.IPAddress, $ipv4.PrefixLength } }",
+            },
+        }) catch null;
+
+        if (ps_result) |result| {
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+
+            var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \r\n\t");
+                if (trimmed.len == 0) continue;
+
+                var parts = std.mem.splitScalar(u8, trimmed, '\t');
+                const alias = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+                const description = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+                const ip_text = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+                const prefix_text = std.mem.trim(u8, parts.next() orelse continue, " \r\n\t");
+
+                const ip = parseIpv4Text(ip_text) orelse continue;
+                const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch continue;
+                const name = if (alias.len > 0) alias else description;
+                if (name.len == 0) continue;
+
+                try appendInterface(allocator, &interfaces, name, description, ip, prefix_len);
+            }
+
+            if (interfaces.items.len > 0) return try interfaces.toOwnedSlice(allocator);
+        }
+
         // Windows: 使用 ipconfig /all 命令解析（获取描述信息）
         const result = try compat.process.run(allocator, .{
             .argv = &[_][]const u8{ "cmd", "/c", "chcp 65001 >nul && ipconfig /all" },
