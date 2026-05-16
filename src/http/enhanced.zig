@@ -24,13 +24,6 @@ pub const RetryConfig = struct {
     poll_interval_ms: u64 = 100,    // 轮询间隔（毫秒）
 };
 
-/// HTTP POST 表单字段结构
-pub const FormField = struct {
-    key: []const u8,
-    v1: []const u8,  // 主要值
-    v2: []const u8 = "",  // 次要值（如 token_id,token）
-};
-
 /// 带重试的 HTTP POST 表单请求
 /// 适用于需要高可靠性的 API 调用
 pub fn httpPostFormWithRetry(
@@ -109,64 +102,9 @@ fn shouldRetryHttpPost(err: anyerror, attempt: u32, max_attempts: u32) bool {
     };
 }
 
-/// 构造 application/x-www-form-urlencoded 表单体
-/// 支持特殊的 login_token 格式（token_id,token）
-pub fn buildFormEncoded(
-    allocator: std.mem.Allocator,
-    fields: []const FormField,
-) ![]u8 {
-    var parts: std.ArrayList([]const u8) = .empty;
-    defer parts.deinit(allocator);
-
-    for (fields) |f| {
-        if (std.mem.eql(u8, f.key, "login_token")) {
-            // 特殊处理 login_token 格式
-            const key = try zhttp.percentEncodeFormComponent(allocator, f.key);
-            defer allocator.free(key);
-
-            const token_id = try zhttp.percentEncodeFormComponent(allocator, f.v1);
-            defer allocator.free(token_id);
-
-            const token = try zhttp.percentEncodeFormComponent(allocator, f.v2);
-            defer allocator.free(token);
-
-            const kv = try std.fmt.allocPrint(allocator, "{s}={s},{s}", .{ key, token_id, token });
-            try parts.append(allocator, kv);
-        } else if (f.v1.len != 0) {
-            // 普通字段
-            const key = try zhttp.percentEncodeFormComponent(allocator, f.key);
-            defer allocator.free(key);
-
-            const value = try zhttp.percentEncodeFormComponent(allocator, f.v1);
-            defer allocator.free(value);
-
-            const kv = try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
-            try parts.append(allocator, kv);
-        }
-    }
-
-    const joined = try std.mem.join(allocator, "&", parts.items);
-    for (parts.items) |part| allocator.free(part);
-    return joined;
-}
-
 // ============================================================================
 // 测试用例
 // ============================================================================
-
-test "buildFormEncoded preserves raw comma in login_token" {
-    const allocator = std.testing.allocator;
-
-    const fields = [_]FormField{
-        .{ .key = "login_token", .v1 = "123456", .v2 = "abcdef" },
-        .{ .key = "format", .v1 = "json", .v2 = "" },
-    };
-
-    const body = try buildFormEncoded(allocator, &fields);
-    defer allocator.free(body);
-
-    try std.testing.expectEqualStrings("login_token=123456,abcdef&format=json", body);
-}
 
 test "shouldRetryHttpPost: retry logic" {
     // 应该重试的错误
