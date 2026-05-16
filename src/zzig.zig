@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// 字符串处理
 pub const Strings = @import("string/strings.zig");
 
