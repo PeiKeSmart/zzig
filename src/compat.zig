@@ -230,10 +230,58 @@ pub const process = struct {
     }
 };
 
+const ConnectResult = struct {
+    stream: ?std.Io.net.Stream = null,
+    err: ?anyerror = null,
+    completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 pub const net = struct {
     pub fn connectTcp(ip_text: []const u8, port: u16) !std.Io.net.Stream {
         const address = try std.Io.net.IpAddress.parse(ip_text, port);
         return std.Io.net.IpAddress.connect(&address, currentIo(), .{ .mode = .stream, .protocol = .tcp });
+    }
+
+    pub fn connectTcpWithTimeout(ip_text: []const u8, port: u16, timeout_ms: u32, poll_interval_ms: u64) !std.Io.net.Stream {
+        if (timeout_ms == 0) return connectTcp(ip_text, port);
+
+        const io = currentIo();
+        var result = ConnectResult{};
+        var future = io.concurrent(connectTcpWorker, .{ ip_text, port, &result }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return connectTcp(ip_text, port),
+        };
+
+        const timeout_ns: i128 = @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+        const start_time = nanoTimestamp();
+
+        while (true) {
+            if (result.completed.load(.acquire)) {
+                _ = future.await(io);
+
+                if (result.err) |err| return err;
+                if (result.stream) |stream| return stream;
+                return error.UnknownError;
+            }
+
+            if (nanoTimestamp() - start_time >= timeout_ns) {
+                _ = future.cancel(io);
+                if (result.stream) |stream| stream.close(io);
+                return error.RequestTimeout;
+            }
+
+            sleep(poll_interval_ms * std.time.ns_per_ms);
+        }
+    }
+
+    fn connectTcpWorker(ip_text: []const u8, port: u16, result: *ConnectResult) void {
+        defer result.completed.store(true, .release);
+
+        const stream = connectTcp(ip_text, port) catch |err| {
+            result.err = err;
+            return;
+        };
+
+        result.stream = stream;
     }
 };
 

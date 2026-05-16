@@ -53,6 +53,39 @@ pub const HostInfo = struct {
     hostname: ?[]const u8, // 可选的主机名
 };
 
+pub const ArpScanProgress = struct {
+    completed: usize,
+    total: usize,
+    found: usize,
+    elapsed_ms: i64,
+};
+
+pub const ArpScanProgressCallback = *const fn (ctx: ?*anyopaque, progress: ArpScanProgress) void;
+
+pub const TcpPortScanProgress = struct {
+    completed: usize,
+    total: usize,
+    found: usize,
+    elapsed_ms: i64,
+};
+
+pub const TcpPortScanProgressCallback = *const fn (ctx: ?*anyopaque, progress: TcpPortScanProgress) void;
+
+pub const ArpScanConfig = struct {
+    thread_count: usize = 64,
+    local_ip: ?u32 = null,
+    progress_interval_ms: u64 = 0,
+    progress_callback: ?ArpScanProgressCallback = null,
+    progress_ctx: ?*anyopaque = null,
+};
+
+pub const TcpPortScanConfig = struct {
+    timeout_ms: u32 = 200,
+    progress_interval_hosts: usize = 10,
+    progress_callback: ?TcpPortScanProgressCallback = null,
+    progress_ctx: ?*anyopaque = null,
+};
+
 /// 计算子网掩码中 1 的位数
 pub fn countMaskBits(mask: u32) u8 {
     var count: u8 = 0;
@@ -266,6 +299,185 @@ pub fn arpScan(ip: u32, mac_out: *[6]u8) bool {
         // TODO: 实现 raw socket ARP 扫描
         return false;
     }
+}
+
+const ArpScanTask = struct {
+    allocator: std.mem.Allocator,
+    scan_list: []const u32,
+    start_idx: usize,
+    end_idx: usize,
+    found_hosts: *std.ArrayList(HostInfo),
+    mutex: *compat.Mutex,
+    progress_counter: *usize,
+};
+
+fn arpWorker(task: *ArpScanTask) void {
+    var local_hosts: std.ArrayList(HostInfo) = .empty;
+    defer local_hosts.deinit(task.allocator);
+
+    var local_progress: usize = 0;
+    const batch_size: usize = 2;
+
+    for (task.start_idx..task.end_idx) |idx| {
+        const ip = task.scan_list[idx];
+        local_progress += 1;
+
+        var mac: [6]u8 = undefined;
+        if (arpScan(ip, &mac)) {
+            local_hosts.append(task.allocator, .{
+                .ip = ip,
+                .mac = mac,
+                .hostname = null,
+            }) catch {};
+        }
+
+        if (local_progress >= batch_size or idx == task.end_idx - 1) {
+            task.mutex.lock();
+            defer task.mutex.unlock();
+
+            task.progress_counter.* += local_progress;
+            local_progress = 0;
+
+            for (local_hosts.items) |host| {
+                task.found_hosts.append(task.allocator, host) catch {};
+            }
+            local_hosts.clearRetainingCapacity();
+        }
+    }
+}
+
+fn buildArpScanOrder(allocator: std.mem.Allocator, base_ip: u32, host_count: u32, local_ip: ?u32) ![]u32 {
+    var scan_order = try allocator.alloc(u32, host_count);
+    errdefer allocator.free(scan_order);
+
+    if (host_count == 0) return scan_order;
+
+    if (local_ip) |my_ip| {
+        const my_offset = my_ip - base_ip - 1;
+        var idx: usize = 0;
+
+        if (my_offset < host_count) {
+            scan_order[idx] = base_ip + my_offset + 1;
+            idx += 1;
+        }
+
+        var radius: u32 = 1;
+        while (radius <= host_count and idx < host_count) : (radius += 1) {
+            if (my_offset >= radius) {
+                const offset = my_offset - radius;
+                if (offset < host_count and offset != my_offset) {
+                    scan_order[idx] = base_ip + offset + 1;
+                    idx += 1;
+                }
+            }
+
+            if (my_offset + radius < host_count and idx < host_count) {
+                const offset = my_offset + radius;
+                if (offset != my_offset) {
+                    scan_order[idx] = base_ip + offset + 1;
+                    idx += 1;
+                }
+            }
+        }
+
+        for (0..host_count) |i| {
+            const ip = base_ip + @as(u32, @intCast(i)) + 1;
+            var already_added = false;
+            for (scan_order[0..idx]) |added_ip| {
+                if (added_ip == ip) {
+                    already_added = true;
+                    break;
+                }
+            }
+
+            if (!already_added and idx < host_count) {
+                scan_order[idx] = ip;
+                idx += 1;
+            }
+        }
+    } else {
+        for (0..host_count) |i| {
+            scan_order[i] = base_ip + @as(u32, @intCast(i)) + 1;
+        }
+    }
+
+    return scan_order;
+}
+
+pub fn discoverHostsByArpConcurrent(
+    allocator: std.mem.Allocator,
+    base_ip: u32,
+    host_count: u32,
+    config: ArpScanConfig,
+) !std.ArrayList(HostInfo) {
+    var found_hosts: std.ArrayList(HostInfo) = .empty;
+    if (host_count == 0) return found_hosts;
+
+    var mutex = compat.Mutex{};
+    var progress_counter: usize = 0;
+
+    const scan_order = try buildArpScanOrder(allocator, base_ip, host_count, config.local_ip);
+    defer allocator.free(scan_order);
+
+    const effective_thread_count = @max(@as(usize, 1), @min(config.thread_count, host_count));
+    const ips_per_thread = (host_count + effective_thread_count - 1) / effective_thread_count;
+
+    var threads = try allocator.alloc(std.Thread, effective_thread_count);
+    defer allocator.free(threads);
+
+    var tasks = try allocator.alloc(ArpScanTask, effective_thread_count);
+    defer allocator.free(tasks);
+
+    for (0..effective_thread_count) |i| {
+        const start_idx = i * ips_per_thread;
+        const end_idx = @min(start_idx + ips_per_thread, host_count);
+
+        tasks[i] = .{
+            .allocator = allocator,
+            .scan_list = scan_order,
+            .start_idx = start_idx,
+            .end_idx = end_idx,
+            .found_hosts = &found_hosts,
+            .mutex = &mutex,
+            .progress_counter = &progress_counter,
+        };
+
+        if (start_idx < end_idx) {
+            threads[i] = try std.Thread.spawn(.{}, arpWorker, .{&tasks[i]});
+        }
+    }
+
+    const start_time = compat.milliTimestamp();
+    if (config.progress_interval_ms > 0 and config.progress_callback != null) {
+        while (true) {
+            compat.sleep(config.progress_interval_ms * std.time.ns_per_ms);
+
+            mutex.lock();
+            const current_progress = progress_counter;
+            const current_found = found_hosts.items.len;
+            const is_complete = current_progress >= host_count;
+            mutex.unlock();
+
+            config.progress_callback.?(config.progress_ctx, .{
+                .completed = current_progress,
+                .total = host_count,
+                .found = current_found,
+                .elapsed_ms = compat.milliTimestamp() - start_time,
+            });
+
+            if (is_complete) break;
+        }
+    }
+
+    for (0..effective_thread_count) |i| {
+        const start_idx = i * ips_per_thread;
+        const end_idx = @min(start_idx + ips_per_thread, host_count);
+        if (start_idx < end_idx) {
+            threads[i].join();
+        }
+    }
+
+    return found_hosts;
 }
 
 /// 获取本机所有网卡信息
@@ -668,14 +880,53 @@ pub fn getInterfacePriority(iface: NetworkInterface) u8 {
 
 /// 测试 TCP 端口连通性
 pub fn testTcpPort(allocator: std.mem.Allocator, ip_str: []const u8, port: u16, timeout_ms: u32) bool {
-    _ = timeout_ms;
     _ = allocator;
 
-    // 尝试连接
-    const stream = compat.net.connectTcp(ip_str, port) catch return false;
+    const poll_interval_ms: u64 = if (timeout_ms > 0 and timeout_ms < 50) timeout_ms else 50;
+    const stream = compat.net.connectTcpWithTimeout(ip_str, port, timeout_ms, poll_interval_ms) catch return false;
     defer stream.close(compat.currentIo());
 
     return true;
+}
+
+pub fn scanOpenTcpHostsInRange(
+    allocator: std.mem.Allocator,
+    base_ip: u32,
+    host_count: u32,
+    port: u16,
+    config: TcpPortScanConfig,
+) !std.ArrayList(u32) {
+    var found_ips: std.ArrayList(u32) = .empty;
+    if (host_count == 0) return found_ips;
+
+    const start_time = compat.milliTimestamp();
+    const progress_interval_hosts = @max(@as(usize, 1), config.progress_interval_hosts);
+    var ip = base_ip + 1;
+    const end_ip = base_ip + host_count + 1;
+    var completed: usize = 0;
+
+    while (ip < end_ip) : (ip += 1) {
+        var ip_buf: [16]u8 = undefined;
+        const ip_str = try ipToString(ip, &ip_buf);
+        completed += 1;
+
+        if (testTcpPort(allocator, ip_str, port, config.timeout_ms)) {
+            try found_ips.append(allocator, ip);
+        }
+
+        if (config.progress_callback) |callback| {
+            if (completed % progress_interval_hosts == 0 or completed == host_count) {
+                callback(config.progress_ctx, .{
+                    .completed = completed,
+                    .total = host_count,
+                    .found = found_ips.items.len,
+                    .elapsed_ms = compat.milliTimestamp() - start_time,
+                });
+            }
+        }
+    }
+
+    return found_ips;
 }
 
 // ============================================================================
@@ -739,4 +990,22 @@ test "parseLinuxInterfaceName" {
     try std.testing.expectEqualStrings("eth0", parseLinuxInterfaceName("2: eth0: <BROADCAST,MULTICAST>").?);
     try std.testing.expectEqualStrings("wlp2s0", parseLinuxInterfaceName("3: wlp2s0: <BROADCAST,MULTICAST>").?);
     try std.testing.expect(parseLinuxInterfaceName("    inet 192.168.1.10/24") == null);
+}
+
+test "buildArpScanOrder prefers local ip" {
+    const allocator = std.testing.allocator;
+    const order = try buildArpScanOrder(allocator, 0xC0A80100, 5, 0xC0A80103);
+    defer allocator.free(order);
+
+    try std.testing.expectEqual(@as(u32, 0xC0A80103), order[0]);
+    try std.testing.expectEqual(@as(u32, 0xC0A80102), order[1]);
+    try std.testing.expectEqual(@as(u32, 0xC0A80104), order[2]);
+}
+
+test "scanOpenTcpHostsInRange zero host count" {
+    const allocator = std.testing.allocator;
+    var found_ips = try scanOpenTcpHostsInRange(allocator, 0xC0A80100, 0, 80, .{});
+    defer found_ips.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), found_ips.items.len);
 }
