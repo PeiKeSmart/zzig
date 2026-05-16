@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 const is_zig_016_or_newer = builtin.zig_version.minor >= 16;
 
-fn currentIo() std.Io {
+pub fn currentIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
