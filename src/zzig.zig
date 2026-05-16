@@ -21,6 +21,12 @@ pub const File = @import("file/file.zig");
 /// HTTP、表单编码与压缩响应辅助
 pub const Http = @import("http/http.zig");
 
+/// HTTP 增强工具（重试机制、表单处理、网络错误处理）
+pub const HttpEnhanced = @import("http/enhanced.zig");
+
+/// 网络工具（CIDR 解析、IP 处理、接口检测）
+pub const Net = @import("net/net.zig");
+
 /// 控制台工具（UTF-8 编码、ANSI 颜色支持、跨平台兼容）
 pub const Console = @import("console/console.zig");
 
@@ -62,6 +68,7 @@ pub const json = struct {
     /// 从 jsmn_zig 模块导入所有核心类型
     const jsmn = @import("json/jsmn_zig.zig");
     pub const Helpers = @import("json/helpers.zig");
+    pub const Query = @import("json/query.zig");
 
     /// JSON 解析器主类型（根据配置生成）
     pub const Jsmn = jsmn.Jsmn;
@@ -74,6 +81,12 @@ pub const json = struct {
 
     /// JSON 解析器构建器（支持链式配置）
     pub const JsonParser = jsmn.Jsmn(jsmn.jsmn_default_config()).JsonParser;
+
+    /// JSON 查询错误类型
+    pub const QueryError = Query.Error;
+
+    /// JSON 查询器类型
+    pub const JsonQuery = Query.JsonQuery;
 
     /// 便捷函数：使用默认配置创建解析器实例
     pub fn createParser() type {
@@ -100,6 +113,26 @@ pub const json = struct {
         });
     }
 
+    /// 便捷函数：快速从 JSON 中提取字符串值
+    pub fn quickGetString(allocator: std.mem.Allocator, json_str: []const u8, key: []const u8) Query.Error![]u8 {
+        return Query.quickGetString(allocator, json_str, key);
+    }
+
+    /// 便捷函数：从 JSON 数组中查找并提取字符串值
+    pub fn quickGetStringFromArray(
+        allocator: std.mem.Allocator,
+        json_str: []const u8,
+        options: struct {
+            array_key: []const u8 = "",
+            match_key: []const u8,
+            match_value: []const u8,
+            target_key: []const u8,
+        },
+    ) Query.Error![]u8 {
+        return Query.quickGetStringFromArray(allocator, json_str, options);
+    }
+
+    /// 便捷函数：JSON 字符串转义反转
     pub fn unescapeJsonStringAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         return Helpers.unescapeJsonStringAlloc(allocator, s);
     }

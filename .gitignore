@@ -7,3 +7,4 @@ zig-out/**
 logger_config.json
 .arts/settings.json
 .codeartsdoer/.codebaseignore
+.claude/settings.local.json
