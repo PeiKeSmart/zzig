@@ -51,6 +51,25 @@ pub const RankedNetworkInterface = struct {
     priority: u8,
 };
 
+pub const InterfaceSelectionResult = struct {
+    interfaces: []const NetworkInterface,
+    selected: ?NetworkInterface,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        freeNetworkInterfaces(allocator, self.interfaces);
+    }
+};
+
+pub const RankedInterfacesResult = struct {
+    interfaces: []const NetworkInterface,
+    ranked: []const RankedNetworkInterface,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.ranked);
+        freeNetworkInterfaces(allocator, self.interfaces);
+    }
+};
+
 /// 主机信息结构（用于扫描结果）
 pub const HostInfo = struct {
     ip: u32,               // IP 地址（主机字节序）
@@ -830,6 +849,15 @@ pub fn freeNetworkInterfaces(allocator: std.mem.Allocator, interfaces: []const N
     allocator.free(interfaces);
 }
 
+pub fn freeHostInfos(allocator: std.mem.Allocator, hosts: *std.ArrayList(HostInfo)) void {
+    for (hosts.items) |host| {
+        if (host.hostname) |name| {
+            allocator.free(name);
+        }
+    }
+    hosts.deinit(allocator);
+}
+
 /// 从网络接口列表中选择最佳接口
 /// 根据优先级和可选的过滤器选择最适合的网络接口
 ///
@@ -883,6 +911,15 @@ pub fn getInterfacePriority(iface: NetworkInterface) u8 {
     return priority;
 }
 
+pub fn getInterfaceTag(iface: NetworkInterface) []const u8 {
+    if (iface.is_virtual) return "⚙️  虚拟网卡";
+
+    const last_octet = @as(u8, @intCast(iface.ip & 0xFF));
+    if (last_octet >= 10 and last_octet <= 253) return "🌟 物理网卡 - 常见局域网子网";
+    if (last_octet == 1) return "🔧 物理网卡 - 可能是网关";
+    return "📡 物理网卡";
+}
+
 pub fn rankInterfacesByPriority(allocator: std.mem.Allocator, interfaces: []const NetworkInterface) ![]RankedNetworkInterface {
     var ranked = try allocator.alloc(RankedNetworkInterface, interfaces.len);
 
@@ -901,6 +938,25 @@ pub fn rankInterfacesByPriority(allocator: std.mem.Allocator, interfaces: []cons
     }
 
     return ranked;
+}
+
+pub fn selectSystemInterface(allocator: std.mem.Allocator, iface_filter: ?[]const u8) !InterfaceSelectionResult {
+    const interfaces = try getNetworkInterfaces(allocator);
+    return .{
+        .interfaces = interfaces,
+        .selected = selectBestInterface(interfaces, iface_filter),
+    };
+}
+
+pub fn getRankedSystemInterfaces(allocator: std.mem.Allocator) !RankedInterfacesResult {
+    const interfaces = try getNetworkInterfaces(allocator);
+    errdefer freeNetworkInterfaces(allocator, interfaces);
+
+    const ranked = try rankInterfacesByPriority(allocator, interfaces);
+    return .{
+        .interfaces = interfaces,
+        .ranked = ranked,
+    };
 }
 
 /// 测试 TCP 端口连通性
@@ -1062,6 +1118,26 @@ test "rankInterfacesByPriority sorts physical lan before virtual" {
     try std.testing.expectEqualStrings("eth0", ranked[0].iface.name);
     try std.testing.expectEqualStrings("wifi", ranked[1].iface.name);
     try std.testing.expectEqualStrings("vmnet", ranked[2].iface.name);
+}
+
+test "getInterfaceTag distinguishes virtual and common lan" {
+    try std.testing.expectEqualStrings("⚙️  虚拟网卡", getInterfaceTag(.{
+        .name = "vmnet",
+        .description = "VMware Network Adapter",
+        .ip = 0xC0A80101,
+        .cidr = "192.168.1.0/24",
+        .prefix_len = 24,
+        .is_virtual = true,
+    }));
+
+    try std.testing.expectEqualStrings("🌟 物理网卡 - 常见局域网子网", getInterfaceTag(.{
+        .name = "eth0",
+        .description = "Ethernet",
+        .ip = 0xC0A80164,
+        .cidr = "192.168.1.0/24",
+        .prefix_len = 24,
+        .is_virtual = false,
+    }));
 }
 
 test "scanOpenTcpHostsInRange zero host count" {
