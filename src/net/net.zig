@@ -175,6 +175,39 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn parseIpv4Text(ip_str: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var iter = std.mem.splitScalar(u8, ip_str, '.');
+    var index: usize = 0;
+
+    while (iter.next()) |octet_str| : (index += 1) {
+        if (index >= 4) return null;
+        octets[index] = std.fmt.parseUnsigned(u8, octet_str, 10) catch return null;
+    }
+
+    if (index != 4) return null;
+
+    return (@as(u32, octets[0]) << 24) |
+        (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) |
+        @as(u32, octets[3]);
+}
+
+fn parseLinuxInterfaceName(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, line, " \r\n\t");
+    if (trimmed.len == 0 or !std.ascii.isDigit(trimmed[0])) return null;
+
+    const first_colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return null;
+    if (first_colon + 1 >= trimmed.len) return null;
+
+    const after_index = std.mem.trimLeft(u8, trimmed[first_colon + 1 ..], " ");
+    const second_colon = std.mem.indexOfScalar(u8, after_index, ':') orelse return null;
+    const name = std.mem.trim(u8, after_index[0..second_colon], " ");
+    if (name.len == 0) return null;
+
+    return name;
+}
+
 /// 使用 ARP 检测主机并获取 MAC 地址
 pub fn arpScan(ip: u32, mac_out: *[6]u8) bool {
     const builtin = @import("builtin");
@@ -427,10 +460,18 @@ pub fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
         defer allocator.free(result.stderr);
 
         // 简单解析 ip addr 输出
-        // 格式示例: inet 192.168.1.100/24
+        // 格式示例:
+        //   2: eth0: <...>
+        //       inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        var current_name: ?[]const u8 = null;
 
         while (lines.next()) |line| {
+            if (parseLinuxInterfaceName(line)) |name| {
+                current_name = name;
+                continue;
+            }
+
             if (std.mem.indexOf(u8, line, "inet ") != null) {
                 var parts = std.mem.splitScalar(u8, line, ' ');
                 var found_inet = false;
@@ -440,45 +481,40 @@ pub fn getNetworkInterfaces(allocator: std.mem.Allocator) ![]NetworkInterface {
                         // 找到 IP/prefix
                         if (std.mem.indexOf(u8, part, ".") != null and std.mem.indexOf(u8, part, "/") != null) {
                             const cidr_str = std.mem.trim(u8, part, " \r\n\t");
-
-                            // 解析 IP
                             const slash_pos = std.mem.indexOfScalar(u8, cidr_str, '/') orelse continue;
                             const ip_str = cidr_str[0..slash_pos];
+                            const prefix_str = cidr_str[slash_pos + 1 ..];
+                            const ip = parseIpv4Text(ip_str) orelse continue;
+                            const first_octet = @as(u8, @intCast((ip >> 24) & 0xFF));
+                            if (first_octet == 127) continue;
 
-                            var octets: [4]u8 = undefined;
-                            var iter = std.mem.splitScalar(u8, ip_str, '.');
-                            var i: usize = 0;
-                            var valid = true;
+                            const prefix_len = std.fmt.parseUnsigned(u8, prefix_str, 10) catch continue;
+                            if (prefix_len > 32) continue;
 
-                            while (iter.next()) |octet_str| : (i += 1) {
-                                if (i >= 4) {
-                                    valid = false;
-                                    break;
-                                }
-                                octets[i] = std.fmt.parseUnsigned(u8, octet_str, 10) catch {
-                                    valid = false;
-                                    break;
-                                };
-                            }
+                            const host_bits: u5 = @intCast(32 - prefix_len);
+                            const mask: u32 = if (prefix_len == 0) 0 else ~@as(u32, 0) << host_bits;
+                            const network_ip = ip & mask;
+                            const iface_name = current_name orelse "unknown";
+                            const is_virtual = isVirtualAdapter(iface_name);
 
-                            if (valid and i == 4 and octets[0] != 127) {
-                                const ip = (@as(u32, octets[0]) << 24) |
-                                    (@as(u32, octets[1]) << 16) |
-                                    (@as(u32, octets[2]) << 8) |
-                                    @as(u32, octets[3]);
+                            const network_octets = [4]u8{
+                                @intCast((network_ip >> 24) & 0xFF),
+                                @intCast((network_ip >> 16) & 0xFF),
+                                @intCast((network_ip >> 8) & 0xFF),
+                                @intCast(network_ip & 0xFF),
+                            };
 
-                                // 简单假设 /24 子网
-                                const prefix_len: u8 = 24;
+                            var normalized_cidr_buf: [20]u8 = undefined;
+                            const normalized_cidr = try std.fmt.bufPrint(&normalized_cidr_buf, "{d}.{d}.{d}.{d}/{d}", .{ network_octets[0], network_octets[1], network_octets[2], network_octets[3], prefix_len });
 
-                                try interfaces.append(allocator, .{
-                                    .name = try allocator.dupe(u8, "eth"),
-                                    .description = try allocator.dupe(u8, "Linux Network Interface"),
-                                    .ip = ip,
-                                    .cidr = try allocator.dupe(u8, cidr_str),
-                                    .prefix_len = prefix_len,
-                                    .is_virtual = false, // Linux 暂时默认为物理网卡
-                                });
-                            }
+                            try interfaces.append(allocator, .{
+                                .name = try allocator.dupe(u8, iface_name),
+                                .description = try allocator.dupe(u8, iface_name),
+                                .ip = ip,
+                                .cidr = try allocator.dupe(u8, normalized_cidr),
+                                .prefix_len = prefix_len,
+                                .is_virtual = is_virtual,
+                            });
                         }
                         break;
                     }
@@ -618,4 +654,16 @@ test "containsIgnoreCase" {
     try std.testing.expect(containsIgnoreCase("HELLO WORLD", "world"));
     try std.testing.expect(containsIgnoreCase("Mixed Case", "CASE"));
     try std.testing.expect(!containsIgnoreCase("Hello World", "foo"));
+}
+
+test "parseIpv4Text" {
+    try std.testing.expectEqual(@as(?u32, 0xC0A80164), parseIpv4Text("192.168.1.100"));
+    try std.testing.expectEqual(@as(?u32, null), parseIpv4Text("192.168.1"));
+    try std.testing.expectEqual(@as(?u32, null), parseIpv4Text("999.168.1.100"));
+}
+
+test "parseLinuxInterfaceName" {
+    try std.testing.expectEqualStrings("eth0", parseLinuxInterfaceName("2: eth0: <BROADCAST,MULTICAST>").?);
+    try std.testing.expectEqualStrings("wlp2s0", parseLinuxInterfaceName("3: wlp2s0: <BROADCAST,MULTICAST>").?);
+    try std.testing.expect(parseLinuxInterfaceName("    inet 192.168.1.10/24") == null);
 }
