@@ -504,6 +504,41 @@ pub fn freeNetworkInterfaces(allocator: std.mem.Allocator, interfaces: []const N
     allocator.free(interfaces);
 }
 
+/// 从网络接口列表中选择最佳接口
+/// 根据优先级和可选的过滤器选择最适合的网络接口
+///
+/// 参数:
+/// - interfaces: 网络接口列表
+/// - iface_filter: 可选的过滤器字符串（匹配名称、描述或 CIDR），传 null 或空字符串表示不过滤
+///
+/// 返回:
+/// - 最佳网络接口，如果没有匹配的接口则返回 null
+pub fn selectBestInterface(interfaces: []const NetworkInterface, iface_filter: ?[]const u8) ?NetworkInterface {
+    var selected: ?NetworkInterface = null;
+    var best_priority: u8 = std.math.maxInt(u8);
+
+    for (interfaces) |iface| {
+        if (iface_filter) |filter| {
+            if (filter.len > 0) {
+                if (!containsIgnoreCase(iface.name, filter) and
+                    !containsIgnoreCase(iface.description, filter) and
+                    !containsIgnoreCase(iface.cidr, filter))
+                {
+                    continue;
+                }
+            }
+        }
+
+        const priority = getInterfacePriority(iface);
+        if (selected == null or priority < best_priority) {
+            selected = iface;
+            best_priority = priority;
+        }
+    }
+
+    return selected;
+}
+
 /// 计算网卡优先级（用于智能选择）
 pub fn getInterfacePriority(iface: NetworkInterface) u8 {
     const last_octet = @as(u8, @intCast(iface.ip & 0xFF));

@@ -55,3 +55,46 @@ pub fn CompareStrings(context: void, a: []const u8, b: []const u8) bool {
     _ = context; // 避免未使用参数的警告
     return std.mem.lessThan(u8, a, b); // 使用 std.mem.lessThan 比较字符串
 }
+
+/// 按多个分隔符分割字符串
+/// 将输入字符串按任意一个分隔符进行分割，去除首尾空白，跳过空段
+///
+/// 参数:
+/// - allocator: 内存分配器
+/// - input: 要分割的字符串
+/// - delimiters: 分隔符集合（每个字符都是独立的分隔符）
+///
+/// 返回:
+/// - 分割后的字符串切片数组，由调用方负责释放
+///
+/// 示例:
+/// ```zig
+/// const result = try splitMulti(allocator, "www,@,home", ",;");
+/// // result = {"www", "@", "home"}
+/// ```
+pub fn splitMulti(allocator: std.mem.Allocator, input: []const u8, delimiters: []const u8) ![][]const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(allocator);
+
+    var start: usize = 0;
+    for (input, 0..) |ch, i| {
+        for (delimiters) |delim| {
+            if (ch == delim) {
+                // 提取当前段，去除首尾空白
+                const segment = std.mem.trim(u8, input[start..i], " \t");
+                if (segment.len > 0) {
+                    try list.append(allocator, segment);
+                }
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    // 处理最后一段
+    const last = std.mem.trim(u8, input[start..], " \t");
+    if (last.len > 0) {
+        try list.append(allocator, last);
+    }
+
+    return list.toOwnedSlice(allocator);
+}

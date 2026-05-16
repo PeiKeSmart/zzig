@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// 进程工具（外部命令执行、输出读取）
+pub const Process = @import("process/process.zig");
+
 /// 字符串处理
 pub const Strings = @import("string/strings.zig");
 
