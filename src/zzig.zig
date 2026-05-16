@@ -132,7 +132,12 @@ pub const json = struct {
             target_key: []const u8,
         },
     ) Query.Error![]u8 {
-        return Query.quickGetStringFromArray(allocator, json_str, options);
+        return Query.quickGetStringFromArray(allocator, json_str, .{
+            .array_key = options.array_key,
+            .match_key = options.match_key,
+            .match_value = options.match_value,
+            .target_key = options.target_key,
+        });
     }
 
     /// 便捷函数：JSON 字符串转义反转

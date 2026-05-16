@@ -301,6 +301,7 @@ fn tokenText(token: Parser.Token, input: []const u8) []const u8 {
 fn skipToken(tokens: []const Parser.Token, index: usize) usize {
     const token = tokens[index];
     switch (token.typ) {
+        .Undefined => return index + 1,
         .String, .Primitive => return index + 1,
         .Object, .Array => {
             var child = index + 1;
