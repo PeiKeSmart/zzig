@@ -11,6 +11,7 @@ pub const RequestOptions = struct {
     method: std.http.Method = .GET,
     payload: ?[]const u8 = null,
     headers: std.http.Client.Request.Headers = .{},
+    extra_headers: []const std.http.Header = &.{},
     user_agent: ?[]const u8 = null,
 };
 
@@ -100,6 +101,7 @@ pub fn fetchBytes(allocator: std.mem.Allocator, client: *std.http.Client, option
         .method = options.method,
         .payload = options.payload,
         .headers = headers,
+        .extra_headers = options.extra_headers,
         .response_writer = &allocating_writer.writer,
     });
 
