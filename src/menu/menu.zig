@@ -209,9 +209,8 @@ pub fn clearScreen() void {
             std.debug.print("\x1b[2J\x1b[H", .{});
         } else {
             // 降级：spawn cls（毫秒级，但兼容所有 Windows 终端）
-            _ = std.process.Child.run(.{
-                .allocator = std.heap.page_allocator,
-                .argv = &[_][]const u8{"cls"},
+            _ = compat.process.run(std.heap.page_allocator, .{
+                .argv = &[_][]const u8{ "cmd", "/c", "cls" },
             }) catch {};
         }
     } else {

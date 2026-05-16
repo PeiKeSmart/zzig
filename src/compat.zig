@@ -2,9 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const is_zig_016_or_newer = builtin.zig_version.minor >= 16;
+var current_io_override: ?std.Io = null;
 
 pub fn currentIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return current_io_override orelse std.Io.Threaded.global_single_threaded.io();
+}
+
+pub fn setCurrentIo(io: std.Io) void {
+    current_io_override = io;
 }
 
 pub const GeneralPurposeAllocator = if (is_zig_016_or_newer)
@@ -218,6 +223,19 @@ pub fn milliTimestamp() i64 {
     }
     return std.time.milliTimestamp();
 }
+
+pub const process = struct {
+    pub fn run(allocator: std.mem.Allocator, options: std.process.RunOptions) std.process.RunError!std.process.RunResult {
+        return std.process.run(allocator, currentIo(), options);
+    }
+};
+
+pub const net = struct {
+    pub fn connectTcp(ip_text: []const u8, port: u16) !std.Io.net.Stream {
+        const address = try std.Io.net.IpAddress.parse(ip_text, port);
+        return std.Io.net.IpAddress.connect(&address, currentIo(), .{ .mode = .stream, .protocol = .tcp });
+    }
+};
 
 pub const windows = struct {
     pub const STD_INPUT_HANDLE: std.os.windows.DWORD = @bitCast(@as(i32, -10));
