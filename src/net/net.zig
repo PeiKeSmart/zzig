@@ -46,6 +46,11 @@ pub const NetworkInterface = struct {
     is_virtual: bool,      // 是否为虚拟网卡
 };
 
+pub const RankedNetworkInterface = struct {
+    iface: NetworkInterface,
+    priority: u8,
+};
+
 /// 主机信息结构（用于扫描结果）
 pub const HostInfo = struct {
     ip: u32,               // IP 地址（主机字节序）
@@ -878,6 +883,26 @@ pub fn getInterfacePriority(iface: NetworkInterface) u8 {
     return priority;
 }
 
+pub fn rankInterfacesByPriority(allocator: std.mem.Allocator, interfaces: []const NetworkInterface) ![]RankedNetworkInterface {
+    var ranked = try allocator.alloc(RankedNetworkInterface, interfaces.len);
+
+    for (interfaces, 0..) |iface, index| {
+        ranked[index] = .{ .iface = iface, .priority = getInterfacePriority(iface) };
+    }
+
+    for (0..ranked.len) |i| {
+        for (i + 1..ranked.len) |j| {
+            if (ranked[i].priority > ranked[j].priority) {
+                const temp = ranked[i];
+                ranked[i] = ranked[j];
+                ranked[j] = temp;
+            }
+        }
+    }
+
+    return ranked;
+}
+
 /// 测试 TCP 端口连通性
 pub fn testTcpPort(allocator: std.mem.Allocator, ip_str: []const u8, port: u16, timeout_ms: u32) bool {
     _ = allocator;
@@ -1000,6 +1025,43 @@ test "buildArpScanOrder prefers local ip" {
     try std.testing.expectEqual(@as(u32, 0xC0A80103), order[0]);
     try std.testing.expectEqual(@as(u32, 0xC0A80102), order[1]);
     try std.testing.expectEqual(@as(u32, 0xC0A80104), order[2]);
+}
+
+test "rankInterfacesByPriority sorts physical lan before virtual" {
+    const allocator = std.testing.allocator;
+    const interfaces = [_]NetworkInterface{
+        .{
+            .name = "vmnet",
+            .description = "VMware Network Adapter",
+            .ip = 0xC0A80101,
+            .cidr = "192.168.1.0/24",
+            .prefix_len = 24,
+            .is_virtual = true,
+        },
+        .{
+            .name = "eth0",
+            .description = "Ethernet",
+            .ip = 0xC0A80164,
+            .cidr = "192.168.1.0/24",
+            .prefix_len = 24,
+            .is_virtual = false,
+        },
+        .{
+            .name = "wifi",
+            .description = "Wi-Fi",
+            .ip = 0xC0A80101,
+            .cidr = "192.168.1.0/24",
+            .prefix_len = 24,
+            .is_virtual = false,
+        },
+    };
+
+    const ranked = try rankInterfacesByPriority(allocator, &interfaces);
+    defer allocator.free(ranked);
+
+    try std.testing.expectEqualStrings("eth0", ranked[0].iface.name);
+    try std.testing.expectEqualStrings("wifi", ranked[1].iface.name);
+    try std.testing.expectEqualStrings("vmnet", ranked[2].iface.name);
 }
 
 test "scanOpenTcpHostsInRange zero host count" {
