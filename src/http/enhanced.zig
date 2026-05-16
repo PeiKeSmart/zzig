@@ -15,7 +15,6 @@
 const std = @import("std");
 const zhttp = @import("../http/http.zig");
 const compat = @import("../compat.zig");
-const json_query = @import("../json/query.zig");
 
 /// HTTP 重试配置
 pub const RetryConfig = struct {
@@ -83,8 +82,6 @@ fn httpPostFormWithTimeout(
         },
         .user_agent = "Zig-HTTP-Client/1.0",
     }, @as(u64, config.timeout_sec) * std.time.ms_per_s, config.poll_interval_ms);
-    defer allocator.free(response.body);
-
     const resp_buf = response.body;
 
     // 处理 gzip 压缩响应
@@ -153,107 +150,6 @@ pub fn buildFormEncoded(
     return joined;
 }
 
-/// 带重试的获取公网 IP（针对特定 IP 查询服务）
-pub fn fetchPublicIPv4WithRetry(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-    config: RetryConfig,
-) ![]u8 {
-    var attempt: u32 = 1;
-
-    while (true) {
-        const ip = fetchPublicIPv4(allocator, client, url, config) catch |err| {
-            if (!shouldRetryHttpPost(err, attempt, config.max_attempts)) return err;
-
-            std.debug.print("fetchPublicIPv4: attempt={d}/{d} 失败 err={s}，{d}ms 后重试\n", .{
-                attempt,
-                config.max_attempts,
-                @errorName(err),
-                config.retry_delay_ms,
-            });
-            compat.sleep(config.retry_delay_ms * std.time.ns_per_ms);
-            attempt += 1;
-            continue;
-        };
-
-        if (attempt > 1) {
-            std.debug.print("fetchPublicIPv4: attempt={d}/{d} 重试成功\n", .{ attempt, config.max_attempts });
-        }
-        return ip;
-    }
-}
-
-/// 从公网 IP 查询服务返回的 JSON 中提取 IPv4 地址
-/// 兼容两种常见格式：
-/// 1. {"Data":[{"Type":"IPv4","Ip":"1.2.3.4"}]}
-/// 2. [{"Type":"IPv4","Ip":"1.2.3.4"}]
-pub fn extractPublicIPv4FromJson(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    return json_query.quickGetStringFromArray(allocator, body, .{
-        .array_key = "Data",
-        .match_key = "Type",
-        .match_value = "IPv4",
-        .target_key = "Ip",
-    }) catch |err| switch (err) {
-        error.KeyNotFound, error.ElementNotFound, error.TypeMismatch => json_query.quickGetStringFromArray(allocator, body, .{
-            .match_key = "Type",
-            .match_value = "IPv4",
-            .target_key = "Ip",
-        }),
-        else => err,
-    };
-}
-
-/// 带重试地获取并直接解析公网 IPv4 地址
-pub fn fetchPublicIPv4AddressWithRetry(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-    config: RetryConfig,
-) ![]u8 {
-    const body = try fetchPublicIPv4WithRetry(allocator, client, url, config);
-    defer allocator.free(body);
-
-    return extractPublicIPv4FromJson(allocator, body);
-}
-
-/// 获取公网 IP（针对特定服务格式）
-/// 服务返回格式示例：[{"Type":"IPv4","Ip":"192.168.1.1"},{"Type":"IPv6","Ip":"::1"}]
-fn fetchPublicIPv4(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    url: []const u8,
-    config: RetryConfig,
-) ![]u8 {
-    // 准备表单数据（特定服务需要）
-    const form_data = "from=hlktech-nuget";
-
-    const response = try zhttp.fetchBytesWithTimeout(allocator, client, .{
-        .url = url,
-        .method = .POST,
-        .payload = form_data,
-        .headers = .{
-            .content_type = .{ .override = "application/x-www-form-urlencoded" },
-        },
-    }, @as(u64, config.timeout_sec) * std.time.ms_per_s, config.poll_interval_ms);
-    defer allocator.free(response.body);
-
-    const body = response.body;
-
-    // 处理 gzip 压缩
-    if (zhttp.isGzipMagic(body)) {
-        const unzipped = try zhttp.gzipDecompressAlloc(allocator, body);
-        defer allocator.free(unzipped);
-
-        // 这里需要调用者使用 json.Query 来解析 IP
-        // 返回原始 JSON 字符串，由调用者解析
-        return try allocator.dupe(u8, unzipped);
-    }
-
-    // 返回原始 JSON 字符串
-    return try allocator.dupe(u8, body);
-}
-
 // ============================================================================
 // 测试用例
 // ============================================================================
@@ -283,34 +179,4 @@ test "shouldRetryHttpPost: retry logic" {
 
     // 其他错误不应重试
     try std.testing.expect(!shouldRetryHttpPost(error.InvalidConfiguration, 1, 3));
-}
-
-test "extractPublicIPv4FromJson: wrapped data array" {
-    const allocator = std.testing.allocator;
-    const json_str =
-        \\\{"Data":[
-        \\\  {"Type":"IPv6","Ip":"::1"},
-        \\\  {"Type":"IPv4","Ip":"192.168.1.1"}
-        \\\]}
-    ;
-
-    const ip = try extractPublicIPv4FromJson(allocator, json_str);
-    defer allocator.free(ip);
-
-    try std.testing.expectEqualStrings("192.168.1.1", ip);
-}
-
-test "extractPublicIPv4FromJson: root array fallback" {
-    const allocator = std.testing.allocator;
-    const json_str =
-        \\\[
-        \\\  {"Type":"IPv6","Ip":"::1"},
-        \\\  {"Type":"IPv4","Ip":"10.0.0.2"}
-        \\\]
-    ;
-
-    const ip = try extractPublicIPv4FromJson(allocator, json_str);
-    defer allocator.free(ip);
-
-    try std.testing.expectEqualStrings("10.0.0.2", ip);
 }

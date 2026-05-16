@@ -251,22 +251,22 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
         return;
     }
 
-    // Windows：需要 UTF-16 转换，使用 arena 承载中间字符串
+    // Windows：需要 UTF-16 转换，使用单个 writer 顺序组装整行，
+    // 避免先生成 message 再作为 {s} 拼接回 full_message 触发别名拷贝。
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // 格式化用户消息
-    const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
+    var buffer: std.ArrayList(u8) = .empty;
+    var writer_allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
+    const writer = &writer_allocating.writer;
 
-    // 组装完整日志（WriteConsoleW 需要一次性写入）
-    const full_message = std.fmt.allocPrint(
-        allocator,
-        "{s}[{s}] {s}{s}{s} {s}\n",
-        .{ color_code, timestamp, color_code, level_label, reset_code, message },
-    ) catch return;
+    writer.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code }) catch return;
+    writer.print(fmt, args) catch return;
+    writer.writeAll("\n") catch return;
 
-    printUtf8(allocator, full_message);
+    buffer = writer_allocating.toArrayList();
+    printUtf8(allocator, buffer.items);
 }
 
 /// 调试级别日志
@@ -305,21 +305,20 @@ pub fn always(comptime fmt: []const u8, args: anytype) void {
     var ts_buf: [32]u8 = undefined;
     const timestamp = formatTimestamp(&ts_buf);
 
-    // 格式化用户消息
-    const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
-
-    // 组装完整日志（使用 INFO 级别的样式）
     const color_code = "\x1b[32m"; // 绿色
     const reset_code = "\x1b[0m";
     const level_label = "INFO";
 
-    const full_message = std.fmt.allocPrint(
-        allocator,
-        "{s}[{s}] {s}{s}{s} {s}\n",
-        .{ color_code, timestamp, color_code, level_label, reset_code, message },
-    ) catch return;
+    var buffer: std.ArrayList(u8) = .empty;
+    var writer_allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
+    const writer = &writer_allocating.writer;
 
-    printUtf8(allocator, full_message);
+    writer.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code }) catch return;
+    writer.print(fmt, args) catch return;
+    writer.writeAll("\n") catch return;
+
+    buffer = writer_allocating.toArrayList();
+    printUtf8(allocator, buffer.items);
 }
 
 /// 不带时间戳和级别的简单打印（用于替换原有的简单打印场景）
