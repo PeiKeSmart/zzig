@@ -119,6 +119,40 @@ pub const JsonQuery = struct {
         return JsonQuery.init(self.allocator, self.json[token.start..token.end]);
     }
 
+    /// 获取数组指定索引处的元素（返回子查询器）
+    pub fn getElementAt(self: JsonQuery, index: usize) Error!JsonQuery {
+        const parsed = try parseJson(self.allocator, self.json);
+        defer parsed.deinit();
+
+        if (parsed.count == 0) return Error.InvalidFormat;
+
+        const array_token = parsed.tokens[0];
+        if (array_token.typ != .Array) return Error.TypeMismatch;
+        if (index >= array_token.size) return Error.ElementNotFound;
+
+        var child_index: usize = 1;
+        var current_index: usize = 0;
+        while (current_index < index and child_index < parsed.count) : (current_index += 1) {
+            child_index = skipToken(parsed.tokens, child_index);
+        }
+
+        if (child_index >= parsed.count) return Error.ElementNotFound;
+        const item_token = parsed.tokens[child_index];
+        return JsonQuery.init(self.allocator, self.json[item_token.start..item_token.end]);
+    }
+
+    /// 获取数组指定索引处的对象
+    pub fn getObjectAt(self: JsonQuery, index: usize) Error!JsonQuery {
+        const item = try self.getElementAt(index);
+
+        const parsed = try parseJson(self.allocator, item.json);
+        defer parsed.deinit();
+
+        if (parsed.count == 0) return Error.InvalidFormat;
+        if (parsed.tokens[0].typ != .Object) return Error.TypeMismatch;
+        return item;
+    }
+
     /// 查找数组中符合条件的第一个元素
     /// 示例: query.findInArray("items", "Type", "IPv4").getString("Ip")
     /// 不依赖属性顺序，自动处理空白符
@@ -390,6 +424,28 @@ test "quickGetStringFromArray: root array" {
     defer allocator.free(ip);
 
     try std.testing.expectEqualStrings("192.168.1.1", ip);
+}
+
+test "JsonQuery: getObjectAt from named array" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\\{"records":[
+        \\\  {"id":"123","value":"1.2.3.4","ttl":"600"},
+        \\\  {"id":"456","value":"5.6.7.8","ttl":"60"}
+        \\\]}
+    ;
+
+    const query = JsonQuery.init(allocator, json_str);
+    const records = try query.getArray("records");
+    const first = try records.getObjectAt(0);
+
+    const id = try first.getString("id");
+    defer allocator.free(id);
+    const value = try first.getString("value");
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings("123", id);
+    try std.testing.expectEqualStrings("1.2.3.4", value);
 }
 
 test "quickGetString: simple query" {

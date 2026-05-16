@@ -15,6 +15,7 @@
 const std = @import("std");
 const zhttp = @import("../http/http.zig");
 const compat = @import("../compat.zig");
+const json_query = @import("../json/query.zig");
 
 /// HTTP 重试配置
 pub const RetryConfig = struct {
@@ -183,6 +184,39 @@ pub fn fetchPublicIPv4WithRetry(
     }
 }
 
+/// 从公网 IP 查询服务返回的 JSON 中提取 IPv4 地址
+/// 兼容两种常见格式：
+/// 1. {"Data":[{"Type":"IPv4","Ip":"1.2.3.4"}]}
+/// 2. [{"Type":"IPv4","Ip":"1.2.3.4"}]
+pub fn extractPublicIPv4FromJson(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    return json_query.quickGetStringFromArray(allocator, body, .{
+        .array_key = "Data",
+        .match_key = "Type",
+        .match_value = "IPv4",
+        .target_key = "Ip",
+    }) catch |err| switch (err) {
+        error.KeyNotFound, error.ElementNotFound, error.TypeMismatch => json_query.quickGetStringFromArray(allocator, body, .{
+            .match_key = "Type",
+            .match_value = "IPv4",
+            .target_key = "Ip",
+        }),
+        else => err,
+    };
+}
+
+/// 带重试地获取并直接解析公网 IPv4 地址
+pub fn fetchPublicIPv4AddressWithRetry(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    config: RetryConfig,
+) ![]u8 {
+    const body = try fetchPublicIPv4WithRetry(allocator, client, url, config);
+    defer allocator.free(body);
+
+    return extractPublicIPv4FromJson(allocator, body);
+}
+
 /// 获取公网 IP（针对特定服务格式）
 /// 服务返回格式示例：[{"Type":"IPv4","Ip":"192.168.1.1"},{"Type":"IPv6","Ip":"::1"}]
 fn fetchPublicIPv4(
@@ -249,4 +283,34 @@ test "shouldRetryHttpPost: retry logic" {
 
     // 其他错误不应重试
     try std.testing.expect(!shouldRetryHttpPost(error.InvalidConfiguration, 1, 3));
+}
+
+test "extractPublicIPv4FromJson: wrapped data array" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\\{"Data":[
+        \\\  {"Type":"IPv6","Ip":"::1"},
+        \\\  {"Type":"IPv4","Ip":"192.168.1.1"}
+        \\\]}
+    ;
+
+    const ip = try extractPublicIPv4FromJson(allocator, json_str);
+    defer allocator.free(ip);
+
+    try std.testing.expectEqualStrings("192.168.1.1", ip);
+}
+
+test "extractPublicIPv4FromJson: root array fallback" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\\[
+        \\\  {"Type":"IPv6","Ip":"::1"},
+        \\\  {"Type":"IPv4","Ip":"10.0.0.2"}
+        \\\]
+    ;
+
+    const ip = try extractPublicIPv4FromJson(allocator, json_str);
+    defer allocator.free(ip);
+
+    try std.testing.expectEqualStrings("10.0.0.2", ip);
 }
