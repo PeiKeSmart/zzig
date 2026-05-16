@@ -16,6 +16,9 @@ pub const Randoms = @import("random/randoms.zig");
 /// 文件及文件夹处理
 pub const File = @import("file/file.zig");
 
+/// HTTP、表单编码与压缩响应辅助
+pub const Http = @import("http/http.zig");
+
 /// 控制台工具（UTF-8 编码、ANSI 颜色支持、跨平台兼容）
 pub const Console = @import("console/console.zig");
 
@@ -56,6 +59,7 @@ pub const logs = struct {
 pub const json = struct {
     /// 从 jsmn_zig 模块导入所有核心类型
     const jsmn = @import("json/jsmn_zig.zig");
+    pub const Helpers = @import("json/helpers.zig");
 
     /// JSON 解析器主类型（根据配置生成）
     pub const Jsmn = jsmn.Jsmn;
@@ -92,6 +96,10 @@ pub const json = struct {
             .tiny_mode = false,
             .enable_helpers = true,
         });
+    }
+
+    pub fn unescapeJsonStringAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+        return Helpers.unescapeJsonStringAlloc(allocator, s);
     }
 };
 
