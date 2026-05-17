@@ -289,6 +289,78 @@ pub const windows = struct {
     pub const STD_INPUT_HANDLE: std.os.windows.DWORD = @bitCast(@as(i32, -10));
     pub const STD_OUTPUT_HANDLE: std.os.windows.DWORD = @bitCast(@as(i32, -11));
 
+    const DWORD = std.os.windows.DWORD;
+    const BOOL = std.os.windows.BOOL;
+    const HANDLE = std.os.windows.HANDLE;
+    const HKEY = std.os.windows.HKEY;
+    const REGSAM = std.os.windows.REGSAM;
+    const BYTE = u8;
+    const LONG = i32;
+    const PSID = *anyopaque;
+    const BOOL_FALSE: BOOL = @enumFromInt(0);
+    const BOOL_TRUE: BOOL = @enumFromInt(1);
+    const ERROR_SUCCESS: DWORD = 0;
+    const KEY_READ: REGSAM = @bitCast(@as(DWORD, 0x20019));
+    const REG_SZ: DWORD = 1;
+    const REG_EXPAND_SZ: DWORD = 2;
+    const SECURITY_DESCRIPTOR_REVISION: DWORD = 1;
+    const ACL_REVISION: DWORD = 2;
+    const DACL_SECURITY_INFORMATION: DWORD = 0x00000004;
+    const MUTEX_ALL_ACCESS: DWORD = 0x1F0001;
+
+    const SID_IDENTIFIER_AUTHORITY = extern struct {
+        Value: [6]u8,
+    };
+
+    const ACL = extern struct {
+        AclRevision: BYTE,
+        Sbz1: BYTE,
+        AclSize: std.os.windows.WORD,
+        AceCount: std.os.windows.WORD,
+        Sbz2: std.os.windows.WORD,
+    };
+
+    const SECURITY_DESCRIPTOR = extern struct {
+        Revision: BYTE,
+        Sbz1: BYTE,
+        Control: std.os.windows.WORD,
+        Owner: PSID,
+        Group: PSID,
+        Sacl: ?*ACL,
+        Dacl: ?*ACL,
+    };
+
+    const SECURITY_WORLD_SID_AUTHORITY = SID_IDENTIFIER_AUTHORITY{ .Value = [_]u8{ 0, 0, 0, 0, 0, 1 } };
+    const SECURITY_WORLD_RID: DWORD = 0;
+
+    pub const RegistryStringError = std.mem.Allocator.Error || error{
+        DanglingSurrogateHalf,
+        ExpectedSecondSurrogateHalf,
+        InvalidUtf8,
+        RegistryKeyNotFound,
+        RegistryValueNotFound,
+        InvalidRegistryValueType,
+        InvalidRegistryValueData,
+        UnexpectedSecondSurrogateHalf,
+    };
+
+    pub const CreateDeniedMutexError = std.mem.Allocator.Error || error{
+        InvalidUtf8,
+        CreateMutexFailed,
+        CreateWorldSidFailed,
+        InitializeAclFailed,
+        AddAccessDeniedAceFailed,
+        InitializeSecurityDescriptorFailed,
+        SetSecurityDescriptorDaclFailed,
+        SetKernelObjectSecurityFailed,
+    };
+
+    fn utf8ToUtf16LeAllocZ(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
+        const utf16 = try std.unicode.utf8ToUtf16LeAlloc(allocator, text);
+        defer allocator.free(utf16);
+        return try allocator.dupeZ(u16, utf16);
+    }
+
     pub fn getStdHandle(std_handle: std.os.windows.DWORD) ?std.os.windows.HANDLE {
         const winapi = std.builtin.CallingConvention.winapi;
         const GetStdHandle = struct {
@@ -346,6 +418,182 @@ pub const windows = struct {
         }.WriteConsoleW;
 
         return WriteConsoleW(handle, buffer.ptr, @intCast(buffer.len), written, null);
+    }
+
+    pub fn queryRegistryStringAlloc(
+        allocator: std.mem.Allocator,
+        root_key: HKEY,
+        sub_key: []const u8,
+        value_name: []const u8,
+    ) RegistryStringError![]u8 {
+        const RegOpenKeyExW = struct {
+            extern "advapi32" fn RegOpenKeyExW(
+                hKey: HKEY,
+                lpSubKey: [*:0]const u16,
+                ulOptions: DWORD,
+                samDesired: REGSAM,
+                phkResult: *HKEY,
+            ) callconv(.winapi) DWORD;
+        }.RegOpenKeyExW;
+
+        const RegQueryValueExW = struct {
+            extern "advapi32" fn RegQueryValueExW(
+                hKey: HKEY,
+                lpValueName: [*:0]const u16,
+                lpReserved: ?*DWORD,
+                lpType: ?*DWORD,
+                lpData: ?*BYTE,
+                lpcbData: ?*DWORD,
+            ) callconv(.winapi) DWORD;
+        }.RegQueryValueExW;
+
+        const RegCloseKey = struct {
+            extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) LONG;
+        }.RegCloseKey;
+
+        const sub_key_z = try utf8ToUtf16LeAllocZ(allocator, sub_key);
+        defer allocator.free(sub_key_z);
+        const value_name_z = try utf8ToUtf16LeAllocZ(allocator, value_name);
+        defer allocator.free(value_name_z);
+
+        var hKey: HKEY = undefined;
+        if (RegOpenKeyExW(root_key, sub_key_z.ptr, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+            return error.RegistryKeyNotFound;
+        defer _ = RegCloseKey(hKey);
+
+        var data_type: DWORD = 0;
+        var data_bytes: DWORD = 0;
+        if (RegQueryValueExW(hKey, value_name_z.ptr, null, &data_type, null, &data_bytes) != ERROR_SUCCESS)
+            return error.RegistryValueNotFound;
+
+        if (data_type != REG_SZ and data_type != REG_EXPAND_SZ)
+            return error.InvalidRegistryValueType;
+
+        if (data_bytes == 0) return allocator.dupe(u8, "");
+        if (@rem(data_bytes, @sizeOf(u16)) != 0) return error.InvalidRegistryValueData;
+
+        const unit_count: usize = @intCast(@divExact(data_bytes, @sizeOf(u16)));
+        const utf16_value = try allocator.alloc(u16, unit_count);
+        defer allocator.free(utf16_value);
+
+        if (RegQueryValueExW(
+            hKey,
+            value_name_z.ptr,
+            null,
+            &data_type,
+            @ptrCast(utf16_value.ptr),
+            &data_bytes,
+        ) != ERROR_SUCCESS) return error.RegistryValueNotFound;
+
+        const trimmed = std.mem.sliceTo(utf16_value, 0);
+        return try std.unicode.utf16LeToUtf8Alloc(allocator, trimmed);
+    }
+
+    pub fn createDeniedMutex(allocator: std.mem.Allocator, name: []const u8) CreateDeniedMutexError!HANDLE {
+        const CreateMutexW = struct {
+            extern "kernel32" fn CreateMutexW(
+                lpMutexAttributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+                bInitialOwner: BOOL,
+                lpName: [*:0]const u16,
+            ) callconv(.winapi) ?HANDLE;
+        }.CreateMutexW;
+
+        const CloseHandle = struct {
+            extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+        }.CloseHandle;
+
+        const AllocateAndInitializeSid = struct {
+            extern "advapi32" fn AllocateAndInitializeSid(
+                pIdentifierAuthority: *const SID_IDENTIFIER_AUTHORITY,
+                nSubAuthorityCount: BYTE,
+                nSubAuthority0: DWORD,
+                nSubAuthority1: DWORD,
+                nSubAuthority2: DWORD,
+                nSubAuthority3: DWORD,
+                nSubAuthority4: DWORD,
+                nSubAuthority5: DWORD,
+                nSubAuthority6: DWORD,
+                nSubAuthority7: DWORD,
+                pSid: *PSID,
+            ) callconv(.winapi) BOOL;
+        }.AllocateAndInitializeSid;
+
+        const FreeSid = struct {
+            extern "advapi32" fn FreeSid(pSid: PSID) callconv(.winapi) ?*anyopaque;
+        }.FreeSid;
+
+        const InitializeAcl = struct {
+            extern "advapi32" fn InitializeAcl(
+                pAcl: *ACL,
+                nAclLength: DWORD,
+                dwAclRevision: DWORD,
+            ) callconv(.winapi) BOOL;
+        }.InitializeAcl;
+
+        const AddAccessDeniedAce = struct {
+            extern "advapi32" fn AddAccessDeniedAce(
+                pAcl: *ACL,
+                dwAceRevision: DWORD,
+                AccessMask: DWORD,
+                pSid: PSID,
+            ) callconv(.winapi) BOOL;
+        }.AddAccessDeniedAce;
+
+        const InitializeSecurityDescriptor = struct {
+            extern "advapi32" fn InitializeSecurityDescriptor(
+                pSecurityDescriptor: *SECURITY_DESCRIPTOR,
+                dwRevision: DWORD,
+            ) callconv(.winapi) BOOL;
+        }.InitializeSecurityDescriptor;
+
+        const SetSecurityDescriptorDacl = struct {
+            extern "advapi32" fn SetSecurityDescriptorDacl(
+                pSecurityDescriptor: *SECURITY_DESCRIPTOR,
+                bDaclPresent: BOOL,
+                pDacl: ?*ACL,
+                bDaclDefaulted: BOOL,
+            ) callconv(.winapi) BOOL;
+        }.SetSecurityDescriptorDacl;
+
+        const SetKernelObjectSecurity = struct {
+            extern "advapi32" fn SetKernelObjectSecurity(
+                Handle: HANDLE,
+                SecurityInformation: DWORD,
+                SecurityDescriptor: *SECURITY_DESCRIPTOR,
+            ) callconv(.winapi) BOOL;
+        }.SetKernelObjectSecurity;
+
+        const mutex_name_z = try utf8ToUtf16LeAllocZ(allocator, name);
+        defer allocator.free(mutex_name_z);
+
+        const handle = CreateMutexW(null, BOOL_FALSE, mutex_name_z.ptr) orelse return error.CreateMutexFailed;
+        errdefer _ = CloseHandle(handle);
+
+        var everyone_sid: PSID = undefined;
+        var authority = SECURITY_WORLD_SID_AUTHORITY;
+        if (!AllocateAndInitializeSid(&authority, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &everyone_sid).toBool())
+            return error.CreateWorldSidFailed;
+        defer _ = FreeSid(everyone_sid);
+
+        var acl_buffer: [256]u8 align(4) = undefined;
+        const acl: *ACL = @ptrCast(&acl_buffer);
+        if (!InitializeAcl(acl, acl_buffer.len, ACL_REVISION).toBool())
+            return error.InitializeAclFailed;
+
+        if (!AddAccessDeniedAce(acl, ACL_REVISION, MUTEX_ALL_ACCESS, everyone_sid).toBool())
+            return error.AddAccessDeniedAceFailed;
+
+        var security_descriptor: SECURITY_DESCRIPTOR = undefined;
+        if (!InitializeSecurityDescriptor(&security_descriptor, SECURITY_DESCRIPTOR_REVISION).toBool())
+            return error.InitializeSecurityDescriptorFailed;
+
+        if (!SetSecurityDescriptorDacl(&security_descriptor, BOOL_TRUE, acl, BOOL_FALSE).toBool())
+            return error.SetSecurityDescriptorDaclFailed;
+
+        if (!SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, &security_descriptor).toBool())
+            return error.SetKernelObjectSecurityFailed;
+
+        return handle;
     }
 };
 
