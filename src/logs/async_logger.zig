@@ -1020,7 +1020,7 @@ pub const AsyncLogger = struct {
     fn logZeroAlloc(self: *AsyncLogger, level: Level, comptime fmt: []const u8, args: anytype) void {
         // 线程局部缓冲区（每线程一个，零初始化避免未定义行为）
         const TLS = struct {
-            threadlocal var format_buffer: [4096]u8 = [_]u8{0} ** 4096;
+            threadlocal var format_buffer: [4096]u8 = @splat(0);
             threadlocal var is_formatting: bool = false; // 防止递归
         };
 

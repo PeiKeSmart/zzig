@@ -9,7 +9,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("\n🧪 测试 both 输出模式\n", .{});
-    std.debug.print("=" ** 60 ++ "\n\n", .{});
+    std.debug.print(@as([60]u8, @splat('=')) ++ "\n\n", .{});
 
     // 从配置文件初始化
     var logger = try zzig.AsyncLogger.AsyncLogger.initFromConfigFile(

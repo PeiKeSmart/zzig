@@ -122,7 +122,7 @@ pub const AsyncLogger = struct {
                 self.writeLog(msg);
             } else {
                 // 队列空，短暂休眠避免空转
-                std.time.sleep(100 * std.time.ns_per_us);
+                compat.sleep(100 * std.time.ns_per_us);
             }
         }
 
@@ -213,7 +213,7 @@ pub fn main() !void {
     std.debug.print("丢弃: {d} 条\n\n", .{logger.getDroppedCount()});
 
     // 等待后台线程处理完
-    std.time.sleep(1 * std.time.ns_per_s);
+    compat.sleep(1 * std.time.ns_per_s);
 
     std.debug.print("=== 测试完成 ===\n", .{});
 }

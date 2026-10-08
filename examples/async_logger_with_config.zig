@@ -21,15 +21,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
+    std.debug.print("\n" ++ @as([60]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("🚀 异步日志配置文件示例\n", .{});
-    std.debug.print("=" ** 60 ++ "\n\n", .{});
+    std.debug.print(@as([60]u8, @splat('=')) ++ "\n\n", .{});
 
     // ========================================================================
     // 方式 1: 使用配置文件初始化 (推荐生产环境使用)
     // ========================================================================
     std.debug.print("📌 方式 1: 从配置文件加载\n", .{});
-    std.debug.print("-" ** 60 ++ "\n", .{});
+    std.debug.print(@as([60]u8, @splat('-')) ++ "\n", .{});
 
     const config_path = "logger_config.json";
 
@@ -72,9 +72,9 @@ pub fn main() !void {
     // 打印统计信息
     // ========================================================================
     const stats = logger.getStats();
-    std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
+    std.debug.print("\n" ++ @as([60]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("📊 运行统计:\n", .{});
-    std.debug.print("=" ** 60 ++ "\n", .{});
+    std.debug.print(@as([60]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("  已处理: {d} 条\n", .{stats.processed_count});
     std.debug.print("  已丢弃: {d} 条\n", .{stats.dropped_count});
     std.debug.print("  队列剩余: {d} 条\n", .{stats.queue_size});
@@ -92,9 +92,9 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
+    std.debug.print("\n" ++ @as([60]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("✅ 示例完成!\n", .{});
-    std.debug.print("=" ** 60 ++ "\n\n", .{});
+    std.debug.print(@as([60]u8, @splat('=')) ++ "\n\n", .{});
 
     // ========================================================================
     // 配置文件说明

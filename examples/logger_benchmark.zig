@@ -59,9 +59,9 @@ fn benchmarkActual(iterations: usize, thread_safe: bool) !void {
 }
 
 pub fn main() !void {
-    std.debug.print("\n" ++ "=" ** 70 ++ "\n", .{});
+    std.debug.print("\n" ++ @as([70]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("Logger 性能基准测试\n", .{});
-    std.debug.print("=" ** 70 ++ "\n", .{});
+    std.debug.print(@as([70]u8, @splat('=')) ++ "\n", .{});
 
     // 测试 1: 过滤场景（测量最小开销）
     std.debug.print("\n【测试 1】过滤场景 (日志被过滤，几乎无开销)\n", .{});
@@ -76,11 +76,11 @@ pub fn main() !void {
     std.debug.print("\n启用线程安全...\n", .{});
     try benchmarkActual(1_000, true);
 
-    std.debug.print("\n" ++ "=" ** 70 ++ "\n", .{});
+    std.debug.print("\n" ++ @as([70]u8, @splat('=')) ++ "\n", .{});
     std.debug.print("结论:\n", .{});
     std.debug.print("1. 被过滤的日志几乎无开销 (~5 ns)\n", .{});
     std.debug.print("2. 线程安全开关对过滤日志无影响\n", .{});
     std.debug.print("3. 实际输出时，IO 是主要瓶颈 (10-100 μs)\n", .{});
     std.debug.print("4. 线程安全锁开销相比 IO 可以忽略\n", .{});
-    std.debug.print("=" ** 70 ++ "\n\n", .{});
+    std.debug.print(@as([70]u8, @splat('=')) ++ "\n\n", .{});
 }

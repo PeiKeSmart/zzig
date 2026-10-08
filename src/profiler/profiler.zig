@@ -242,7 +242,8 @@ pub const Profiler = struct {
 
         // 打印 Top 10
         std.debug.print("{s:<30} {s:>10} {s:>15} {s:>15} {s:>15}\n", .{ "Zone", "Calls", "Avg (μs)", "Min (μs)", "Max (μs)" });
-        std.debug.print("{s}\n", .{"-" ** 85});
+        const separator: [85]u8 = @splat('-');
+        std.debug.print("{s}\n", .{separator});
 
         const top_n = @min(10, entries.items.len);
         for (entries.items[0..top_n]) |entry| {

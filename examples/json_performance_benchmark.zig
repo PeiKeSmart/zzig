@@ -284,7 +284,7 @@ pub fn main() !void {
             @as(f64, @floatFromInt(result_original.heap_allocations)) * 100.0;
         std.debug.print("    堆分配减少: {d:.1}%\n", .{alloc_reduction});
 
-        std.debug.print("\n{s}\n\n", .{"=" ** 60});
+        std.debug.print("\n{s}\n\n", .{@as([60]u8, @splat('='))});
     }
 
     // 内存占用对比

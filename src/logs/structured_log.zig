@@ -182,7 +182,7 @@ pub const StructuredLog = struct {
     /// comptime 查表：标记所有需要 JSON 转义的字节（0=无需转义，1=需转义）
     /// 包含 0-31 控制字符、'"'、'\\'，单次 bool 查表代替 6 次比较
     const JSON_ESCAPE_TABLE: [256]bool = blk: {
-        var table = [_]bool{false} ** 256;
+        var table: [256]bool = @splat(false);
         // 控制字符 0-31 全部需要转义
         var i: u8 = 0;
         while (i < 32) : (i += 1) table[i] = true;

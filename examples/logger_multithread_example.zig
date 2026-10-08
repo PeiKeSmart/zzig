@@ -9,7 +9,7 @@ fn workerThread(thread_id: usize) void {
         zzig.Logger.debug("线程 {d} - 调试信息 {d}", .{ thread_id, i });
 
         // 模拟一些工作
-        std.time.sleep(10 * std.time.ns_per_ms);
+        zzig.compat.sleep(10 * std.time.ns_per_ms);
     }
 }
 
@@ -30,8 +30,8 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("\n" ++ "=" ** 50 ++ "\n\n", .{});
-    std.time.sleep(100 * std.time.ns_per_ms);
+    std.debug.print("\n" ++ @as([50]u8, @splat('=')) ++ "\n\n", .{});
+    zzig.compat.sleep(100 * std.time.ns_per_ms);
 
     // 测试 2: 启用线程安全
     std.debug.print("【测试 2】启用线程安全（日志应该完整且不交错）\n", .{});

@@ -8,7 +8,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("\n🚀 异步日志文件输出测试\n", .{});
-    std.debug.print("=" ** 60 ++ "\n\n", .{});
+    std.debug.print(@as([60]u8, @splat('=')) ++ "\n\n", .{});
 
     // 从配置文件初始化 (不存在则自动生成)
     var logger = try zzig.AsyncLogger.AsyncLogger.initFromConfigFile(

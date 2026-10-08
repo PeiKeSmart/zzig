@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     switch (current_zig.minor) {
         15 => versions.build(b),
         16 => versions.build(b),
+        17 => versions.build(b),
         else => @compileError("unknown version!"),
     }
 }
