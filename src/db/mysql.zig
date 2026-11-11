@@ -307,6 +307,21 @@ pub const Conn = struct {
     /// 压缩协议的读缓冲：已解压、待解析的内层字节流
     rbuf: std.ArrayList(u8) = .empty,
     rpos: usize = 0,
+    /// 预处理语句缓存（按 SQL 文本复用 `COM_STMT_PREPARE` 的结果）。
+    /// 0 = 关闭；默认 32 条（热点 ORM 语句通常个位数）。
+    stmt_cache: std.ArrayListUnmanaged(CachedStmt) = .empty,
+    stmt_cache_limit: usize = 32,
+    stmt_cache_hits: usize = 0,
+    stmt_cache_misses: usize = 0,
+
+    const CachedStmt = struct {
+        /// 服务端语句句柄
+        id: u32,
+        num_columns: u16,
+        num_params: u16,
+        /// SQL 文本（自己持有，和 arena 生命周期无关）
+        sql: []const u8,
+    };
 
     // ── 基本信息 ────────────────────────────────────────────────────────────
     pub fn serverVersion(self: *const Conn) []const u8 {
@@ -409,10 +424,39 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Conn) void {
+        // 先关服务端语句句柄，再断连接（顺序反了会白发一堆 COM_STMT_CLOSE）
+        self.clearStmtCache();
         self.closeQuietly();
         self.pkt.deinit(self.gpa);
         self.wbuf.deinit(self.gpa);
         self.rbuf.deinit(self.gpa);
+        // 缓存链表自身的缓冲也要还回去（`clearStmtCache` 只清条目、故意保留容量）
+        self.stmt_cache.deinit(self.gpa);
+    }
+
+    /// 清空预处理语句缓存（关闭服务端句柄并释放 SQL 副本）。
+    pub fn clearStmtCache(self: *Conn) void {
+        for (self.stmt_cache.items) |e| {
+            if (self.closed) break;
+            self.closeStatement(e.id);
+            self.gpa.free(e.sql);
+        }
+        self.stmt_cache.clearRetainingCapacity();
+    }
+
+    /// 设置预处理语句缓存上限（0 = 关闭缓存）。返回前会把超出部分关掉。
+    pub fn setStmtCacheLimit(self: *Conn, limit: usize) void {
+        self.stmt_cache_limit = limit;
+        while (self.stmt_cache.items.len > limit) {
+            const e = self.stmt_cache.orderedRemove(0);
+            self.closeStatement(e.id);
+            self.gpa.free(e.sql);
+        }
+    }
+
+    /// 缓存统计（命中/未命中/当前条数），用于观察热点 SQL 是否真的被复用。
+    pub fn stmtCacheStats(self: *const Conn) struct { hits: usize, misses: usize, size: usize } {
+        return .{ .hits = self.stmt_cache_hits, .misses = self.stmt_cache_misses, .size = self.stmt_cache.items.len };
     }
 
     fn closeQuietly(self: *Conn) void {
@@ -556,9 +600,47 @@ pub const Conn = struct {
         return self.readResponse(arena, null);
     }
 
+    /// 带参语句：**优先复用已缓存的预处理语句**（省掉每次的 prepare/close 往返）。
+    ///
+    /// 缓存键是 SQL 文本本身；语句句柄是**连接私有**的，所以缓存挂在 `Conn` 上、
+    /// 断开/重连自然失效。命中失败（服务端已丢弃句柄）时的处理见 `executeStatementCached`。
     fn queryPrepared(self: *Conn, arena: std.mem.Allocator, sql: []const u8, params: []const Value) !Result {
+        if (self.stmt_cache_limit > 0) {
+            for (self.stmt_cache.items) |e| {
+                if (std.mem.eql(u8, e.sql, sql)) {
+                    self.stmt_cache_hits += 1;
+                    return self.executeStatement(arena, .{ .id = e.id, .num_columns = e.num_columns, .num_params = e.num_params }, params);
+                }
+            }
+            self.stmt_cache_misses += 1;
+        }
+
         const prepared = try self.prepareStatement(arena, sql);
-        defer self.closeStatement(prepared.id);
+        if (self.stmt_cache_limit == 0) {
+            defer self.closeStatement(prepared.id);
+            return self.executeStatement(arena, prepared, params);
+        }
+        // 满了先按 FIFO 关掉最旧的一条（热点语句很快稳定，FIFO 足够且实现简单）
+        while (self.stmt_cache.items.len >= self.stmt_cache_limit) {
+            const old = self.stmt_cache.orderedRemove(0);
+            self.closeStatement(old.id);
+            self.gpa.free(old.sql);
+        }
+        const owned_sql = self.gpa.dupe(u8, sql) catch |e| {
+            self.closeStatement(prepared.id);
+            return e;
+        };
+        self.stmt_cache.append(self.gpa, .{
+            .id = prepared.id,
+            .num_columns = prepared.num_columns,
+            .num_params = prepared.num_params,
+            .sql = owned_sql,
+        }) catch |e| {
+            self.closeStatement(prepared.id);
+            self.gpa.free(owned_sql);
+            return e;
+        };
+        // 入缓存后不再关句柄；后续执行失败也不主动清（MySQL 允许错误后继续复用同一句柄）
         return self.executeStatement(arena, prepared, params);
     }
 
