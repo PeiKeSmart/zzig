@@ -24,9 +24,17 @@
 //!   Rust `Pek.RCode` 用大端，两者不一致，已记入 `docs/决策记录.md` 待真库确认）。
 //!
 //! 未实现（明确不静默降级）：
-//! - **TLS**：`CLIENT_SSL` 不发送。内网明文场景够用；跨公网请走 SSH 隧道或反代。
-//! - **压缩协议**（`CLIENT_COMPRESS`）、**LOCAL INFILE**、**连接池**（池化在上层做）。
+//! - **压缩协议**（`CLIENT_COMPRESS`）、**连接池**（池化在上层做）。
 //! - `authentication_webauthn_client` 等新插件：显式 `error.UnsupportedAuthPlugin`。
+//!
+//! TLS（`CLIENT_SSL`，2026-11-11 起）：
+//! - `SslMode=Disabled`：明文（不声明 `CLIENT_SSL`）；
+//! - `SslMode=Preferred`（**缺省**）：服务端声明 SSL 就走 TLS，没声明就明文；
+//!   TLS 握手失败（证书/协议问题）时**整条重连一次明文**并在 stderr 说明原因。
+//! - `SslMode=Required`：只加密，不校验证书链与主机名；
+//! - `SslMode=VerifyCA`：校验证书链（`SslCa`/`CertificateFile` 或系统根证书），不校验主机名；
+//! - `SslMode=VerifyFull`：证书链 + 主机名全校验（主机名取连接串的 `Server`）。
+//! 与 C# MySqlConnector 的取值与默认值一致；`SslMode=None` 等价 `Disabled`。
 //!
 //! 线程模型：`Conn` **不是**线程安全的，一条连接同一时刻只能被一个线程使用（与 sqlite 驱动一致）。
 
@@ -36,6 +44,9 @@ const Value = @import("value.zig").Value;
 const Row = @import("row.zig").Row;
 const Decimal = @import("../number/decimal.zig").Decimal;
 const DateTime = @import("../time/datetime.zig").DateTime;
+/// TLS 客户端：std 副本 + 补「服务端请求客户端证书（CertificateRequest）」的处理。
+/// MySQL 8 默认配了 `ssl_ca`，握手必发该消息，std 不处理会直接连不上（见 `tls_client.zig` 头部）。
+const tls_client = @import("tls_client.zig");
 
 pub const default_port: u16 = 3306;
 
@@ -52,6 +63,8 @@ const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 /// 允许 `LOAD DATA LOCAL INFILE` 由客户端发送数据（服务端不开时协商不上，调用处会明确报错）
 const CLIENT_LOCAL_FILES: u32 = 0x0000_0080;
+/// 走 TLS：先发 `SSLRequest`，再在**同一条 TCP** 上换 TLS（MySQL 的 TLS 升级方式）
+const CLIENT_SSL: u32 = 0x0000_0800;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
@@ -159,6 +172,41 @@ pub const Result = union(enum) {
     rows: Rows,
 };
 
+/// TLS 档位（与 C# MySqlConnector 的 `SslMode` 一一对应）。
+pub const SslMode = enum {
+    /// 明文连接（不声明 `CLIENT_SSL`）
+    disabled,
+    /// 缺省：服务端声明 SSL 就加密；TLS 握手失败时回退明文重连一次
+    preferred,
+    /// 只加密，不校验证书（内网自签场景的常态）
+    required,
+    /// 校验证书链，不校验主机名（自签 CA + IP 直连的常态）
+    verify_ca,
+    /// 证书链 + 主机名全校验（公网域名的常态）
+    verify_full,
+
+    /// 解析连接串取值（忽略大小写；`None` 等价 `Disabled`，与 MySqlConnector 一致）。
+    /// 无法识别时返回 null，由调用方决定报错还是忽略。
+    pub fn parse(raw: []const u8) ?SslMode {
+        const v = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(v, "none") or std.ascii.eqlIgnoreCase(v, "disabled") or
+            std.ascii.eqlIgnoreCase(v, "false") or std.mem.eql(u8, v, "0")) return .disabled;
+        if (std.ascii.eqlIgnoreCase(v, "preferred") or std.ascii.eqlIgnoreCase(v, "prefered") or
+            std.ascii.eqlIgnoreCase(v, "true") or std.mem.eql(u8, v, "1")) return .preferred;
+        if (std.ascii.eqlIgnoreCase(v, "required") or std.mem.eql(u8, v, "2")) return .required;
+        if (std.ascii.eqlIgnoreCase(v, "verifyca") or std.ascii.eqlIgnoreCase(v, "verify-ca") or
+            std.ascii.eqlIgnoreCase(v, "verify_ca") or std.mem.eql(u8, v, "3")) return .verify_ca;
+        if (std.ascii.eqlIgnoreCase(v, "verifyfull") or std.ascii.eqlIgnoreCase(v, "verify-full") or
+            std.ascii.eqlIgnoreCase(v, "verify_full") or std.mem.eql(u8, v, "4")) return .verify_full;
+        return null;
+    }
+
+    /// 是否需要校验服务端证书（`required` 只加密不校验）
+    pub fn verifiesCertificate(self: SslMode) bool {
+        return self == .verify_ca or self == .verify_full;
+    }
+};
+
 /// 连接参数（与 XCode 连接串一一对应，解析在上层做）。
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",
@@ -168,6 +216,11 @@ pub const Options = struct {
     database: []const u8 = "",
     /// 45 = utf8mb4_general_ci（5.7 与 8.0 都有）；55 = utf8mb4_0900_ai_ci 仅 8.0+
     charset: u8 = 45,
+    /// TLS 档位（缺省 `preferred`：服务端支持就加密，属于「更安全且不会连不上」的一档）
+    ssl_mode: SslMode = .preferred,
+    /// 根证书文件（PEM，绝对路径优先；相对路径按当前目录解析）。仅 `verify_ca`/`verify_full` 用；
+    /// 留空则用系统根证书。
+    ssl_ca: []const u8 = "",
 };
 
 pub const Error = error{
@@ -179,6 +232,36 @@ pub const Error = error{
     AuthRequiresFullAuth,
     LocalInfileNotSupported,
     NotImplemented,
+    /// 连接串要求 TLS，但服务端未声明 `CLIENT_SSL`
+    TlsNotSupported,
+};
+
+/// TLS 会话状态（堆分配，见 `Conn.tls` 的注释）。
+const TlsState = struct {
+    client: tls_client.Client,
+    /// `Client.Options.ca.bundle` 要求稳定的锁与证书束地址 → 跟着状态一起住堆上
+    lock: std.Io.RwLock = std.Io.RwLock.init,
+    ca: std.crypto.Certificate.Bundle = .empty,
+    /// 握手失败时由 TLS 层写入具体告警（`TlsAlert` 场景据此说明是证书还是协议问题）
+    alert: std.crypto.tls.Alert = .{ .level = .warning, .description = .close_notify },
+    stream_reader: std.Io.net.Stream.Reader,
+    stream_writer: std.Io.net.Stream.Writer,
+    /// 四块缓冲一次性分配（socket 读 / socket 写 / 明文读 / 明文写）
+    bufs: []u8,
+
+    /// socket 侧缓冲：TLS 要求输入 Reader 的容量 ≥ `min_buffer_len`
+    const socket_buf_len = tls_client.Client.min_buffer_len;
+    /// 明文侧缓冲（写多小、读多大）：写缓冲太小会每包一次 TLS record
+    const app_read_extra = 8 * 1024;
+    const app_write_len = 8 * 1024;
+
+    fn destroy(self: *TlsState, gpa: std.mem.Allocator) void {
+        // close_notify：告知对端「正常结束」而不是被截断（失败也不影响关闭）
+        self.client.end() catch {};
+        self.ca.deinit(gpa);
+        gpa.free(self.bufs);
+        gpa.destroy(self);
+    }
 };
 
 pub const Conn = struct {
@@ -204,6 +287,9 @@ pub const Conn = struct {
     closed: bool = false,
     /// 读写已报错（连接不可用）：关闭时不再尝试发 COM_QUIT，否则 Windows 会抛断连状态
     broken: bool = false,
+    /// TLS 会话（`null` = 明文）。**堆分配**：`Client` 内部持有指向 Reader/Writer 的指针，
+    /// 而 `Conn` 是按值返回的，栈上地址会随复制失效。
+    tls: ?*TlsState = null,
 
     // ── 基本信息 ────────────────────────────────────────────────────────────
     pub fn serverVersion(self: *const Conn) []const u8 {
@@ -251,7 +337,26 @@ pub const Conn = struct {
 
     // ── 连接 ────────────────────────────────────────────────────────────────
     /// 建立连接并完成鉴权。失败时 `lastError()` 有具体原因（含错误码 / SQLSTATE）。
+    ///
+    /// `SslMode`：`disabled` 明文；`preferred`（缺省）优先 TLS、失败则重连一次明文；
+    /// `required`/`verify_ca`/`verify_full` 只走 TLS，不做明文降级。
     pub fn open(gpa: std.mem.Allocator, opts: Options) !Conn {
+        return switch (opts.ssl_mode) {
+            .disabled => openOnce(gpa, opts, false),
+            .required, .verify_ca, .verify_full => openOnce(gpa, opts, true),
+            .preferred => openOnce(gpa, opts, true) catch |e| {
+                // 第一条连接已经失败：把 TLS 侧的真实原因打出来再重连，
+                // 否则「SSL 明明开了却连上明文」这类问题永远排查不到
+                std.debug.print(
+                    "[zzig.mysql] TLS 建连失败（{s}），按 SslMode=Preferred 回退明文重连：{s}:{d}\n",
+                    .{ @errorName(e), opts.host, opts.port },
+                );
+                return openOnce(gpa, opts, false);
+            },
+        };
+    }
+
+    fn openOnce(gpa: std.mem.Allocator, opts: Options, use_tls: bool) !Conn {
         const io = compat.currentIo();
         const address = std.Io.net.IpAddress.resolve(io, opts.host, opts.port) catch |e| {
             std.debug.print("[zzig.mysql] 解析主机失败：host={s} port={d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
@@ -263,9 +368,13 @@ pub const Conn = struct {
         };
 
         var self = Conn{ .gpa = gpa, .io = io, .stream = stream };
-        errdefer self.closeQuietly();
+        // 失败时不仅要关 socket，还要释放包缓冲（TLS 状态由 closeQuietly 一并释放）
+        errdefer {
+            self.closeQuietly();
+            self.pkt.deinit(gpa);
+        }
 
-        self.handshake(opts) catch |e| {
+        self.handshake(opts, use_tls) catch |e| {
             // 握手阶段失败：把协议层细节补齐到 lastError，避免只看到一个 error 名
             if (self.err_len == 0) {
                 self.setError("握手/鉴权失败（{s}:{d} 用户 {s}）：{s}", .{ opts.host, opts.port, opts.user, @errorName(e) });
@@ -275,6 +384,11 @@ pub const Conn = struct {
             return e;
         };
         return self;
+    }
+
+    /// 本条连接是否走了 TLS（诊断/日志用）。
+    pub fn isTls(self: *const Conn) bool {
+        return self.tls != null;
     }
 
     pub fn deinit(self: *Conn) void {
@@ -288,6 +402,11 @@ pub const Conn = struct {
         // COM_QUIT：尽力而为，对端已断也不报错（连接已坏时干脆不发，避开 Windows 断连状态）
         self.seq = 0;
         if (!self.broken) self.writePacket(&[_]u8{COM_QUIT}) catch {};
+        // TLS 侧还要发 close_notify 并释放状态（`destroy` 内部已 catch）
+        if (self.tls) |st| {
+            st.destroy(self.gpa);
+            self.tls = null;
+        }
         self.stream.close(self.io);
     }
 
@@ -636,7 +755,7 @@ pub const Conn = struct {
     }
 
     // ── 握手与鉴权 ──────────────────────────────────────────────────────────
-    fn handshake(self: *Conn, opts: Options) !void {
+    fn handshake(self: *Conn, opts: Options, use_tls: bool) !void {
         self.seq = 0;
         const pkt = try self.readPacket();
         const hs = try parseHandshake(pkt);
@@ -661,7 +780,22 @@ pub const Conn = struct {
         if (opts.database.len > 0) flags |= CLIENT_CONNECT_WITH_DB;
         // 只在服务端支持的范围内起作用
         flags &= hs.capability | CLIENT_CONNECT_WITH_DB;
+
+        // TLS：服务端必须声明 CLIENT_SSL 才可能加密（标志位要同时进 SSLRequest 与正式响应）
+        if (use_tls) {
+            if ((hs.capability & CLIENT_SSL) != 0) {
+                flags |= CLIENT_SSL;
+            } else if (opts.ssl_mode != .preferred) {
+                self.setError(
+                    "服务端未启用 SSL（capability=0x{x}），但连接串要求 SslMode={s}；请在服务端开启 TLS 或改为 SslMode=None",
+                    .{ hs.capability, @tagName(opts.ssl_mode) },
+                );
+                return error.TlsNotSupported;
+            }
+            // SslMode=Preferred 且服务端没开 SSL：按语义直接走明文（不需要额外重连）
+        }
         self.client_capabilities = flags;
+        const want_tls = (flags & CLIENT_SSL) != 0;
 
         // 注意：`hs.auth_plugin_name` 借用的是复用包缓冲（`self.pkt`），后续任何 readPacket
         // 都会覆盖它 → 必须拷贝到自己缓冲再用，否则鉴权往返时插件名变成垃圾字节。
@@ -673,6 +807,17 @@ pub const Conn = struct {
 
         var auth_buf: [32]u8 = undefined;
         const auth = try self.authResponse(plugin, opts.password, hs.auth_plugin_data[0..hs.auth_plugin_data_len], &auth_buf);
+
+        if (want_tls) {
+            // `SSLRequest`：32 字节（能力位 + 最大包长 + 字符集 + 23 字节 0），序号与握手连续。
+            // 它**就是**一个缩短的握手响应；服务端收到后立即开始 TLS 协商。
+            var ssl_req: [32]u8 = @splat(0);
+            std.mem.writeInt(u32, ssl_req[0..4], flags, .little);
+            std.mem.writeInt(u32, ssl_req[4..8], max_packet_size, .little);
+            ssl_req[8] = opts.charset;
+            try self.writePacket(&ssl_req);
+            try self.establishTls(opts);
+        }
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
@@ -701,6 +846,87 @@ pub const Conn = struct {
 
         try self.writePacket(buf.items);
         try self.finishAuth(opts, plugin, hs.auth_plugin_data[0..hs.auth_plugin_data_len]);
+    }
+
+    /// 在同一条 TCP 上把明文升级成 TLS。
+    ///
+    /// MySQL 的做法是：客户端先发 32 字节 `SSLRequest`（一个缩短的握手响应），
+    /// 服务端确认后双方**立即**在这条连接上开始 TLS 协商，之后的包全部走加密。
+    /// 失败时不静默降级：`required`/`verify_ca`/`verify_full` 直接抛错；
+    /// `preferred` 由 `open()` 回退明文重连一次。
+    fn establishTls(self: *Conn, opts: Options) !void {
+        const gpa = self.gpa;
+        const app_read_len = TlsState.socket_buf_len + TlsState.app_read_extra;
+        const total = TlsState.socket_buf_len * 2 + app_read_len + TlsState.app_write_len;
+        const bufs = gpa.alloc(u8, total) catch |e| {
+            self.setError("分配 TLS 缓冲（{d} 字节）失败：{s}", .{ total, @errorName(e) });
+            return e;
+        };
+        errdefer gpa.free(bufs);
+
+        const socket_read_buf = bufs[0..TlsState.socket_buf_len];
+        const socket_write_buf = bufs[TlsState.socket_buf_len..][0..TlsState.socket_buf_len];
+        const tls_read_buf = bufs[TlsState.socket_buf_len * 2 ..][0..app_read_len];
+        const tls_write_buf = bufs[TlsState.socket_buf_len * 2 + app_read_len ..][0..TlsState.app_write_len];
+
+        const st = gpa.create(TlsState) catch |e| {
+            self.setError("分配 TLS 状态失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        errdefer gpa.destroy(st);
+
+        st.* = .{
+            .client = undefined,
+            .stream_reader = self.stream.reader(self.io, socket_read_buf),
+            .stream_writer = self.stream.writer(self.io, socket_write_buf),
+            .bufs = bufs,
+        };
+
+        const now = std.Io.Clock.real.now(self.io);
+
+        // 只有 VerifyCA / VerifyFull 才需要根证书；Required 只加密
+        const need_ca = opts.ssl_mode.verifiesCertificate();
+        errdefer if (need_ca) st.ca.deinit(gpa);
+        if (need_ca) {
+            loadTrustedCa(&st.ca, gpa, self.io, now, opts.ssl_ca) catch |e| {
+                self.setError(
+                    "加载根证书失败（SslCa={s}）：{s}",
+                    .{ if (opts.ssl_ca.len > 0) opts.ssl_ca else "系统根证书", @errorName(e) },
+                );
+                return e;
+            };
+        }
+
+        var entropy: [tls_client.Client.Options.entropy_len]u8 = undefined;
+        self.io.random(&entropy);
+
+        st.client = tls_client.Client.init(
+            &st.stream_reader.interface,
+            &st.stream_writer.interface,
+            .{
+                // VerifyFull 校主机名；VerifyCA 只校链
+                .host = if (opts.ssl_mode == .verify_full) .{ .explicit = opts.host } else .no_verification,
+                .ca = if (opts.ssl_mode.verifiesCertificate())
+                    .{ .bundle = .{ .gpa = gpa, .io = self.io, .lock = &st.lock, .bundle = &st.ca } }
+                else
+                    .no_verification,
+                .read_buffer = tls_read_buf,
+                .write_buffer = tls_write_buf,
+                .entropy = &entropy,
+                .realtime_now = now,
+                .alert = &st.alert,
+                // MySQL 报文自带长度字段，截断会被协议层发现 → 允许把 EOF 原样透传上来
+                .allow_truncation_attacks = true,
+            },
+        ) catch |e| {
+            self.broken = true;
+            self.setError(
+                "TLS 握手失败（{s}；SslMode={s}，主机 {s}，告警 {s}/{s}）",
+                .{ @errorName(e), @tagName(opts.ssl_mode), opts.host, @tagName(st.alert.level), @tagName(st.alert.description) },
+            );
+            return e;
+        };
+        self.tls = st;
     }
 
     fn finishAuth(self: *Conn, opts: Options, initial_plugin: []const u8, initial_scramble: []const u8) !void {
@@ -875,23 +1101,7 @@ pub const Conn = struct {
     fn readExact(self: *Conn, dst: []u8) !void {
         var got: usize = 0;
         while (got < dst.len) {
-            // 不用 `Stream.read`：0.17 里它对 `net_read` 的返回值做了不支持的解构（编译报错）。
-            // 直接走 `io.operate`，拿 `data_len`。
-            var slices = [_][]u8{dst[got..]};
-            const r = self.io.operate(.{ .net_read = .{
-                .socket_handle = self.stream.socket.handle,
-                .data = &slices,
-            } }) catch |e| {
-                self.broken = true;
-                self.setError("读 socket 失败：{s}", .{@errorName(e)});
-                return e;
-            };
-            const res = r.net_read catch |e| {
-                self.broken = true;
-                self.setError("读 socket 失败：{s}", .{@errorName(e)});
-                return e;
-            };
-            const n = res.data_len;
+            const n = try self.readSome(dst[got..]);
             if (n == 0) {
                 self.broken = true;
                 self.setError("连接被对端关闭（已读 {d}/{d} 字节）", .{ got, dst.len });
@@ -899,6 +1109,59 @@ pub const Conn = struct {
             }
             got += n;
         }
+    }
+
+    /// 读一段（返回 0 = 对端已关）。明文直接走 socket；TLS 走 TLS Reader。
+    fn readSome(self: *Conn, dst: []u8) !usize {
+        if (self.tls) |st| {
+            var slices = [_][]u8{dst};
+            // 注意：TLS 层返回 0 **不等于**对端关闭 —— 它可能只是消费了几个控制记录
+            // （NewSessionTicket / KeyUpdate）而没产出应用数据；必须继续读，
+            // 只有 `EndOfStream` 或收到 `close_notify` 才算关闭。
+            var rounds: usize = 0;
+            while (true) {
+                const n = st.client.reader.readVec(&slices) catch |e| {
+                    if (e == error.EndOfStream) return 0;
+                    self.broken = true;
+                    // ReadFailed 包裹了底层原因：两个来源都看一眼，不把 TLS 错误写成「对端关闭」
+                    const cause: []const u8 = if (st.client.read_err) |c|
+                        @errorName(c)
+                    else if (st.stream_reader.err) |c|
+                        @errorName(c)
+                    else
+                        "无";
+                    self.setError(
+                        "TLS 读失败：{s}（底层 {s}，对端告警 {s}，本次请求 {d} 字节）",
+                        .{ @errorName(e), cause, alertText(st.client.alert), dst.len },
+                    );
+                    return e;
+                };
+                if (n > 0) return n;
+                if (st.client.received_close_notify) return 0;
+                rounds += 1;
+                if (rounds > 64) {
+                    self.setError("TLS 读循环 {d} 轮仍无应用数据（疑似对端持续发送控制记录）", .{rounds});
+                    return error.Protocol;
+                }
+            }
+        }
+        // 不用 `Stream.read`：0.17 里它对 `net_read` 的返回值做了不支持的解构（编译报错）。
+        // 直接走 `io.operate`，拿 `data_len`。
+        var slices = [_][]u8{dst};
+        const r = self.io.operate(.{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = &slices,
+        } }) catch |e| {
+            self.broken = true;
+            self.setError("读 socket 失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        const res = r.net_read catch |e| {
+            self.broken = true;
+            self.setError("读 socket 失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        return res.data_len;
     }
 
     fn writePacket(self: *Conn, payload: []const u8) !void {
@@ -916,6 +1179,7 @@ pub const Conn = struct {
             off += chunk;
             if (chunk < max_payload) break;
         }
+        try self.flushOut();
     }
 
     /// 发送**恰好一个**包（不自动分块、不补空包）。
@@ -935,9 +1199,36 @@ pub const Conn = struct {
         self.seq +%= 1;
         try self.writeAll(&hdr);
         if (payload.len > 0) try self.writeAll(payload);
+        try self.flushOut();
+    }
+
+    /// 把缓冲刷到对端。明文路径每次 `writeAll` 已经写到 socket，这里什么也不做；
+    /// TLS 路径必须两步：先让 TLS 加密并写进 socket Writer，再刷 socket Writer。
+    fn flushOut(self: *Conn) !void {
+        const st = self.tls orelse return;
+        st.client.writer.flush() catch |e| {
+            self.broken = true;
+            self.setError("TLS 发送失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        st.stream_writer.interface.flush() catch |e| {
+            self.broken = true;
+            self.setError("发送失败（{d} 字节待发）：{s}", .{ st.stream_writer.interface.buffered().len, @errorName(e) });
+            return e;
+        };
     }
 
     fn writeAll(self: *Conn, bytes: []const u8) !void {
+        if (self.tls) |st| {
+            // 不在这里 flush：一个 MySQL 包由「4 字节头 + 载荷」两次 writeAll 组成，
+            // 中途 flush 会变成两个 TLS record（多一次小包往返）
+            st.client.writer.writeAll(bytes) catch |e| {
+                self.broken = true;
+                self.setError("TLS 写失败：{s}", .{@errorName(e)});
+                return e;
+            };
+            return;
+        }
         var sent: usize = 0;
         while (sent < bytes.len) {
             const result = self.io.operate(.{ .net_write = .{
@@ -963,10 +1254,35 @@ pub const Conn = struct {
     }
 };
 
+/// 握手/读阶段的对端告警（`Client.alert` 只在收到告警时才有值）。
+fn alertText(a: ?std.crypto.tls.Alert) []const u8 {
+    const v = a orelse return "无";
+    return @tagName(v.description);
+}
+
+/// 装载信任根：给了 `SslCa`/`CertificateFile` 就用它（绝对路径直接开，相对路径按当前目录），
+/// 否则用系统根证书（Windows 证书库 / Linux 常见 CA 目录）。
+fn loadTrustedCa(
+    cb: *std.crypto.Certificate.Bundle,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    now: std.Io.Timestamp,
+    ca_path: []const u8,
+) !void {
+    if (ca_path.len == 0) {
+        try cb.rescan(gpa, io, now);
+    } else if (std.fs.path.isAbsolute(ca_path)) {
+        try cb.addCertsFromFilePathAbsolute(gpa, io, now, ca_path);
+    } else {
+        try cb.addCertsFromFilePath(gpa, io, now, std.Io.Dir.cwd(), ca_path);
+    }
+    // 空证书束会让校验「永远失败但看不出原因」，这里直接拒掉并给出路径
+    if (cb.bytes.items.len == 0) return error.EmptyCertificateBundle;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // 鉴权散列（与 MySQL 服务端算法字节级一致）
 // ══════════════════════════════════════════════════════════════════════════
-
 /// `mysql_native_password`：`SHA1(pwd) XOR SHA1(scramble ++ SHA1(SHA1(pwd)))`
 pub fn nativePasswordScramble(password: []const u8, scramble: []const u8) [20]u8 {
     const Sha1 = std.crypto.hash.Sha1;
