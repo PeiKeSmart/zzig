@@ -1,29 +1,32 @@
 //! MySQL 驱动（**绿色版：纯 wire protocol 实现，不加载 libmysqlclient**）。
 //!
-//! 参考实现：Rust `Pek.RCode/src/mysql.rs`（用 `mysql` crate，同样是纯协议）与
-//! C# `DH.NCode/DH.NCode/MySql.cs`（MySqlConnector）。本模块只做「连得上、发得出、读得回」，
-//! SQL 语义、建表、反查等全部由上层（ORM）负责。
+//! 参考实现（**口径以 C# 绿色版为准**）：
+//! - C# `G:\Code\Pek.FrameWork\DH.MySql`（自实现协议，`Authentication.cs` / `MySqlFieldCodec.cs` / `Messages\ClientFlags.cs`）；
+//! - Rust `Pek.RCode/src/mysql.rs`（`mysql` crate，同为纯协议，作为补充对照）。
+//! 本模块只做「连得上、发得出、读得回」，SQL 语义、建表、反查等全部由上层（ORM）负责。
 //!
 //! 已实现：
 //! - 握手 v10 解析 + `HandshakeResponse41`
-//! - 鉴权：`mysql_native_password`（完整）、`caching_sha2_password`（**仅 fast auth**，
-//!   见下方限制）
+//! - 鉴权：`mysql_native_password`（完整）、`caching_sha2_password`（**fast auth + 完整鉴权**：
+//!   请求公钥 → `RSAES-OAEP(SHA1)` 加密 `密码 XOR scramble` → 发送，见 `crypto/rsa.zig`）
 //! - `COM_QUERY`（文本协议）：无参语句 / DDL / 简单查询
 //! - `COM_STMT_PREPARE` + `COM_STMT_EXECUTE` + `COM_STMT_CLOSE`（二进制协议）：
 //!   带参语句，参数按 `Value` 类型绑定，结果按列类型解码
-//! - `COM_PING` / `COM_QUIT`
+//! - `COM_PING` / `COM_QUIT` / `COM_INIT_DB`
 //! - 值转换：整数/浮点/Decimal/日期时间/BIT/Blob/JSON 按 MySQL 协议类型还原
+//!
+//! 能力标志口径（与 `DH.MySql/Authentication.cs` 一致）：
+//! - **`CLIENT_FOUND_ROWS` 开启**：`affected_rows` 是「匹配行数」而非「变更行数」
+//!   （C# 侧注释 `// UseAffectedRows`；XCode 的 `Update` 返回值语义依赖这一档）。
+//! - **`CLIENT_MULTI_STATEMENTS` / `MULTI_RESULTS` / `PS_MULTI_RESULTS` 开启**：与 C# 一致，
+//!   多结果集会由 `drainMoreResults` 读掉。
+//! - BIT 值按**小端**字节序还原（`MySqlFieldCodec.ConvertBitBytesToUInt64` 口径；
+//!   Rust `Pek.RCode` 用大端，两者不一致，已记入 `docs/决策记录.md` 待真库确认）。
 //!
 //! 未实现（明确不静默降级）：
 //! - **TLS**：`CLIENT_SSL` 不发送。内网明文场景够用；跨公网请走 SSH 隧道或反代。
-//! - **`caching_sha2_password` 的 full auth**：明文连接下需要 RSA 公钥加密，本实现不做，
-//!   会返回 `error.AuthRequiresFullAuth` 并提示改用 `mysql_native_password`。注意
-//!   MySQL 8 只在**服务端已缓存该用户凭据**时才走 fast auth，所以新用户首次连接可能失败。
-//! - **`CLIENT_MULTI_STATEMENTS`**：刻意不开启（Rust 默认开启）。开启后一条 SQL 可带多语句，
-//!   对 ORM 无价值且放大注入面；不开启时服务端直接报语法错误。
-//! - **`CLIENT_FOUND_ROWS`**：刻意不开启，与 Rust 侧一致 —— `affected_rows` 是「实际变更行数」，
-//!   不是「匹配行数」。上层若需要「匹配行数」语义请自行判断。
-//! - 压缩协议、LOCAL INFILE、连接池（池化在上层做）。
+//! - **压缩协议**（`CLIENT_COMPRESS`）、**LOCAL INFILE**、**连接池**（池化在上层做）。
+//! - `authentication_webauthn_client` 等新插件：显式 `error.UnsupportedAuthPlugin`。
 //!
 //! 线程模型：`Conn` **不是**线程安全的，一条连接同一时刻只能被一个线程使用（与 sqlite 驱动一致）。
 
@@ -43,11 +46,16 @@ const max_payload: usize = 0xff_ffff;
 
 // ── capability flags ────────────────────────────────────────────────────────
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+/// 返回「匹配行数」而不是「变更行数」（C# 绿色版 `DH.MySql` 明确开启：`// UseAffectedRows`）
+const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
+const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
+const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 
 // ── commands ────────────────────────────────────────────────────────────────
@@ -248,6 +256,8 @@ pub const Conn = struct {
             if (self.err_len == 0) {
                 self.setError("握手/鉴权失败（{s}:{d} 用户 {s}）：{s}", .{ opts.host, opts.port, opts.user, @errorName(e) });
             }
+            // 同时打到 stderr：运维看到的就是「哪一步 + 为什么」，不用回去加日志再复现
+            std.debug.print("[zzig.mysql] 连接/鉴权失败：{s}\n", .{self.lastError()});
             return e;
         };
         return self;
@@ -572,13 +582,21 @@ pub const Conn = struct {
         }
 
         var flags: u32 = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 |
-            CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+            CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH |
+            CLIENT_FOUND_ROWS | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS;
         if (opts.database.len > 0) flags |= CLIENT_CONNECT_WITH_DB;
         // 只在服务端支持的范围内起作用
         flags &= hs.capability | CLIENT_CONNECT_WITH_DB;
         self.client_capabilities = flags;
 
-        const plugin = if (hs.auth_plugin_name.len > 0) hs.auth_plugin_name else "mysql_native_password";
+        // 注意：`hs.auth_plugin_name` 借用的是复用包缓冲（`self.pkt`），后续任何 readPacket
+        // 都会覆盖它 → 必须拷贝到自己缓冲再用，否则鉴权往返时插件名变成垃圾字节。
+        var plugin_buf: [64]u8 = undefined;
+        const plugin_src = if (hs.auth_plugin_name.len > 0) hs.auth_plugin_name else "mysql_native_password";
+        const plugin_len = @min(plugin_src.len, plugin_buf.len);
+        @memcpy(plugin_buf[0..plugin_len], plugin_src[0..plugin_len]);
+        const plugin = plugin_buf[0..plugin_len];
+
         var auth_buf: [32]u8 = undefined;
         const auth = try self.authResponse(plugin, opts.password, hs.auth_plugin_data[0..hs.auth_plugin_data_len], &auth_buf);
 
@@ -608,11 +626,12 @@ pub const Conn = struct {
         }
 
         try self.writePacket(buf.items);
-        try self.finishAuth(opts, plugin);
+        try self.finishAuth(opts, plugin, hs.auth_plugin_data[0..hs.auth_plugin_data_len]);
     }
 
-    fn finishAuth(self: *Conn, opts: Options, initial_plugin: []const u8) !void {
+    fn finishAuth(self: *Conn, opts: Options, initial_plugin: []const u8, initial_scramble: []const u8) !void {
         var plugin = initial_plugin;
+        var scramble = initial_scramble;
         var auth_buf: [32]u8 = undefined;
         var rounds: usize = 0;
         while (true) {
@@ -652,6 +671,7 @@ pub const Conn = struct {
                     self.seq = self.seq; // 保持当前序列号
                     try self.writePacket(auth);
                     plugin = new_plugin;
+                    scramble = new_scramble;
                     continue;
                 },
                 0x01 => {
@@ -663,13 +683,10 @@ pub const Conn = struct {
                             continue;
                         }
                         if (data.len == 1 and data[0] == 0x04) {
-                            self.setError(
-                                "服务端要求 caching_sha2_password 完整鉴权（{s}@{s}:{d}）：明文连接需要 RSA 公钥交换，本驱动未实现。" ++
-                                    "请改用 mysql_native_password 建用户（MySQL 8：CREATE USER ... IDENTIFIED WITH mysql_native_password BY '...'；" ++
-                                    "MySQL 8.4+ 需服务端开启 --mysql-native-password=ON），或改用 TLS 通道。",
-                                .{ opts.user, opts.host, opts.port },
-                            );
-                            return error.AuthRequiresFullAuth;
+                            // 完整鉴权：请求服务端公钥 → RSA-OAEP 加密 (密码 XOR scramble) → 发送
+                            // 与 C# 绿色版 `DH.MySql/Authentication.cs` 的 PerformFullAuthenticationAsync 一致
+                            try self.performFullAuth(opts.password, scramble);
+                            return;
                         }
                         self.setError("caching_sha2_password 返回未知状态字节 0x{x}", .{if (data.len > 0) data[0] else 0});
                         return error.Protocol;
@@ -685,10 +702,55 @@ pub const Conn = struct {
         }
     }
 
+    /// `caching_sha2_password` 完整鉴权（明文连接下的默认路径）：
+    /// 1. 发 `0x02`（request_public_key）；2. 收 `0x01` + PEM 公钥；
+    /// 3. `obf = password XOR scramble`；4. `RSAES-OAEP(SHA1)` 加密后发送；5. 收 OK。
+    /// 与 C# 绿色版 `DH.MySql/Authentication.cs` 的 `PerformFullAuthenticationAsync` 一致。
+    fn performFullAuth(self: *Conn, password: []const u8, scramble: []const u8) !void {
+        const rsa = @import("../crypto/rsa.zig");
+        if (scramble.len == 0) {
+            self.setError("完整鉴权失败：服务端未提供 scramble", .{});
+            return error.Protocol;
+        }
+
+        try self.writePacket(&[_]u8{0x02});
+        const key_pkt = try self.readPacket();
+        if (key_pkt.len < 2 or key_pkt[0] != 0x01) {
+            self.setError("请求公钥失败：期望 0x01 前缀，实际首字节 0x{x}（长度 {d}）", .{ if (key_pkt.len > 0) key_pkt[0] else 0, key_pkt.len });
+            return error.Protocol;
+        }
+        // key_pkt 指向复用缓冲；parsePublicKey 内部会拷贝并立即解析，不跨 readPacket 使用
+        var pub_key = rsa.parsePublicKey(self.gpa, key_pkt[1..]) catch |e| {
+            self.setError("解析服务端 RSA 公钥失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        defer pub_key.deinit();
+
+        const obf = try self.gpa.alloc(u8, password.len);
+        defer self.gpa.free(obf);
+        for (password, 0..) |b, i| obf[i] = b ^ scramble[i % scramble.len];
+
+        const cipher = rsa.oaepSha1Encrypt(self.gpa, self.io, pub_key, obf) catch |e| {
+            self.setError("RSA-OAEP 加密密码失败：{s}", .{@errorName(e)});
+            return e;
+        };
+        defer self.gpa.free(cipher);
+        try self.writePacket(cipher);
+
+        const ok_pkt = try self.readPacket();
+        if (ok_pkt.len == 0) return error.ConnectionClosed;
+        if (ok_pkt[0] == 0xff) return self.failFromPayload(ok_pkt);
+        if (ok_pkt[0] != 0x00) {
+            self.setError("完整鉴权响应异常：期望 OK，实际首字节 0x{x}", .{ok_pkt[0]});
+            return error.AuthFailed;
+        }
+        const ok = try parseOkPayload(ok_pkt);
+        self.applyOk(ok);
+    }
+
     fn authResponse(self: *Conn, plugin: []const u8, password: []const u8, scramble: []const u8, buf: *[32]u8) ![]const u8 {
         _ = self;
-        if (password.len == 0) return "";
-        if (std.mem.eql(u8, plugin, "mysql_native_password")) {
+        if (password.len == 0) return "";        if (std.mem.eql(u8, plugin, "mysql_native_password")) {
             const s = nativePasswordScramble(password, scramble);
             @memcpy(buf[0..20], &s);
             return buf[0..20];
@@ -1003,7 +1065,7 @@ pub fn parseColumnDef(payload: []const u8) !Column {
     const col_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
     pos += 4;
     if (pos + 1 > payload.len) return error.Protocol;
-    const ty: ColumnType = @enumFromInt(payload[pos]);
+    const ty: ColumnType = @fromBackingInt(@intCast(payload[pos]));
     pos += 1;
     if (pos + 2 > payload.len) return error.Protocol;
     const flags = std.mem.readInt(u16, payload[pos..][0..2], .little);
@@ -1088,10 +1150,12 @@ fn textValue(arena: std.mem.Allocator, col: Column, raw: []const u8) !Value {
             return .{ .datetime = dt };
         },
         .bit => {
-            // BIT(n) 在文本协议下是原始大端字节（C#/Rust 都还原成整数）
+            // 与 C# 绿色版 `DH.MySql` 口径一致：BIT 文本协议按**小端**字节序还原
+            // （对应 `MySqlFieldCodec.ConvertBitBytesToUInt64`）；Rust `Pek.RCode` 反之，已记入决策记录。
             var acc: u64 = 0;
-            for (raw) |b| {
-                acc = (acc << 8) | b;
+            for (raw, 0..) |b, idx| {
+                if (idx >= 8) break;
+                acc |= @as(u64, b) << @intCast(idx * 8);
             }
             return .{ .int = @intCast(acc) };
         },
@@ -1173,7 +1237,10 @@ fn binaryValue(arena: std.mem.Allocator, col: Column, payload: []const u8, pos: 
                 },
                 .bit => blk: {
                     var acc: u64 = 0;
-                    for (raw) |b| acc = (acc << 8) | b;
+                    for (raw, 0..) |b, idx| {
+                        if (idx >= 8) break;
+                        acc |= @as(u64, b) << @intCast(idx * 8);
+                    }
                     break :blk .{ .int = @intCast(acc) };
                 },
                 .blob, .tiny_blob, .medium_blob, .long_blob, .geometry => .{ .blob = try arena.dupe(u8, raw) },
@@ -1254,14 +1321,14 @@ fn parseBinaryTimeText(arena: std.mem.Allocator, payload: []const u8, pos: *usiz
 
 fn paramType(v: Value) u8 {
     return switch (v) {
-        .null => @intFromEnum(ColumnType.null),
-        .boolean => @intFromEnum(ColumnType.tiny),
-        .int => @intFromEnum(ColumnType.longlong),
-        .float => @intFromEnum(ColumnType.double),
-        .decimal => @intFromEnum(ColumnType.newdecimal),
-        .text => @intFromEnum(ColumnType.var_string),
-        .blob => @intFromEnum(ColumnType.blob),
-        .datetime => @intFromEnum(ColumnType.datetime),
+        .null => @backingInt(ColumnType.null),
+        .boolean => @backingInt(ColumnType.tiny),
+        .int => @backingInt(ColumnType.longlong),
+        .float => @backingInt(ColumnType.double),
+        .decimal => @backingInt(ColumnType.newdecimal),
+        .text => @backingInt(ColumnType.var_string),
+        .blob => @backingInt(ColumnType.blob),
+        .datetime => @backingInt(ColumnType.datetime),
     };
 }
 
@@ -1611,7 +1678,8 @@ test "MySQL - lenenc 整数编解码往返（含 251/65536 边界）" {
     }
 }
 
-test "MySQL - 列定义解析（协议 4.1）" {    var buf: [64]u8 = undefined;
+test "MySQL - 列定义解析（协议 4.1）" {
+    var buf: [64]u8 = undefined;
     var i: usize = 0;
     // catalog / schema / table / org_table
     const parts = [_][]const u8{ "def", "test", "t", "t" };
@@ -1636,7 +1704,7 @@ test "MySQL - 列定义解析（协议 4.1）" {    var buf: [64]u8 = undefined;
     i += 2;
     std.mem.writeInt(u32, buf[i..][0..4], 255, .little); // length
     i += 4;
-    buf[i] = @intFromEnum(ColumnType.var_string);
+    buf[i] = @backingInt(ColumnType.var_string);
     i += 1;
     std.mem.writeInt(u16, buf[i..][0..2], ColumnFlags.not_null, .little);
     i += 2;

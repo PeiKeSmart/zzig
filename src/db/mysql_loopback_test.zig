@@ -109,8 +109,8 @@ fn sendResultSet(stream: std.Io.net.Stream, io: std.Io) !void {
     try writePacket(stream, io, 1, &[_]u8{0x02});
     // 列定义：id LONG / name VAR_STRING
     var def_buf: [96]u8 = undefined;
-    try writePacket(stream, io, 2, buildColumnDef(&def_buf, "id", @intFromEnum(mysql.ColumnType.long)));
-    try writePacket(stream, io, 3, buildColumnDef(&def_buf, "name", @intFromEnum(mysql.ColumnType.var_string)));
+    try writePacket(stream, io, 2, buildColumnDef(&def_buf, "id", @backingInt(mysql.ColumnType.long)));
+    try writePacket(stream, io, 3, buildColumnDef(&def_buf, "name", @backingInt(mysql.ColumnType.var_string)));
     // 列定义结束
     try writePacket(stream, io, 4, &[_]u8{ 0xfe, 0x00, 0x00, 0x02, 0x00 });
     // 一行：id=7，name='abc'
@@ -120,6 +120,10 @@ fn sendResultSet(stream: std.Io.net.Stream, io: std.Io) !void {
 }
 
 fn buildHandshake(out: []u8) []u8 {
+    return buildHandshakeWithPlugin(out, "mysql_native_password");
+}
+
+fn buildHandshakeWithPlugin(out: []u8, plugin: []const u8) []u8 {
     var i: usize = 0;
     out[i] = 10;
     i += 1;
@@ -142,7 +146,7 @@ fn buildHandshake(out: []u8) []u8 {
     i += 1;
     std.mem.writeInt(u16, out[i..][0..2], 2, .little); // status
     i += 2;
-    std.mem.writeInt(u16, out[i..][0..2], @truncate(mysql_caps_high()), .little);
+    std.mem.writeInt(u16, out[i..][0..2], @truncate(mysql_caps_high() >> 16), .little);
     i += 2;
     out[i] = 21; // auth data len
     i += 1;
@@ -152,7 +156,6 @@ fn buildHandshake(out: []u8) []u8 {
     i += 12;
     out[i] = 0;
     i += 1;
-    const plugin = "mysql_native_password";
     @memcpy(out[i..][0..plugin.len], plugin);
     i += plugin.len;
     out[i] = 0;
@@ -297,6 +300,247 @@ test "MySQL 端到端（回环假服务端）：握手/鉴权/COM_QUERY/结果�
     th.join();
     if (!ctx.ok) {
         std.debug.print("[FAIL] 假服务端断言失败：{s}\n", .{ctx.errText()});
+        return error.FakeServerAssertion;
+    }
+}
+
+// ── caching_sha2_password 完整鉴权（RSA 公钥交换） ──────────────────────────
+
+fn serverMainSha2(ctx: *ServerCtx) void {
+    runServerSha2(ctx) catch |e| {
+        if (ctx.err_len == 0) ctx.fail("假服务端（caching_sha2）异常：{s}", .{@errorName(e)});
+        return;
+    };
+    ctx.ok = true;
+}
+
+fn runServerSha2(ctx: *ServerCtx) !void {
+    var stream = try ctx.server.accept(ctx.io);
+    defer stream.close(ctx.io);
+    const io = ctx.io;
+
+    var hs_buf: [256]u8 = @splat(0);
+    try writePacket(stream, io, 0, buildHandshakeWithPlugin(&hs_buf, "caching_sha2_password"));
+
+    var in_buf: [4096]u8 = undefined;
+    const resp = try readPacket(stream, io, &in_buf);
+    const auth_len_off = 32 + user.len + 1;
+    if (resp.len <= auth_len_off) {
+        ctx.fail("握手响应过短：{d}", .{resp.len});
+        return error.Protocol;
+    }
+    if (resp[auth_len_off] != 32) {
+        ctx.fail("caching_sha2 初始摘要应为 32 字节，实际 {d}", .{resp[auth_len_off]});
+        return error.Protocol;
+    }
+    const got = resp[auth_len_off + 1 ..][0..32];
+    const want = mysql.cachingSha2Scramble(password, salt);
+    if (!std.mem.eql(u8, got, &want)) {
+        ctx.fail("caching_sha2 摘要与算法重算结果不一致", .{});
+        return error.AuthFailed;
+    }
+
+    // 要求完整鉴权：AuthMoreData 0x01 0x04
+    try writePacket(stream, io, 2, &[_]u8{ 0x01, 0x04 });
+
+    const req = try readPacket(stream, io, &in_buf);
+    if (req.len != 1 or req[0] != 0x02) {
+        ctx.fail("客户端未请求公钥（首字节 0x{x}）", .{if (req.len > 0) req[0] else 0});
+        return error.Protocol;
+    }
+
+    // 返回 PEM 公钥（48 字节模长，够放 OAEP 填充）
+    var der_buf: [256]u8 = @splat(0);
+    const der = buildRsaPublicKeyDer(&der_buf);
+    var pem_buf: [512]u8 = @splat(0);
+    const pem = buildPublicKeyPem(&pem_buf, der);
+
+    var key_pkt: [640]u8 = undefined;
+    key_pkt[0] = 0x01;
+    @memcpy(key_pkt[1..][0..pem.len], pem);
+    try writePacket(stream, io, 4, key_pkt[0 .. 1 + pem.len]);
+
+    // 收 RSA 密文：长度必须等于模长，且不能全 0（全 0 说明 OAEP/模幂没跑）
+    const cipher = try readPacket(stream, io, &in_buf);
+    if (cipher.len != 48) {
+        ctx.fail("RSA 密文长度应为 48，实际 {d}", .{cipher.len});
+        return error.Protocol;
+    }
+    var all_zero = true;
+    for (cipher) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero) {
+        ctx.fail("RSA 密文全 0，加密未生效", .{});
+        return error.Protocol;
+    }
+
+    try writePacket(stream, io, 6, &[_]u8{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 });
+
+    while (true) {
+        const cmd = try readPacket(stream, io, &in_buf);
+        if (cmd.len == 0) return;
+        switch (cmd[0]) {
+            0x01 => return,
+            0x0e => try writePacket(stream, io, 1, &[_]u8{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }),
+            else => {
+                ctx.fail("未预期命令字节 0x{x}", .{cmd[0]});
+                return error.Protocol;
+            },
+        }
+    }
+}
+
+fn buildRsaPublicKeyDer(out: []u8) []u8 {
+    var n_bytes: [48]u8 = undefined;
+    for (&n_bytes, 0..) |*b, i| b.* = @intCast((i * 11 + 5) & 0xff);
+    n_bytes[0] = 0xd3;
+    const e_bytes = [_]u8{ 0x01, 0x00, 0x01 };
+    const oid = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+
+    // RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }
+    var ints: [128]u8 = undefined;
+    var r: usize = 0;
+    ints[r] = 0x02;
+    r += 1;
+    ints[r] = n_bytes.len;
+    r += 1;
+    @memcpy(ints[r..][0..n_bytes.len], &n_bytes);
+    r += n_bytes.len;
+    ints[r] = 0x02;
+    r += 1;
+    ints[r] = e_bytes.len;
+    r += 1;
+    @memcpy(ints[r..][0..e_bytes.len], &e_bytes);
+    r += e_bytes.len;
+
+    // 外层 SEQUENCE（漏了这层会让 BIT STRING 里直接出现 0x02，解析必然失败）
+    var rsa: [130]u8 = undefined;
+    rsa[0] = 0x30;
+    rsa[1] = @intCast(r);
+    @memcpy(rsa[2..][0..r], ints[0..r]);
+    const rsa_len = 2 + r;
+
+    // SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, BIT STRING }
+    var inner: [256]u8 = undefined;
+    var k: usize = 0;
+    inner[k] = 0x30;
+    k += 1;
+    inner[k] = @intCast(oid.len + 2);
+    k += 1;
+    @memcpy(inner[k..][0..oid.len], &oid);
+    k += oid.len;
+    inner[k] = 0x05; // NULL
+    k += 1;
+    inner[k] = 0x00;
+    k += 1;
+    inner[k] = 0x03; // BIT STRING
+    k += 1;
+    inner[k] = @intCast(1 + rsa_len);
+    k += 1;
+    inner[k] = 0x00; // unused bits
+    k += 1;
+    @memcpy(inner[k..][0..rsa_len], rsa[0..rsa_len]);
+    k += rsa_len;
+
+    var i: usize = 0;
+    out[i] = 0x30;
+    i += 1;
+    out[i] = @intCast(k);
+    i += 1;
+    @memcpy(out[i..][0..k], inner[0..k]);
+    i += k;
+    return out[0..i];
+}
+
+fn buildPublicKeyPem(out: []u8, der: []const u8) []u8 {
+    const enc = std.base64.standard.Encoder;
+    var b64: [256]u8 = undefined;
+    const b64_len = enc.calcSize(der.len);
+    const b64_slice = enc.encode(b64[0..b64_len], der);
+
+    var i: usize = 0;
+    const head = "-----BEGIN PUBLIC KEY-----\n";
+    @memcpy(out[i..][0..head.len], head);
+    i += head.len;
+
+    var pos: usize = 0;
+    while (pos < b64_slice.len) {
+        const n = @min(64, b64_slice.len - pos);
+        @memcpy(out[i..][0..n], b64_slice[pos..][0..n]);
+        i += n;
+        out[i] = '\n';
+        i += 1;
+        pos += n;
+    }
+
+    const tail = "-----END PUBLIC KEY-----\n";
+    @memcpy(out[i..][0..tail.len], tail);
+    i += tail.len;
+    return out[0..i];
+}
+
+test "回环固件：假服务端 RSA 公钥（DER/PEM）可被驱动解析" {
+    const rsa = @import("../crypto/rsa.zig");
+    var der_buf: [256]u8 = @splat(0);
+    const der = buildRsaPublicKeyDer(&der_buf);
+    var pem_buf: [512]u8 = @splat(0);
+    const pem = buildPublicKeyPem(&pem_buf, der);
+
+    // 先直接解析 DER：定位是 DER 拼装错，还是 PEM/base64 环节错
+    var k_der = rsa.parsePublicKeyDer(std.testing.allocator, der) catch |e| {
+        std.debug.print("[DIAG] der parse failed {s}: len={d} hex={s}\n", .{ @errorName(e), der.len, std.fmt.bytesToHex(der[0..40], .lower) });
+        return e;
+    };
+    k_der.deinit();
+
+    var key = try rsa.parsePublicKey(std.testing.allocator, pem);
+    defer key.deinit();
+    try std.testing.expectEqual(@as(usize, 48), key.size);
+}
+
+test "MySQL 端到端（回环假服务端）：caching_sha2 完整鉴权（RSA 公钥交换）" {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39130;
+    var server: ?std.Io.net.Server = null;
+    while (port < 39150) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        server = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    if (server == null) {
+        std.debug.print("[SKIP] 39130-39149 端口均不可用，跳过 caching_sha2 回环用例\n", .{});
+        return;
+    }
+
+    var ctx = ServerCtx{ .server = server.?, .io = sio };
+    defer ctx.server.deinit(sio);
+    const th = try std.Thread.spawn(.{}, serverMainSha2, .{&ctx});
+
+    {
+        var conn = mysql.Conn.open(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = port,
+            .user = user,
+            .password = password,
+        }) catch |e| {
+            th.join();
+            std.debug.print("[FAIL] caching_sha2 完整鉴权连接失败：{s}；服务端信息：{s}\n", .{ @errorName(e), ctx.errText() });
+            return e;
+        };
+        defer conn.deinit();
+        try conn.ping();
+    }
+
+    th.join();
+    if (!ctx.ok) {
+        std.debug.print("[FAIL] 假服务端（caching_sha2）断言失败：{s}\n", .{ctx.errText()});
         return error.FakeServerAssertion;
     }
 }

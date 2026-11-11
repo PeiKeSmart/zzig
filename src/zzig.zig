@@ -202,6 +202,7 @@ test {
     _ = @import("db/sqlite.zig");
     _ = @import("db/mysql.zig");
     _ = @import("db/mysql_loopback_test.zig");
+    _ = @import("crypto/rsa.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
 }
