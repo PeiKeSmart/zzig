@@ -298,7 +298,7 @@ fn authScram(ctx: *ServerCtx, stream: std.Io.net.Stream, io: std.Io) !void {
         return error.Protocol;
     }
     const resp_len = std.mem.readInt(i32, initial[name_end + 1 ..][0..4], .big);
-    const client_first = initial[name_end + 5 ..][0 .. @as(usize, @intCast(resp_len))];
+    const client_first = initial[name_end + 5 ..][0..@as(usize, @intCast(resp_len))];
     // client-first = "n,," + client-first-bare
     if (!std.mem.startsWith(u8, client_first, "n,,")) {
         ctx.fail("SCRAM：client-first 前缀不是 n,,（{s}）", .{client_first});

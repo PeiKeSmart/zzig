@@ -50,6 +50,8 @@ const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+/// 允许 `LOAD DATA LOCAL INFILE` 由客户端发送数据（服务端不开时协商不上，调用处会明确报错）
+const CLIENT_LOCAL_FILES: u32 = 0x0000_0080;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
@@ -66,6 +68,9 @@ const COM_PING: u8 = 0x0e;
 const COM_STMT_PREPARE: u8 = 0x16;
 const COM_STMT_EXECUTE: u8 = 0x17;
 const COM_STMT_CLOSE: u8 = 0x19;
+
+/// 服务端在 `LOCAL INFILE` 场景回的首字节（请求客户端发数据）
+const LOCAL_INFILE_REQUEST: u8 = 0xfb;
 
 // ── 服务端状态标志 ──────────────────────────────────────────────────────────
 const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
@@ -339,6 +344,65 @@ pub const Conn = struct {
         };
     }
 
+    /// 通过 `LOAD DATA LOCAL INFILE` 批量装载：**数据由客户端流式发送，不落盘、不需要服务端文件权限**。
+    ///
+    /// `sql` 由调用方拼好（`LOAD DATA LOCAL INFILE '<仅用于日志的名字>' INTO TABLE ... FIELDS/LINES ...`），
+    /// `data` 是按该规则格式化好的全部文本。返回影响行数。
+    ///
+    /// 失败语义（都不降级）：
+    /// - 没协商上 `CLIENT_LOCAL_FILES` → `error.LocalInfileNotSupported`；
+    /// - 服务端未开 `local_infile`（MySQL 8 默认关闭）→ 服务端回 3948，按 `error.Server` 抛，`lastError()` 有原文。
+    ///
+    /// 分块：每包最大 `max_payload`；**最后单独发一个空包**作为结束标记。
+    /// 数据恰好是 `max_payload` 整数倍时也正确（不会提前截断）。
+    pub fn loadDataLocal(self: *Conn, sql: []const u8, data: []const u8) !u64 {
+        if ((self.client_capabilities & CLIENT_LOCAL_FILES) == 0) {
+            self.setError(
+                "未协商 CLIENT_LOCAL_FILES（服务端 capability=0x{x}），无法使用 LOAD DATA LOCAL",
+                .{self.server_capabilities},
+            );
+            return error.LocalInfileNotSupported;
+        }
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        try buf.append(self.gpa, COM_QUERY);
+        try buf.appendSlice(self.gpa, sql);
+
+        self.seq = 0;
+        try self.writePacket(buf.items);
+
+        const first = try self.readPacket();
+        if (first.len == 0) return error.Protocol;
+        if (first[0] == 0xff) return self.failFromPayload(first);
+        if (first[0] != LOCAL_INFILE_REQUEST) {
+            // 服务端没有要求发数据（例如把 LOAD DATA 当普通服务器端语句执行了）：
+            // 这不是我们期望的形态，明确报错而不是当成成功
+            self.setError("期望 LOCAL INFILE 请求（0xfb），却收到 0x{x}；请确认 SQL 是 LOAD DATA **LOCAL** INFILE", .{first[0]});
+            return error.Protocol;
+        }
+
+        // 分块发送数据（每包 ≤ max_payload），再发一个空包结束
+        var off: usize = 0;
+        while (off < data.len) {
+            const chunk = @min(data.len - off, max_payload);
+            try self.writeRawPacket(data[off .. off + chunk]);
+            off += chunk;
+        }
+        try self.writeRawPacket(&.{});
+
+        const done = try self.readPacket();
+        if (done.len == 0) return error.Protocol;
+        if (done[0] == 0xff) return self.failFromPayload(done);
+        if (done[0] == 0x00) {
+            const ok = try parseOkPayload(done);
+            self.applyOk(ok);
+            return ok.affected_rows;
+        }
+        self.setError("LOAD DATA 结束后收到非 OK 包（0x{x}）", .{done[0]});
+        return error.Protocol;
+    }
+
     fn queryText(self: *Conn, arena: std.mem.Allocator, sql: []const u8) !Result {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
@@ -592,7 +656,8 @@ pub const Conn = struct {
 
         var flags: u32 = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 |
             CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH |
-            CLIENT_FOUND_ROWS | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS;
+            CLIENT_FOUND_ROWS | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS |
+            CLIENT_LOCAL_FILES;
         if (opts.database.len > 0) flags |= CLIENT_CONNECT_WITH_DB;
         // 只在服务端支持的范围内起作用
         flags &= hs.capability | CLIENT_CONNECT_WITH_DB;
@@ -851,6 +916,25 @@ pub const Conn = struct {
             off += chunk;
             if (chunk < max_payload) break;
         }
+    }
+
+    /// 发送**恰好一个**包（不自动分块、不补空包）。
+    ///
+    /// 只用于 `LOAD DATA LOCAL` 的数据流：那里「空包」是结束标记，
+    /// 用 `writePacket` 的自动补空包会在数据正好是 16MB 整数倍时**提前截断**。
+    fn writeRawPacket(self: *Conn, payload: []const u8) !void {
+        if (payload.len > max_payload) {
+            self.setError("单包载荷 {d} 超过协议上限 {d}", .{ payload.len, max_payload });
+            return error.Protocol;
+        }
+        var hdr: [4]u8 = undefined;
+        hdr[0] = @intCast(payload.len & 0xff);
+        hdr[1] = @intCast((payload.len >> 8) & 0xff);
+        hdr[2] = @intCast((payload.len >> 16) & 0xff);
+        hdr[3] = self.seq;
+        self.seq +%= 1;
+        try self.writeAll(&hdr);
+        if (payload.len > 0) try self.writeAll(payload);
     }
 
     fn writeAll(self: *Conn, bytes: []const u8) !void {

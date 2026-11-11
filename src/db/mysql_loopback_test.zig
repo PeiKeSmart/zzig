@@ -21,6 +21,12 @@ const ServerCtx = struct {
     ok: bool = false,
     err_buf: [160]u8 = undefined,
     err_len: usize = 0,
+    /// LOCAL INFILE 用例：期望收到的数据（客户端流式发送的内容）
+    expect_data: []const u8 = "",
+    /// LOCAL INFILE 用例：实际收到多少字节
+    got_len: usize = 0,
+    /// LOCAL INFILE 用例：实际内容是否逐字节一致
+    data_matched: bool = false,
 
     fn fail(self: *ServerCtx, comptime fmt: []const u8, args: anytype) void {
         const text = std.fmt.bufPrint(&self.err_buf, fmt, args) catch "假服务端失败";
@@ -164,7 +170,8 @@ fn buildHandshakeWithPlugin(out: []u8, plugin: []const u8) []u8 {
 }
 
 fn mysql_caps_low() u32 {
-    return 0x0000_0001 | 0x0000_0004 | 0x0000_0200 | 0x0000_2000 | 0x0000_8000;
+    // 0x80 = CLIENT_LOCAL_FILES：LOCAL INFILE 用例要求服务端声明它，否则客户端会按规矩裁掉该位
+    return 0x0000_0001 | 0x0000_0004 | 0x0000_0080 | 0x0000_0200 | 0x0000_2000 | 0x0000_8000;
 }
 
 fn mysql_caps_high() u32 {
@@ -302,6 +309,129 @@ test "MySQL 端到端（回环假服务端）：握手/鉴权/COM_QUERY/结果�
         std.debug.print("[FAIL] 假服务端断言失败：{s}\n", .{ctx.errText()});
         return error.FakeServerAssertion;
     }
+}
+
+// ── LOAD DATA LOCAL INFILE（客户端流式发送数据，不落盘） ─────────────────────
+
+fn serverMainLocalInfile(ctx: *ServerCtx) void {
+    runServerLocalInfile(ctx) catch |e| {
+        if (ctx.err_len == 0) ctx.fail("假服务端（LOCAL INFILE）异常：{s}", .{@errorName(e)});
+        return;
+    };
+    ctx.ok = true;
+}
+
+fn runServerLocalInfile(ctx: *ServerCtx) !void {
+    var stream = try ctx.server.accept(ctx.io);
+    defer stream.close(ctx.io);
+    const io = ctx.io;
+
+    var hs_buf: [128]u8 = @splat(0);
+    try writePacket(stream, io, 0, buildHandshake(&hs_buf));
+
+    var in_buf: [4096]u8 = undefined;
+    const resp = try readPacket(stream, io, &in_buf);
+    // capability 低 4 字节（小端）：必须带 CLIENT_LOCAL_FILES(0x80)
+    const caps = std.mem.readInt(u32, resp[0..4], .little);
+    if ((caps & 0x0080) == 0) {
+        ctx.fail("客户端未声明 CLIENT_LOCAL_FILES（capability=0x{x}）", .{caps});
+        return error.Protocol;
+    }
+    try writePacket(stream, io, 2, &[_]u8{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 });
+
+    while (true) {
+        const cmd = try readPacket(stream, io, &in_buf);
+        if (cmd.len == 0) return;
+        switch (cmd[0]) {
+            0x01 => return, // COM_QUIT
+            0x03 => {
+                const sql = cmd[1..];
+                if (!std.mem.startsWith(u8, sql, "LOAD DATA LOCAL INFILE")) {
+                    ctx.fail("未预期 SQL：{s}", .{sql});
+                    return error.Protocol;
+                }
+                // 0xfb + 文件名\0（文件名只用于服务端日志）
+                var req: [32]u8 = @splat(0);
+                req[0] = 0xfb;
+                const name = "zcode_bulk.tsv";
+                @memcpy(req[1 .. 1 + name.len], name);
+                try writePacket(stream, io, 1, req[0 .. 1 + name.len + 1]);
+
+                // 收数据包直到空包；seq 由 2 起递增
+                var seq: u8 = 2;
+                var total: usize = 0;
+                var matched = true;
+                while (true) {
+                    const chunk = try readPacket(stream, io, &in_buf);
+                    if (chunk.len == 0) break;
+                    const end = total + chunk.len;
+                    if (end <= ctx.expect_data.len) {
+                        if (!std.mem.eql(u8, ctx.expect_data[total..end], chunk)) matched = false;
+                    } else matched = false;
+                    total = end;
+                    seq +%= 1;
+                }
+                ctx.got_len = total;
+                ctx.data_matched = matched and total == ctx.expect_data.len;
+                // OK：affected_rows=3 / insert_id=0 / status=2 / warnings=0
+                try writePacket(stream, io, seq, &[_]u8{ 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00 });
+            },
+            else => {
+                ctx.fail("未预期命令字节 0x{x}", .{cmd[0]});
+                return error.Protocol;
+            },
+        }
+    }
+}
+
+test "MySQL 端到端（回环假服务端）：LOAD DATA LOCAL INFILE 流式装载" {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39141;
+    var server: ?std.Io.net.Server = null;
+    while (port < 39160) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        server = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    if (server == null) {
+        std.debug.print("[SKIP] 39141-39159 端口均不可用，跳过 LOCAL INFILE 用例\n", .{});
+        return;
+    }
+
+    const payload = "1\talpha\n2\tbeta\n3\t\\N\n"; // 含 NULL 的 TSV
+    var ctx = ServerCtx{ .server = server.?, .io = sio, .expect_data = payload };
+    defer ctx.server.deinit(sio);
+    const th = try std.Thread.spawn(.{}, serverMainLocalInfile, .{&ctx});
+
+    {
+        var conn = mysql.Conn.open(std.testing.allocator, .{
+            .host = "127.0.0.1",
+            .port = port,
+            .user = user,
+            .password = password,
+        }) catch |e| {
+            th.join();
+            std.debug.print("[FAIL] 连接假服务端失败：{s}；服务端信息：{s}\n", .{ @errorName(e), ctx.errText() });
+            return e;
+        };
+        defer conn.deinit();
+
+        const sql = "LOAD DATA LOCAL INFILE 'zcode_bulk.tsv' INTO TABLE `t` FIELDS TERMINATED BY '\\t' " ++
+            "ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' (`id`,`name`)";
+        const affected = try conn.loadDataLocal(sql, payload);
+        try std.testing.expectEqual(@as(u64, 3), affected);
+    }
+
+    th.join();
+    if (!ctx.ok) {
+        std.debug.print("[FAIL] 假服务端断言失败：{s}\n", .{ctx.errText()});
+        return error.FakeServerAssertion;
+    }
+    try std.testing.expectEqual(payload.len, ctx.got_len);
+    try std.testing.expect(ctx.data_matched);
 }
 
 // ── caching_sha2_password 完整鉴权（RSA 公钥交换） ──────────────────────────
