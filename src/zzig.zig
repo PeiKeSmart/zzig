@@ -27,6 +27,9 @@ pub const Http = @import("http/http.zig");
 /// HTTP 增强工具（重试机制、表单处理、网络错误处理）
 pub const HttpEnhanced = @import("http/enhanced.zig");
 
+/// 极简 HTTP/1.1 服务端（监听+线程+上限；鉴权/限流在业务层）
+pub const http_server = @import("http/server.zig");
+
 /// 网络工具（CIDR 解析、IP 处理、接口检测）
 pub const Net = @import("net/net.zig");
 
@@ -208,6 +211,7 @@ test {
     _ = @import("db/mysql_loopback_test.zig");
     _ = @import("db/postgres.zig");
     _ = @import("db/postgres_loopback_test.zig");
+    _ = @import("http/server.zig");
     _ = @import("crypto/rsa.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
