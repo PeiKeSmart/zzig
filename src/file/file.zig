@@ -33,6 +33,27 @@ pub fn CurrentPath(allocator: std.mem.Allocator) ![]u8 {
 
 var temp_name_counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
+/// 读取整个文件到内存（调用方负责 free）。`max_bytes` 防止误读超大文件。
+///
+/// 0.17 的 `std.fs.cwd().readFileAlloc` 已移除，这里用 `compat` 的跨版本文件句柄按文件长度读取。
+pub fn ReadAllAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const dir = compat.fs.cwd();
+    var f = try dir.openFile(path, .{});
+    defer f.close();
+
+    const end = try f.getEndPos();
+    if (end > max_bytes) return error.FileTooBig;
+    return f.readToEndAlloc(allocator, max_bytes);
+}
+
+/// 覆盖写入整个文件（不存在则创建）。
+pub fn WriteAll(path: []const u8, bytes: []const u8) !void {
+    const dir = compat.fs.cwd();
+    var f = try dir.createFile(path, .{});
+    defer f.close();
+    try f.writeAll(bytes);
+}
+
 /// 生成一个唯一的**文件名**（不含目录，调用方负责 free）。
 ///
 /// 用途：测试库文件、导出中间文件、临时下载文件——避免不同进程/不同轮次互相覆盖。

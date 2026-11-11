@@ -319,3 +319,16 @@ test "File - 唯一临时文件名与静默删除" {
     // 文件不存在时不得 panic
     zzig.File.DeleteQuiet(p1);
 }
+
+test "File - ReadAllAlloc / WriteAll 往返" {
+    const allocator = testing.allocator;
+
+    const path = try zzig.File.UniqueTempName(allocator, "zzig-io", ".tmp");
+    defer allocator.free(path);
+    defer zzig.File.DeleteQuiet(path);
+
+    try zzig.File.WriteAll(path, "hello 世界");
+    const content = try zzig.File.ReadAllAlloc(allocator, path, 1024);
+    defer allocator.free(content);
+    try testing.expectEqualStrings("hello 世界", content);
+}
