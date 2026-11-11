@@ -166,3 +166,23 @@ pub const json = struct {
 ///   xml.WriterImpl.writeToFileStreaming(...) — callback 风格 XML→流式文件写出
 ///   xml.toString(doc, alloc, opt)     — DOM→字符串
 pub const xml = @import("xml/xml.zig");
+
+/// 通用字符串缓冲（`std.Io.Writer.Allocating` 封装：零碎拼接少一次临时分配）
+pub const Buf = @import("text/buf.zig").Buf;
+
+/// 通用十进制（尾数 + 缩放因子；解析/格式化/精确比较，不含算术）
+pub const Decimal = @import("number/decimal.zig").Decimal;
+
+/// 通用日期时间（无时区；`YYYY-MM-DD HH:MM:SS.fffffff` 文本口径；含当前时间/Unix 换算）
+pub const DateTime = @import("time/datetime.zig").DateTime;
+
+/// 数据库通用层：值模型 + 驱动。与具体 ORM 无关，任何要读写数据库的项目都可复用。
+pub const db = struct {
+    /// 字段值模型（Null/Bool/Int/Float/Decimal/Text/Blob/DateTime + 跨类型取值 + SQL 字面量）
+    pub const Value = @import("db/value.zig").Value;
+    /// SQLite 驱动（动态加载 `sqlite3.dll` / `winsqlite3.dll`，不链 libc）
+    pub const sqlite = @import("db/sqlite.zig");
+};
+
+/// 便捷别名：`zzig.sqlite` == `zzig.db.sqlite`
+pub const sqlite = db.sqlite;

@@ -200,3 +200,122 @@ test "AsyncLogger - level filtering works" {
     // 应该只有 2 条被处理
     try testing.expectEqual(@as(usize, 2), logger.getProcessedCount());
 }
+
+// ─────────────────────── 通用数值 / 时间 / 缓冲 ───────────────────────
+
+test "Decimal - 解析与格式化保留尾随零" {
+    const allocator = testing.allocator;
+
+    const d = try zzig.Decimal.parse("12.3400");
+    try testing.expectEqual(@as(u8, 4), d.scale);
+
+    const text = try d.formatAlloc(allocator);
+    defer allocator.free(text);
+    try testing.expectEqualStrings("12.3400", text);
+
+    // 数值相等忽略尾随零
+    try testing.expect(d.eql(try zzig.Decimal.parse("12.34")));
+    try testing.expect(!d.eql(try zzig.Decimal.parse("12.35")));
+}
+
+test "Decimal - 指数形式与精度往返" {
+    try testing.expect((try zzig.Decimal.parse("1.2e3")).eql(try zzig.Decimal.parse("1200")));
+    try testing.expect((try zzig.Decimal.parse("1e-3")).eql(try zzig.Decimal.parse("0.001")));
+    try testing.expectError(error.InvalidDecimal, zzig.Decimal.parse("abc"));
+}
+
+test "DateTime - 7 位小数秒往返" {
+    const allocator = testing.allocator;
+
+    const text = "2026-09-26 18:01:02.1230000";
+    const dt = try zzig.DateTime.parse(text);
+    const out = try dt.formatAlloc(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(text, out);
+}
+
+test "DateTime - 兼容纯日期/斜杠分隔/时区后缀" {
+    try testing.expect((try zzig.DateTime.parse("2026-09-26")).eql(.{ .year = 2026, .month = 9, .day = 26 }));
+    try testing.expect((try zzig.DateTime.parse("2026/09/26 08:00")).eql(.{ .year = 2026, .month = 9, .day = 26, .hour = 8 }));
+    try testing.expectError(error.InvalidDateTime, zzig.DateTime.parse("2026-13-01"));
+}
+
+test "DateTime - Unix 秒换算" {
+    const dt = zzig.DateTime.fromUnixSeconds(1790445662);
+    try testing.expectEqual(@as(i32, 2026), dt.year);
+    try testing.expectEqual(@as(u8, 9), dt.month);
+    try testing.expectEqual(@as(u8, 26), dt.day);
+}
+
+test "Buf - 追加与格式化" {
+    var b = zzig.Buf.init(testing.allocator);
+    defer b.deinit();
+
+    try b.add("SELECT ");
+    try b.fmt("{d}", .{42});
+    try b.add(" FROM t");
+    try testing.expectEqualStrings("SELECT 42 FROM t", b.slice());
+}
+
+// ─────────────────────── 数据库通用层 ───────────────────────
+
+test "db.Value - 跨类型取值与 SQL 字面量" {
+    const allocator = testing.allocator;
+    const Value = zzig.db.Value;
+
+    try testing.expectEqual(@as(?i64, 42), (Value{ .text = "42" }).asI64());
+    try testing.expectEqual(@as(?bool, true), (Value{ .int = 1 }).asBool());
+
+    const lit = try (Value{ .text = "O'Reilly" }).toSqlLiteralAlloc(allocator);
+    defer allocator.free(lit);
+    try testing.expectEqualStrings("'O''Reilly'", lit);
+
+    const dt = Value{ .datetime = try zzig.DateTime.parse("2026-09-26 18:01:02.1230000") };
+    const text = try dt.toTextAlloc(allocator);
+    defer allocator.free(text);
+    try testing.expectEqualStrings("2026-09-26 18:01:02.1230000", text);
+}
+
+test "sqlite - 动态加载并在内存库上跑通 CRUD" {
+    const allocator = testing.allocator;
+
+    var lib = zzig.sqlite.Lib.load(allocator) catch {
+        // 本机无可用 sqlite3.dll / winsqlite3.dll 时跳过（不是失败）
+        std.debug.print("[SKIP] 本机未找到 SQLite 动态库\n", .{});
+        return;
+    };
+    defer lib.deinit();
+
+    var db = try zzig.sqlite.Db.open(&lib, ":memory:");
+    defer db.close();
+
+    _ = try db.exec(allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, amount TEXT)");
+    _ = try db.exec(allocator, "INSERT INTO t (name, amount) VALUES ('a', '12.3400')");
+
+    const stmt = try db.prepare(allocator, "SELECT name, amount FROM t WHERE id = ?");
+    defer stmt.finalize();
+    try stmt.bindAll(&.{.{ .int = 1 }});
+
+    const rc = lib.step(stmt.handle);
+    try testing.expectEqual(zzig.sqlite.sqlite_row, rc);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const row = try stmt.readRow(arena.allocator());
+    try testing.expectEqualStrings("a", row.get("name").?.text);
+    // 文本参数走 SQLITE_TRANSIENT：写入的尾随零必须原样读回
+    try testing.expectEqualStrings("12.3400", row.get("amount").?.text);
+}
+
+test "File - 唯一临时文件名与静默删除" {
+    const allocator = testing.allocator;
+
+    const p1 = try zzig.File.UniqueTempName(allocator, "zzig-test", ".db");
+    defer allocator.free(p1);
+    const p2 = try zzig.File.UniqueTempName(allocator, "zzig-test", ".db");
+    defer allocator.free(p2);
+
+    try testing.expect(!std.mem.eql(u8, p1, p2));
+    // 文件不存在时不得 panic
+    zzig.File.DeleteQuiet(p1);
+}
