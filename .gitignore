@@ -1,9 +1,16 @@
-# Zig 编译缓存
-.zig-cache/**
-zig-cache/**
+# Zig 编译缓存（通配符：`--cache-dir .zig-cache-xxx` 这类临时目录也要忽略）
+.zig-cache*/
+zig-cache*/
 
 # Zig 构建输出（文档、可执行文件、库文件等）
-zig-out/**
+zig-out*/
+
+# 测试产生的临时库与报告
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+artifacts/
 logger_config.json
 .arts/settings.json
 .codeartsdoer/.codebaseignore

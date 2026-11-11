@@ -1,0 +1,14 @@
+# 统一换行：仓库内存 LF，检出按平台规则还原（与 Pek.ZCode 保持一致）
+* text=auto eol=lf
+
+*.zig      text eol=lf
+*.zon      text eol=lf
+*.md       text eol=lf
+*.py       text eol=lf
+*.ps1      text eol=crlf
+
+*.exe      binary
+*.dll      binary
+*.db       binary
+*.ico      binary
+*.png      binary

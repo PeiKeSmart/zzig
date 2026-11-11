@@ -125,6 +125,13 @@ pub const Column = struct {
         return (self.flags & ColumnFlags.unsigned) != 0;
     }
 
+    /// 协议里 BLOB 系列与 TEXT 系列**共用类型码**，只有字符集为 63(binary) 时才是真正的二进制
+    /// （与 C# 绿色版 `DH.MySql/MySqlColumn.RemapTypeByCharset` 同一口径；不判 charset 会把
+    /// TEXT 列误当成 Blob，真库实测就是 `Title` 变成 `[blob 12 字节]`）。
+    pub fn isBinaryCharset(self: Column) bool {
+        return self.charset == 63;
+    }
+
     pub fn isBinary(self: Column) bool {
         return (self.flags & ColumnFlags.binary) != 0;
     }
@@ -633,6 +640,8 @@ pub const Conn = struct {
         var plugin = initial_plugin;
         var scramble = initial_scramble;
         var auth_buf: [32]u8 = undefined;
+        // AuthSwitchRequest 里的插件名同样借用包缓冲，必须拷贝（否则下一包就读到垃圾）
+        var switch_buf: [64]u8 = undefined;
         var rounds: usize = 0;
         while (true) {
             rounds += 1;
@@ -662,13 +671,16 @@ pub const Conn = struct {
                         self.setError("AuthSwitchRequest 缺少插件名终止符", .{});
                         return error.Protocol;
                     };
-                    const new_plugin = rest[0..name_end];
+                    const new_plugin_raw = rest[0..name_end];
                     var new_scramble = rest[name_end + 1 ..];
                     // 结尾可能带一个 \0，去掉（scramble 固定 20 字节）
                     if (new_scramble.len > 20) new_scramble = new_scramble[0..20];
 
+                    const nl = @min(new_plugin_raw.len, switch_buf.len);
+                    @memcpy(switch_buf[0..nl], new_plugin_raw[0..nl]);
+                    const new_plugin = switch_buf[0..nl];
+
                     const auth = try self.authResponse(new_plugin, opts.password, new_scramble, &auth_buf);
-                    self.seq = self.seq; // 保持当前序列号
                     try self.writePacket(auth);
                     plugin = new_plugin;
                     scramble = new_scramble;
@@ -726,9 +738,11 @@ pub const Conn = struct {
         };
         defer pub_key.deinit();
 
-        const obf = try self.gpa.alloc(u8, password.len);
+        // MySQL 规范的 full auth：XOR((password || '\0'), nonce)，**含结尾 NUL**
+        const obf = try self.gpa.alloc(u8, password.len + 1);
         defer self.gpa.free(obf);
         for (password, 0..) |b, i| obf[i] = b ^ scramble[i % scramble.len];
+        obf[password.len] = 0 ^ scramble[password.len % scramble.len];
 
         const cipher = rsa.oaepSha1Encrypt(self.gpa, self.io, pub_key, obf) catch |e| {
             self.setError("RSA-OAEP 加密密码失败：{s}", .{@errorName(e)});
@@ -750,7 +764,8 @@ pub const Conn = struct {
 
     fn authResponse(self: *Conn, plugin: []const u8, password: []const u8, scramble: []const u8, buf: *[32]u8) ![]const u8 {
         _ = self;
-        if (password.len == 0) return "";        if (std.mem.eql(u8, plugin, "mysql_native_password")) {
+        if (password.len == 0) return "";
+        if (std.mem.eql(u8, plugin, "mysql_native_password")) {
             const s = nativePasswordScramble(password, scramble);
             @memcpy(buf[0..20], &s);
             return buf[0..20];
@@ -1159,10 +1174,15 @@ fn textValue(arena: std.mem.Allocator, col: Column, raw: []const u8) !Value {
             }
             return .{ .int = @intCast(acc) };
         },
-        .blob, .tiny_blob, .medium_blob, .long_blob, .geometry => {
+        .blob, .tiny_blob, .medium_blob, .long_blob => {
+            if (col.isBinaryCharset()) return .{ .blob = try arena.dupe(u8, raw) };
+            return .{ .text = try arena.dupe(u8, raw) };
+        },
+        .geometry => {
             return .{ .blob = try arena.dupe(u8, raw) };
         },
         .json, .enum_, .set, .varchar, .var_string, .string => {
+            if (col.isBinaryCharset()) return .{ .blob = try arena.dupe(u8, raw) };
             return .{ .text = try arena.dupe(u8, raw) };
         },
         // 未知/新增类型：按文本保留，绝不静默丢弃
@@ -1243,8 +1263,15 @@ fn binaryValue(arena: std.mem.Allocator, col: Column, payload: []const u8, pos: 
                     }
                     break :blk .{ .int = @intCast(acc) };
                 },
-                .blob, .tiny_blob, .medium_blob, .long_blob, .geometry => .{ .blob = try arena.dupe(u8, raw) },
-                else => .{ .text = try arena.dupe(u8, raw) },
+                .blob, .tiny_blob, .medium_blob, .long_blob => if (col.isBinaryCharset())
+                    .{ .blob = try arena.dupe(u8, raw) }
+                else
+                    .{ .text = try arena.dupe(u8, raw) },
+                .geometry => .{ .blob = try arena.dupe(u8, raw) },
+                else => if (col.isBinaryCharset())
+                    .{ .blob = try arena.dupe(u8, raw) }
+                else
+                    .{ .text = try arena.dupe(u8, raw) },
             };
         },
     }
