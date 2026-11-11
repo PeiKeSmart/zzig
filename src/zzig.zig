@@ -182,7 +182,26 @@ pub const db = struct {
     pub const Value = @import("db/value.zig").Value;
     /// SQLite 驱动（动态加载 `sqlite3.dll` / `winsqlite3.dll`，不链 libc）
     pub const sqlite = @import("db/sqlite.zig");
+    /// MySQL 驱动（纯 wire protocol，不依赖 libmysqlclient）
+    pub const mysql = @import("db/mysql.zig");
+    /// 结果集行（各驱动共用）
+    pub const Row = @import("db/row.zig").Row;
 };
 
 /// 便捷别名：`zzig.sqlite` == `zzig.db.sqlite`
 pub const sqlite = db.sqlite;
+/// 便捷别名：`zzig.mysql` == `zzig.db.mysql`
+pub const mysql = db.mysql;
+
+// 模块内部测试入口：`zig test` 只收集「根文件直接 import 到」的文件的 test 块，
+// 跨模块 import（test.zig → zzig 模块）不会收集。build.zig 里 `zzig-module-tests`
+// 以本文件为根，靠这里把它们拉进来，否则驱动单测形同虚设。
+test {
+    _ = @import("db/value.zig");
+    _ = @import("db/row.zig");
+    _ = @import("db/sqlite.zig");
+    _ = @import("db/mysql.zig");
+    _ = @import("db/mysql_loopback_test.zig");
+    _ = @import("number/decimal.zig");
+    _ = @import("time/datetime.zig");
+}

@@ -360,17 +360,7 @@ pub const Stmt = struct {
     }
 };
 
-pub const Row = struct {
-    names: []const []const u8,
-    values: []const Value,
-
-    pub fn get(self: Row, name: []const u8) ?Value {
-        for (self.names, 0..) |n, i| {
-            if (std.ascii.eqlIgnoreCase(n, name)) return self.values[i];
-        }
-        return null;
-    }
-};
+pub const Row = @import("row.zig").Row;
 
 test "加载 SQLite 动态库并执行最小语句" {
     var lib = Lib.load(std.testing.allocator) catch |e| {

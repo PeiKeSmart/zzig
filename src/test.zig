@@ -3,6 +3,10 @@ const testing = std.testing;
 const zzig = @import("zzig");
 const compat = zzig.compat;
 
+// 注意：各驱动模块（db/sqlite.zig、db/mysql.zig 等）内的 test 块 **不会** 被本文件收集 ——
+// 它们是 `zzig` 模块的文件，跨模块 import 只做类型分析、不注册测试。
+// 因此 build.zig 额外加了一个以 `src/zzig.zig` 为根的测试产物（zzig-module-tests）专门跑它们。
+
 // 字符串处理测试
 test "Strings - AddString concatenates two strings" {
     const allocator = testing.allocator;

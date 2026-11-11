@@ -419,6 +419,20 @@ const versions = struct {
         const run_zzig_tests = b.addRunArtifact(zzig_unit_tests);
         test_step.dependOn(&run_zzig_tests.step);
         test_step.dependOn(&run_xml_tests.step);
+
+        // 模块内部测试：以 src/zzig.zig 为根，才会收集 db/sqlite.zig、db/mysql.zig 等
+        // 模块文件里的 test 块（跨模块 import 不会收集）。
+        const self_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        const zzig_module_tests = b.addTest(.{
+            .name = "zzig-module-tests",
+            .root_module = self_module,
+        });
+        const run_module_tests = b.addRunArtifact(zzig_module_tests);
+        test_step.dependOn(&run_module_tests.step);
     }
     fn generateDocs(b: *Build, optimize: OptimizeMode, target: Build.ResolvedTarget) void {
         const sources = [_]struct { name: []const u8, path: []const []const u8 }{
