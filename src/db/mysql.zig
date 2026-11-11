@@ -63,6 +63,8 @@ const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 /// 允许 `LOAD DATA LOCAL INFILE` 由客户端发送数据（服务端不开时协商不上，调用处会明确报错）
 const CLIENT_LOCAL_FILES: u32 = 0x0000_0080;
+/// 压缩协议（zlib）：认证 OK 之后，所有包再包一层压缩帧（帧长/序号/解压后长度 + 数据）
+const CLIENT_COMPRESS: u32 = 0x0000_0020;
 /// 走 TLS：先发 `SSLRequest`，再在**同一条 TCP** 上换 TLS（MySQL 的 TLS 升级方式）
 const CLIENT_SSL: u32 = 0x0000_0800;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
@@ -84,6 +86,9 @@ const COM_STMT_CLOSE: u8 = 0x19;
 
 /// 服务端在 `LOCAL INFILE` 场景回的首字节（请求客户端发数据）
 const LOCAL_INFILE_REQUEST: u8 = 0xfb;
+
+/// 压缩协议的「最小压缩长度」：小于它的帧直接按未压缩发（协议惯例：小包越压越大）
+const min_compress_len: usize = 50;
 
 // ── 服务端状态标志 ──────────────────────────────────────────────────────────
 const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
@@ -221,6 +226,9 @@ pub const Options = struct {
     /// 根证书文件（PEM，绝对路径优先；相对路径按当前目录解析）。仅 `verify_ca`/`verify_full` 用；
     /// 留空则用系统根证书。
     ssl_ca: []const u8 = "",
+    /// 压缩协议（`CLIENT_COMPRESS`）：缺省关闭（与 MySqlConnector 的 `UseCompression` 缺省一致）。
+    /// 开与不开都只是传输层包装，SQL/值语义完全一致。
+    compress: bool = false,
 };
 
 pub const Error = error{
@@ -290,6 +298,15 @@ pub const Conn = struct {
     /// TLS 会话（`null` = 明文）。**堆分配**：`Client` 内部持有指向 Reader/Writer 的指针，
     /// 而 `Conn` 是按值返回的，栈上地址会随复制失效。
     tls: ?*TlsState = null,
+    /// 是否已切换到压缩协议（认证 OK 之后才开，与协议规定一致）
+    compressed: bool = false,
+    /// 压缩帧自己的序号（与内层包序号 `seq` 独立）
+    compress_seq: u8 = 0,
+    /// 压缩协议的写缓冲：攒一个内层包再压（避免小包逐个压）
+    wbuf: std.ArrayList(u8) = .empty,
+    /// 压缩协议的读缓冲：已解压、待解析的内层字节流
+    rbuf: std.ArrayList(u8) = .empty,
+    rpos: usize = 0,
 
     // ── 基本信息 ────────────────────────────────────────────────────────────
     pub fn serverVersion(self: *const Conn) []const u8 {
@@ -394,6 +411,8 @@ pub const Conn = struct {
     pub fn deinit(self: *Conn) void {
         self.closeQuietly();
         self.pkt.deinit(self.gpa);
+        self.wbuf.deinit(self.gpa);
+        self.rbuf.deinit(self.gpa);
     }
 
     fn closeQuietly(self: *Conn) void {
@@ -401,6 +420,7 @@ pub const Conn = struct {
         self.closed = true;
         // COM_QUIT：尽力而为，对端已断也不报错（连接已坏时干脆不发，避开 Windows 断连状态）
         self.seq = 0;
+        self.compress_seq = 0;
         if (!self.broken) self.writePacket(&[_]u8{COM_QUIT}) catch {};
         // TLS 侧还要发 close_notify 并释放状态（`destroy` 内部已 catch）
         if (self.tls) |st| {
@@ -417,6 +437,7 @@ pub const Conn = struct {
 
     pub fn ping(self: *Conn) !void {
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(&[_]u8{COM_PING});
         const pkt = try self.readPacket();
         if (pkt.len == 0) return error.Protocol;
@@ -432,6 +453,7 @@ pub const Conn = struct {
         try buf.append(self.gpa, COM_INIT_DB);
         try buf.appendSlice(self.gpa, name);
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(buf.items);
         const pkt = try self.readPacket();
         if (pkt.len == 0) return error.Protocol;
@@ -489,6 +511,7 @@ pub const Conn = struct {
         try buf.appendSlice(self.gpa, sql);
 
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(buf.items);
 
         const first = try self.readPacket();
@@ -528,6 +551,7 @@ pub const Conn = struct {
         try buf.append(self.gpa, COM_QUERY);
         try buf.appendSlice(self.gpa, sql);
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(buf.items);
         return self.readResponse(arena, null);
     }
@@ -551,6 +575,7 @@ pub const Conn = struct {
         try buf.append(self.gpa, COM_STMT_PREPARE);
         try buf.appendSlice(self.gpa, sql);
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(buf.items);
 
         const pkt = try self.readPacket();
@@ -583,6 +608,7 @@ pub const Conn = struct {
         buf[0] = COM_STMT_CLOSE;
         std.mem.writeInt(u32, buf[1..5], id, .little);
         self.seq = 0;
+        self.compress_seq = 0;
         // COM_STMT_CLOSE 没有响应；写失败说明连接已坏，留给下一次调用暴露
         self.writePacket(&buf) catch {};
     }
@@ -620,6 +646,7 @@ pub const Conn = struct {
         for (params) |p| try encodeParam(gpa, &buf, p);
 
         self.seq = 0;
+        self.compress_seq = 0;
         try self.writePacket(buf.items);
         return self.readResponse(arena, prepared.num_columns);
     }
@@ -757,6 +784,7 @@ pub const Conn = struct {
     // ── 握手与鉴权 ──────────────────────────────────────────────────────────
     fn handshake(self: *Conn, opts: Options, use_tls: bool) !void {
         self.seq = 0;
+        self.compress_seq = 0;
         const pkt = try self.readPacket();
         const hs = try parseHandshake(pkt);
         self.server_capabilities = hs.capability;
@@ -777,6 +805,7 @@ pub const Conn = struct {
             CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH |
             CLIENT_FOUND_ROWS | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS |
             CLIENT_LOCAL_FILES;
+        if (opts.compress) flags |= CLIENT_COMPRESS;
         if (opts.database.len > 0) flags |= CLIENT_CONNECT_WITH_DB;
         // 只在服务端支持的范围内起作用
         flags &= hs.capability | CLIENT_CONNECT_WITH_DB;
@@ -846,6 +875,18 @@ pub const Conn = struct {
 
         try self.writePacket(buf.items);
         try self.finishAuth(opts, plugin, hs.auth_plugin_data[0..hs.auth_plugin_data_len]);
+
+        // 压缩协议从「认证完成之后」开始（服务端的 OK 包还是不压的）
+        if ((flags & CLIENT_COMPRESS) != 0) {
+            self.compressed = true;
+            self.compress_seq = 0;
+        } else if (opts.compress) {
+            // 客户端要求压缩但服务端不支持：**不静默降级**，否则「以为压缩了实际没压」
+            std.debug.print(
+                "[zzig.mysql] 连接串要求压缩，但服务端未声明 CLIENT_COMPRESS（capability=0x{x}），本条连接按未压缩运行\n",
+                .{hs.capability},
+            );
+        }
     }
 
     /// 在同一条 TCP 上把明文升级成 TLS。
@@ -1080,6 +1121,7 @@ pub const Conn = struct {
 
     // ── 包收发 ──────────────────────────────────────────────────────────────
     fn readPacket(self: *Conn) ![]u8 {
+        if (self.compressed) return self.readPacketCompressed();
         self.pkt.clearRetainingCapacity();
         while (true) {
             var hdr: [4]u8 = undefined;
@@ -1096,6 +1138,68 @@ pub const Conn = struct {
             if (len < max_payload) break;
         }
         return self.pkt.items;
+    }
+
+    /// 压缩协议下的读：先解压出**内层字节流**，再按 4 字节头切包。
+    fn readPacketCompressed(self: *Conn) ![]u8 {
+        self.pkt.clearRetainingCapacity();
+        while (true) {
+            while (true) {
+                const avail = self.rbuf.items.len - self.rpos;
+                if (avail < 4) break;
+                const h = self.rbuf.items[self.rpos..][0..4];
+                const len: usize = @as(usize, h[0]) | (@as(usize, h[1]) << 8) | (@as(usize, h[2]) << 16);
+                if (len > max_packet_size) {
+                    self.setError("服务端包长度 {d} 超过上限 {d}（压缩流内）", .{ len, max_packet_size });
+                    return error.Protocol;
+                }
+                if (avail < 4 + len) break;
+                self.seq = h[3] +% 1;
+                try self.pkt.appendSlice(self.gpa, self.rbuf.items[self.rpos + 4 ..][0..len]);
+                self.rpos += 4 + len;
+                if (len < max_payload) return self.pkt.items;
+            }
+            try self.refillReadBuf();
+        }
+    }
+
+    /// 读一个压缩帧、解压并追加到读缓冲。
+    fn refillReadBuf(self: *Conn) !void {
+        // 先把已消费部分移走，避免缓冲无限增长
+        if (self.rpos > 0) {
+            const rest = self.rbuf.items.len - self.rpos;
+            if (rest > 0) std.mem.copyForwards(u8, self.rbuf.items[0..rest], self.rbuf.items[self.rpos..]);
+            self.rbuf.shrinkRetainingCapacity(rest);
+            self.rpos = 0;
+        }
+
+        var hdr: [7]u8 = undefined;
+        try self.readExact(&hdr);
+        const clen: usize = @as(usize, hdr[0]) | (@as(usize, hdr[1]) << 8) | (@as(usize, hdr[2]) << 16);
+        const cseq = hdr[3];
+        const ulen: usize = @as(usize, hdr[4]) | (@as(usize, hdr[5]) << 8) | (@as(usize, hdr[6]) << 16);
+        self.compress_seq = cseq +% 1;
+        if (clen > max_packet_size or ulen > max_packet_size) {
+            self.setError("压缩帧长度异常（压缩 {d} / 解压后 {d}，上限 {d}）", .{ clen, ulen, max_packet_size });
+            return error.Protocol;
+        }
+
+        const start = self.rbuf.items.len;
+        try self.rbuf.resize(self.gpa, start + @max(clen, ulen));
+        const body = self.rbuf.items[start..][0..clen];
+        try self.readExact(body);
+        if (ulen == 0) {
+            // 未压缩帧：原样使用
+            self.rbuf.shrinkRetainingCapacity(start + clen);
+        } else {
+            // 解压到同一块缓冲的前半部分（ulen ≤ clen 不一定成立，所以缓冲按两者较大值分配）
+            inflateZlib(self.gpa, body, self.rbuf.items[start..][0..ulen]) catch |e| {
+                self.rbuf.shrinkRetainingCapacity(start);
+                self.setError("压缩帧解压失败（压缩 {d} → 期望 {d} 字节）：{s}", .{ clen, ulen, @errorName(e) });
+                return e;
+            };
+            self.rbuf.shrinkRetainingCapacity(start + ulen);
+        }
     }
 
     fn readExact(self: *Conn, dst: []u8) !void {
@@ -1165,6 +1269,17 @@ pub const Conn = struct {
     }
 
     fn writePacket(self: *Conn, payload: []const u8) !void {
+        if (self.compressed) {
+            var off: usize = 0;
+            while (true) {
+                const chunk = @min(payload.len - off, max_payload);
+                try self.appendInnerHeader(chunk);
+                if (chunk > 0) try self.wbuf.appendSlice(self.gpa, payload[off .. off + chunk]);
+                off += chunk;
+                if (chunk < max_payload) break;
+            }
+            return self.flushCompressed();
+        }
         var hdr: [4]u8 = undefined;
         var off: usize = 0;
         while (true) {
@@ -1191,6 +1306,11 @@ pub const Conn = struct {
             self.setError("单包载荷 {d} 超过协议上限 {d}", .{ payload.len, max_payload });
             return error.Protocol;
         }
+        if (self.compressed) {
+            try self.appendInnerHeader(payload.len);
+            if (payload.len > 0) try self.wbuf.appendSlice(self.gpa, payload);
+            return self.flushCompressed();
+        }
         var hdr: [4]u8 = undefined;
         hdr[0] = @intCast(payload.len & 0xff);
         hdr[1] = @intCast((payload.len >> 8) & 0xff);
@@ -1200,6 +1320,62 @@ pub const Conn = struct {
         try self.writeAll(&hdr);
         if (payload.len > 0) try self.writeAll(payload);
         try self.flushOut();
+    }
+
+    /// 往写缓冲追加一个内层包的头（压缩协议下内层仍是标准 4 字节头）。
+    fn appendInnerHeader(self: *Conn, len: usize) !void {
+        var hdr: [4]u8 = undefined;
+        hdr[0] = @intCast(len & 0xff);
+        hdr[1] = @intCast((len >> 8) & 0xff);
+        hdr[2] = @intCast((len >> 16) & 0xff);
+        hdr[3] = self.seq;
+        self.seq +%= 1;
+        try self.wbuf.appendSlice(self.gpa, &hdr);
+    }
+
+    /// 把写缓冲里的内层字节流切成压缩帧发出去（每帧 ≤ 16MB），然后清空。
+    fn flushCompressed(self: *Conn) !void {
+        var off: usize = 0;
+        while (off < self.wbuf.items.len) {
+            const n = @min(self.wbuf.items.len - off, max_payload);
+            try self.writeCompressedFrame(self.wbuf.items[off..][0..n]);
+            off += n;
+        }
+        self.wbuf.clearRetainingCapacity();
+        try self.flushOut();
+    }
+
+    /// 发一个压缩帧：`{3 字节压缩后长度, 1 字节序号, 3 字节解压后长度}` + 数据。
+    /// 解压后长度写 0 表示「本帧未压缩」（帧太小压不动时按未压缩发，协议允许）。
+    fn writeCompressedFrame(self: *Conn, chunk: []const u8) !void {
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+
+        var uncompressed_len: usize = 0;
+        var body: []const u8 = chunk;
+        if (chunk.len >= min_compress_len) {
+            compressZlib(self.gpa, &scratch, chunk) catch |e| {
+                self.setError("压缩失败（{d} 字节）：{s}", .{ chunk.len, @errorName(e) });
+                return e;
+            };
+            if (scratch.items.len < chunk.len) {
+                uncompressed_len = chunk.len;
+                body = scratch.items;
+            }
+        }
+
+        var hdr: [7]u8 = undefined;
+        hdr[0] = @intCast(body.len & 0xff);
+        hdr[1] = @intCast((body.len >> 8) & 0xff);
+        hdr[2] = @intCast((body.len >> 16) & 0xff);
+        hdr[3] = self.compress_seq;
+        hdr[4] = @intCast(uncompressed_len & 0xff);
+        hdr[5] = @intCast((uncompressed_len >> 8) & 0xff);
+        hdr[6] = @intCast((uncompressed_len >> 16) & 0xff);
+        self.compress_seq +%= 1;
+
+        try self.writeAll(&hdr);
+        if (body.len > 0) try self.writeAll(body);
     }
 
     /// 把缓冲刷到对端。明文路径每次 `writeAll` 已经写到 socket，这里什么也不做；
@@ -1258,6 +1434,30 @@ pub const Conn = struct {
 fn alertText(a: ?std.crypto.tls.Alert) []const u8 {
     const v = a orelse return "无";
     return @tagName(v.description);
+}
+
+/// zlib 压缩到 `out`（先清空）。压缩协议按 MySQL 惯例用 zlib 容器。
+pub fn compressZlib(gpa: std.mem.Allocator, out: *std.ArrayList(u8), data: []const u8) !void {
+    out.clearRetainingCapacity();
+    // 注意：`flate.Compress.init` 断言输出 Writer 的缓冲 > 8 字节，
+    // 直接用空的 `Allocating` 会 panic（踩过），所以给个初始容量。
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var c = try std.compress.flate.Compress.init(&aw.writer, window, .zlib, .default);
+    try c.writer.writeAll(data);
+    try c.finish();
+    try out.appendSlice(gpa, aw.writer.buffered());
+}
+
+/// zlib 解压 `src` 到 `dst`（`dst.len` 必须等于解压后长度，由压缩帧头给出）。
+pub fn inflateZlib(gpa: std.mem.Allocator, src: []const u8, dst: []u8) !void {
+    var in: std.Io.Reader = .fixed(src);
+    const buffer = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(buffer);
+    var d = std.compress.flate.Decompress.init(&in, .zlib, buffer);
+    try d.reader.readSliceAll(dst);
 }
 
 /// 装载信任根：给了 `SslCa`/`CertificateFile` 就用它（绝对路径直接开，相对路径按当前目录），
@@ -2116,6 +2316,45 @@ test "MySQL - lenenc 整数编解码往返（含 251/65536 边界）" {
         try testing.expectEqual(expect, got);
         try testing.expectEqual(list.items.len, pos);
     }
+}
+
+test "MySQL - 压缩协议：zlib 往返（含未压缩小帧的判定规则）" {
+    const a = testing.allocator;
+
+    // ① 大段可压缩数据：压完必须更小，且解压后逐字节一致
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        try payload.appendSlice(a, "INSERT INTO DH_Log (Code, Title) VALUES ('k-0001', '重复内容');");
+    }
+
+    var zdata: std.ArrayList(u8) = .empty;
+    defer zdata.deinit(a);
+    try compressZlib(a, &zdata, payload.items);
+    try testing.expect(zdata.items.len < payload.items.len);
+
+    const back = try a.alloc(u8, payload.items.len);
+    defer a.free(back);
+    try inflateZlib(a, zdata.items, back);
+    try testing.expectEqualSlices(u8, payload.items, back);
+
+    // ② 小于 min_compress_len 的帧按协议**不压**（解压后长度写 0 由调用方决定，
+    //    这里只验证常量与压缩本身对短数据不占便宜这一事实）
+    const tiny = "SELECT 1";
+    try testing.expect(tiny.len < min_compress_len);
+    var ztiny: std.ArrayList(u8) = .empty;
+    defer ztiny.deinit(a);
+    try compressZlib(a, &ztiny, tiny);
+    try testing.expect(ztiny.items.len > tiny.len); // 短数据压完更大 → 走未压缩分支
+
+    // ③ 空数据也要能往返（zlib 空流）
+    var zempty: std.ArrayList(u8) = .empty;
+    defer zempty.deinit(a);
+    try compressZlib(a, &zempty, "");
+    const empty_back = try a.alloc(u8, 0);
+    defer a.free(empty_back);
+    try inflateZlib(a, zempty.items, empty_back);
 }
 
 test "MySQL - 列定义解析（协议 4.1）" {
