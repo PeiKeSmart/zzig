@@ -184,6 +184,8 @@ pub const db = struct {
     pub const sqlite = @import("db/sqlite.zig");
     /// MySQL 驱动（纯 wire protocol，不依赖 libmysqlclient）
     pub const mysql = @import("db/mysql.zig");
+    /// PostgreSQL 驱动（协议 3.0，纯 wire protocol，不依赖 libpq）
+    pub const postgres = @import("db/postgres.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -192,6 +194,8 @@ pub const db = struct {
 pub const sqlite = db.sqlite;
 /// 便捷别名：`zzig.mysql` == `zzig.db.mysql`
 pub const mysql = db.mysql;
+/// 便捷别名：`zzig.postgres` == `zzig.db.postgres`
+pub const postgres = db.postgres;
 
 // 模块内部测试入口：`zig test` 只收集「根文件直接 import 到」的文件的 test 块，
 // 跨模块 import（test.zig → zzig 模块）不会收集。build.zig 里 `zzig-module-tests`
@@ -202,6 +206,8 @@ test {
     _ = @import("db/sqlite.zig");
     _ = @import("db/mysql.zig");
     _ = @import("db/mysql_loopback_test.zig");
+    _ = @import("db/postgres.zig");
+    _ = @import("db/postgres_loopback_test.zig");
     _ = @import("crypto/rsa.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
