@@ -296,6 +296,38 @@ pub fn oaepSha1Encrypt(gpa: std.mem.Allocator, io: std.Io, key: PublicKey, msg: 
     return oaepSha1EncryptWithSeed(gpa, key, msg, &seed);
 }
 
+/// `RSAES-PKCS1-v1_5` 加密（EM = 0x00 0x02 || 非零随机 || 0x00 || M）。
+/// 仅作为「服务端到底用哪种填充」的对照实验保留，生产路径默认走 OAEP。
+pub fn pkcs1Encrypt(gpa: std.mem.Allocator, io: std.Io, key: PublicKey, msg: []const u8) ![]u8 {
+    const k = key.size;
+    if (msg.len + 11 > k) return error.MessageTooLong;
+
+    const em = try gpa.alloc(u8, k);
+    defer gpa.free(em);
+    em[0] = 0x00;
+    em[1] = 0x02;
+    const ps_len = k - msg.len - 3;
+    // PS 必须非零
+    io.random(em[2..][0..ps_len]);
+    for (em[2..][0..ps_len]) |*b| {
+        if (b.* == 0) b.* = 0x01;
+    }
+    em[2 + ps_len] = 0x00;
+    @memcpy(em[3 + ps_len ..], msg);
+
+    var m = try bytesToInt(gpa, em);
+    defer m.deinit();
+    var c = try modPow(gpa, &m, &key.e, &key.n);
+    defer c.deinit();
+
+    const out = try gpa.alloc(u8, k);
+    errdefer gpa.free(out);
+    @memset(out, 0);
+    const need = (c.bitCountAbs() + 7) / 8;
+    c.toConst().writeTwosComplement(out[k - need ..], .big);
+    return out;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // 单测（不需要私钥：验 DER 解析、模幂、OAEP 编码可逆）
 // ══════════════════════════════════════════════════════════════════════════

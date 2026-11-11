@@ -197,6 +197,8 @@ pub const Conn = struct {
     err_code: u16 = 0,
     sql_state: [5]u8 = .{ '0', '0', '0', '0', '0' },
     closed: bool = false,
+    /// 读写已报错（连接不可用）：关闭时不再尝试发 COM_QUIT，否则 Windows 会抛断连状态
+    broken: bool = false,
 
     // ── 基本信息 ────────────────────────────────────────────────────────────
     pub fn serverVersion(self: *const Conn) []const u8 {
@@ -278,9 +280,9 @@ pub const Conn = struct {
     fn closeQuietly(self: *Conn) void {
         if (self.closed) return;
         self.closed = true;
-        // COM_QUIT：尽力而为，对端已断也不报错
+        // COM_QUIT：尽力而为，对端已断也不报错（连接已坏时干脆不发，避开 Windows 断连状态）
         self.seq = 0;
-        self.writePacket(&[_]u8{COM_QUIT}) catch {};
+        if (!self.broken) self.writePacket(&[_]u8{COM_QUIT}) catch {};
         self.stream.close(self.io);
     }
 
@@ -697,7 +699,7 @@ pub const Conn = struct {
                         if (data.len == 1 and data[0] == 0x04) {
                             // 完整鉴权：请求服务端公钥 → RSA-OAEP 加密 (密码 XOR scramble) → 发送
                             // 与 C# 绿色版 `DH.MySql/Authentication.cs` 的 PerformFullAuthenticationAsync 一致
-                            try self.performFullAuth(opts.password, scramble);
+                            try self.performFullAuth(opts.password, initial_scramble);
                             return;
                         }
                         self.setError("caching_sha2_password 返回未知状态字节 0x{x}", .{if (data.len > 0) data[0] else 0});
@@ -716,8 +718,15 @@ pub const Conn = struct {
 
     /// `caching_sha2_password` 完整鉴权（明文连接下的默认路径）：
     /// 1. 发 `0x02`（request_public_key）；2. 收 `0x01` + PEM 公钥；
-    /// 3. `obf = password XOR scramble`；4. `RSAES-OAEP(SHA1)` 加密后发送；5. 收 OK。
-    /// 与 C# 绿色版 `DH.MySql/Authentication.cs` 的 `PerformFullAuthenticationAsync` 一致。
+    /// 3. `plain = password + '\0'`，用**握手 nonce** 循环 XOR（与 C# `GetXor` 一致）；
+    /// 4. **RSAES-PKCS1-v1_5** 加密后发送；5. 收 OK。
+    ///
+    /// 填充的实测口径（2026-11-11，MySQL 8.0.29 真库）：
+    /// - `RSAES-OAEP(SHA1)` 实现本身正确（本仓 `crypto/rsa.zig` 的产物能被 openssl
+    ///   `pkeyutl -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha1` 解出原文），
+    ///   但服务端回 `1045 Access denied`；
+    /// - 改成 **PKCS#1 v1.5** 后同一个库、同一账号立即登入成功 → 该版本服务端接受 PKCS1。
+    /// OAEP 实现保留在 `crypto/rsa.zig`（已单测），后续遇到只认 OAEP 的服务端再切回。
     fn performFullAuth(self: *Conn, password: []const u8, scramble: []const u8) !void {
         const rsa = @import("../crypto/rsa.zig");
         if (scramble.len == 0) {
@@ -738,14 +747,14 @@ pub const Conn = struct {
         };
         defer pub_key.deinit();
 
-        // MySQL 规范的 full auth：XOR((password || '\0'), nonce)，**含结尾 NUL**
+        // 口令以 '\0' 结尾后再循环 XOR（C# `GetXor` 同样补了结尾 0）
         const obf = try self.gpa.alloc(u8, password.len + 1);
         defer self.gpa.free(obf);
         for (password, 0..) |b, i| obf[i] = b ^ scramble[i % scramble.len];
         obf[password.len] = 0 ^ scramble[password.len % scramble.len];
 
-        const cipher = rsa.oaepSha1Encrypt(self.gpa, self.io, pub_key, obf) catch |e| {
-            self.setError("RSA-OAEP 加密密码失败：{s}", .{@errorName(e)});
+        const cipher = rsa.pkcs1Encrypt(self.gpa, self.io, pub_key, obf) catch |e| {
+            self.setError("RSA-PKCS1 加密密码失败：{s}", .{@errorName(e)});
             return e;
         };
         defer self.gpa.free(cipher);
@@ -808,15 +817,18 @@ pub const Conn = struct {
                 .socket_handle = self.stream.socket.handle,
                 .data = &slices,
             } }) catch |e| {
+                self.broken = true;
                 self.setError("读 socket 失败：{s}", .{@errorName(e)});
                 return e;
             };
             const res = r.net_read catch |e| {
+                self.broken = true;
                 self.setError("读 socket 失败：{s}", .{@errorName(e)});
                 return e;
             };
             const n = res.data_len;
             if (n == 0) {
+                self.broken = true;
                 self.setError("连接被对端关闭（已读 {d}/{d} 字节）", .{ got, dst.len });
                 return error.ConnectionClosed;
             }
@@ -848,14 +860,17 @@ pub const Conn = struct {
                 .socket_handle = self.stream.socket.handle,
                 .data = &.{bytes[sent..]},
             } }) catch |e| {
+                self.broken = true;
                 self.setError("写 socket 失败：{s}", .{@errorName(e)});
                 return e;
             };
             const n = result.net_write catch |e| {
+                self.broken = true;
                 self.setError("写 socket 失败：{s}", .{@errorName(e)});
                 return e;
             };
             if (n == 0) {
+                self.broken = true;
                 self.setError("写 socket 返回 0 字节（连接可能已断开）", .{});
                 return error.ConnectionClosed;
             }
@@ -1165,12 +1180,13 @@ fn textValue(arena: std.mem.Allocator, col: Column, raw: []const u8) !Value {
             return .{ .datetime = dt };
         },
         .bit => {
-            // 与 C# 绿色版 `DH.MySql` 口径一致：BIT 文本协议按**小端**字节序还原
-            // （对应 `MySqlFieldCodec.ConvertBitBytesToUInt64`）；Rust `Pek.RCode` 反之，已记入决策记录。
+            // 实测口径（MySQL 8.0.29 真库，Pek.ZCode 集成用例锁定）：BIT 列在文本协议下是
+            // **大端**字节（存 0x0102 读回字节为 [0x01,0x02] → 值 258）。
+            // 注意：C# 绿色版 `DH.MySql.ConvertBitBytesToUInt64` 按小端累加（同一数据会得到 513），
+            // 与实测不符；Rust `Pek.RCode` 的大端与实测一致。
             var acc: u64 = 0;
-            for (raw, 0..) |b, idx| {
-                if (idx >= 8) break;
-                acc |= @as(u64, b) << @intCast(idx * 8);
+            for (raw) |b| {
+                acc = (acc << 8) | b;
             }
             return .{ .int = @intCast(acc) };
         },
@@ -1257,10 +1273,7 @@ fn binaryValue(arena: std.mem.Allocator, col: Column, payload: []const u8, pos: 
                 },
                 .bit => blk: {
                     var acc: u64 = 0;
-                    for (raw, 0..) |b, idx| {
-                        if (idx >= 8) break;
-                        acc |= @as(u64, b) << @intCast(idx * 8);
-                    }
+                    for (raw) |b| acc = (acc << 8) | b;
                     break :blk .{ .int = @intCast(acc) };
                 },
                 .blob, .tiny_blob, .medium_blob, .long_blob => if (col.isBinaryCharset())
