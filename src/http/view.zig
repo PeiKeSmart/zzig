@@ -989,6 +989,8 @@ const RenderCtx = struct {
     body: []const u8 = "",
     /// 当前模板声明的布局名（`null` = 无布局）
     layout_name: ?[]const u8 = null,
+    /// 当前正在渲染的子模板层数（Partial / 组件）；>0 时不允许定义分区
+    sub_views: usize = 0,
     depth: usize = 0,
     err: ?[]const u8 = null,
 };
@@ -1065,6 +1067,9 @@ fn renderNodes(
                 };
             },
             .section => |section| {
+                if (rc.sub_views > 0) {
+                    return renderFail(rc, "分部视图/组件不能定义分区 `{s}`（请把分区写到页面或布局）", .{section.name});
+                }
                 if (rc.sections.contains(section.name)) {
                     return renderFail(rc, "分区 `{s}` 重复定义", .{section.name});
                 }
@@ -1150,10 +1155,12 @@ fn renderSubTemplate(rc: *RenderCtx, template: *Template, model: Value, writer: 
     rc.model = model;
     rc.body = "";
     rc.depth += 1;
+    rc.sub_views += 1;
     defer {
         rc.model = saved_model;
         rc.body = saved_body;
         rc.depth -= 1;
+        rc.sub_views -= 1;
     }
     var ignored: ?[]const u8 = null;
     try renderNodes(rc, template.nodes, null, writer, &ignored);
@@ -2132,5 +2139,28 @@ test "view：组件语法子集外显式报错" {
     switch (compile(arena, "@await Component.RenderAsync(\"X\")")) {
         .ok => return error.TestUnexpectedResult,
         .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "仅支持 InvokeAsync / Invoke") != null),
+    }
+}
+
+test "view：分部视图/组件内定义分区显式报错" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-section-guard");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Shared/_Part.cshtml", .{dir}), "@section Scripts {<script>x()</script>}");
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    renderer.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir}));
+
+    switch (renderSourceWith(arena, &renderer, "home", "@Html.Partial(\"_Part\")", value.ofNull())) {
+        .html => return error.TestUnexpectedResult,
+        .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "不能定义分区") != null),
     }
 }
