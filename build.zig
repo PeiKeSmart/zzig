@@ -420,7 +420,56 @@ const versions = struct {
         const web_example_step = b.step("web-demo", "运行 Web MVC 示例（Controller + 视图 + 区域 + wwwroot）");
         web_example_step.dependOn(&run_web_example.step);
 
+        // ========== SPA 资源表生成器（供消费方 build.zig 通过 artifact 调用）==========
+        // 消费方用法：
+        //   const dep = b.dependency("zzig", .{});
+        //   const gen = b.addRunArtifact(dep.artifact("zzig-spa-gen"));
+        //   gen.addArg("--dist"); gen.addArg("web/dist");
+        //   gen.addArg("--out");  const out = gen.addOutputFileArg("spa_assets.zig");
+        //   mod.addAnonymousImport("spa_assets", .{ .root_source_file = out });
+        const spa_gen_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "src", "build", "spa_gen.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        const spa_gen_exe = b.addExecutable(.{
+            .name = "zzig-spa-gen",
+            .root_module = spa_gen_module,
+        });
+        b.installArtifact(spa_gen_exe);
+
         const test_step = b.step("test", "Run unit tests");
+
+        // ========== Vue/SPA 单 exe 演示（前端 dist 编译期嵌入）==========
+        const spa_gen_run = b.addRunArtifact(spa_gen_exe);
+        spa_gen_run.addArg("--dist");
+        spa_gen_run.addArg(b.pathJoin(&.{ "examples", "spa", "web", "dist" }));
+        spa_gen_run.addArg("--out");
+        const spa_assets_file = spa_gen_run.addOutputFileArg("spa_assets.zig");
+
+        const spa_demo_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "spa_demo.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        spa_demo_module.addImport("zzig", zzig);
+        spa_demo_module.addAnonymousImport("spa_assets", .{ .root_source_file = spa_assets_file });
+
+        const spa_demo_exe = b.addExecutable(.{
+            .name = "spa_demo",
+            .root_module = spa_demo_module,
+        });
+        // 演示程序始终安装（0.17 下 build_examples 默认 false，否则拿不到 exe）
+        b.installArtifact(spa_demo_exe);
+
+        const run_spa_demo = b.addRunArtifact(spa_demo_exe);
+        const spa_demo_step = b.step("spa-demo", "运行 Vue/SPA 单 exe 演示（dist 编译期嵌入）");
+        spa_demo_step.dependOn(&run_spa_demo.step);
+
+        // 生成器自身单测（自包含，独立编译）
+        const spa_gen_tests = b.addTest(.{ .name = "spa-gen-tests", .root_module = spa_gen_module });
+        const run_spa_gen_tests = b.addRunArtifact(spa_gen_tests);
+        test_step.dependOn(&run_spa_gen_tests.step);
 
         // 创建测试模块
         const test_module = b.createModule(.{

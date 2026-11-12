@@ -271,6 +271,15 @@ pub const StaticFiles = struct {
         for (files) |file| try self.embed(file.path, file.data, file.content_type);
     }
 
+    /// 把「编译期生成的资源表」批量嵌入（前端 dist → 单 exe）。
+    ///
+    /// `files` 的每个元素只需有 `.path` 与 `.data`（见 `build/spa_gen.zig` 生成的表）：
+    /// 内容类型按扩展名自动推断（与磁盘下发同一张 MIME 表）。
+    /// 嵌入资源**不受**「未知扩展名默认拒绝」策略限制 —— 走到这里说明开发者已明确要提供它们。
+    pub fn embedAssets(self: *StaticFiles, files: anytype) !void {
+        for (files) |f| try self.embed(f.path, f.data, mimeType(f.path));
+    }
+
     /// 已注册嵌入资源数量（`0` = 纯磁盘模式）。
     pub fn embeddedCount(self: *const StaticFiles) usize {
         return self.embedded.count();

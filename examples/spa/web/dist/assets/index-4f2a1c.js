@@ -1,0 +1,1 @@
+console.log("zzig spa bundle v1");
