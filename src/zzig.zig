@@ -30,6 +30,60 @@ pub const HttpEnhanced = @import("http/enhanced.zig");
 /// 极简 HTTP/1.1 服务端（监听+线程+上限；鉴权/限流在业务层）
 pub const http_server = @import("http/server.zig");
 
+/// Web 应用栈（对齐 ASP.NET Core / DH.RustBase 的 MVC 约定）
+///
+/// - `web.App`：装配路由 + 控制器 + 视图 + 静态资源，并桥接 `http_server`；
+/// - `web.Controller`：动作分发 `/{prefix}/{action}` + 参数绑定（路由→查询→表单→JSON）；
+/// - `web.view`：Razor 子集视图引擎（`Views/{Controller}/{Action}.cshtml`、`Areas/{Area}/Views`、
+///   布局/分区/Partial、模板缓存）；
+/// - `web.static_files`：`wwwroot` 静态资源（MIME / 默认文档 / ETag 304 / 目录穿越防护 /
+///   区域多根 / 嵌入资源 / SPA 回退）；
+/// - `web.Value`：视图模型值（对象/列表/标量 + JSON 解析/序列化 + C# 口径文本化）。
+///
+/// 用法：
+/// ```zig
+/// var app = try zzig.web.App.init(allocator, io, .{});
+/// defer app.deinit();
+///
+/// var home = try zzig.web.Controller.init(allocator, io, "home");
+/// defer home.deinit();
+/// try home.get("index", HomeController.index);
+/// try app.mountController(&home);
+///
+/// try app.run("127.0.0.1", 8080, .{});
+/// ```
+pub const web = struct {
+    pub const router = @import("http/router.zig");
+    pub const controller = @import("http/controller.zig");
+    pub const view = @import("http/view.zig");
+    pub const static_files = @import("http/static_files.zig");
+    pub const value = @import("http/value.zig");
+    pub const App = @import("http/web.zig").App;
+    pub const Options = @import("http/web.zig").Options;
+
+    pub const Value = @import("http/value.zig").Value;
+    pub const Field = @import("http/value.zig").Field;
+    pub const ObjectBuilder = @import("http/value.zig").ObjectBuilder;
+    pub const Ctx = @import("http/router.zig").Ctx;
+    pub const Request = @import("http/router.zig").Request;
+    pub const Response = @import("http/router.zig").Response;
+    pub const Handler = @import("http/router.zig").Handler;
+    pub const handler = @import("http/router.zig").handler;
+    pub const middleware = @import("http/router.zig").middleware;
+
+    pub const Controller = @import("http/controller.zig").Controller;
+    pub const ActionResult = @import("http/controller.zig").ActionResult;
+    pub const arg = @import("http/controller.zig").arg;
+    pub const argInt = @import("http/controller.zig").argInt;
+    pub const argBool = @import("http/controller.zig").argBool;
+    pub const jsonResult = @import("http/controller.zig").jsonResult;
+    pub const viewResult = @import("http/controller.zig").viewResult;
+    pub const viewNamed = @import("http/controller.zig").viewNamed;
+
+    pub const ViewRenderer = @import("http/view.zig").ViewRenderer;
+    pub const StaticFiles = @import("http/static_files.zig").StaticFiles;
+};
+
 /// 网络工具（CIDR 解析、IP 处理、接口检测）
 pub const Net = @import("net/net.zig");
 
@@ -250,6 +304,12 @@ test {
     _ = @import("db/tds.zig");
     _ = @import("db/tds_loopback_test.zig");
     _ = @import("http/server.zig");
+    _ = @import("http/value.zig");
+    _ = @import("http/router.zig");
+    _ = @import("http/static_files.zig");
+    _ = @import("http/view.zig");
+    _ = @import("http/controller.zig");
+    _ = @import("http/web.zig");
     _ = @import("crypto/rsa.zig");
     _ = @import("crypto/hash_util.zig");
     _ = @import("file/glob.zig");

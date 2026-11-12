@@ -159,11 +159,13 @@ pub fn main() !void {
 | **Console** | [控制台工具文档](docs/console_usage.md) | UTF-8 + ANSI 颜色支持 |
 | **Logger** | [同步日志文档](docs/logger_usage.md) | 简单同步日志 |
 | **JSON** | [JSON 解析器教程](docs/json_usage.md) | 高性能 JSON 解析库 |
+| **Web（MVC）** | [Web MVC 一体化](docs/web_mvc.md) | Controller / Razor 子集视图 / 区域（Areas）/ wwwroot 静态资源 |
 | **File** | (开发中) | 文件和目录操作 |
 | **Strings** | (开发中) | 字符串处理工具 |
 | **Randoms** | (开发中) | 随机数生成器 |
 
 ### 详细文档
+- [Web MVC 一体化（Controller / 视图 / 区域 / wwwroot）](docs/web_mvc.md) ⭐ 新增
 - [零分配实现分析](docs/zero_allocation_implementation.md)
 - [异步日志配置指南](docs/async_logger_config.md)
 - [ARMv6 兼容性说明](docs/armv6_compatibility.md) ⭐ 新增
@@ -193,6 +195,9 @@ zig build zero-alloc-demo
 
 # 日志轮转测试
 zig build rotation-test
+
+# Web MVC 示例（Controller + 视图 + 区域 + wwwroot，监听 127.0.0.1:8080）
+zig build web-demo
 
 # 压力测试
 zig build stress-test

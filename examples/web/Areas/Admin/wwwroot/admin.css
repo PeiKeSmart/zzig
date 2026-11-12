@@ -1,0 +1,10 @@
+body {
+    margin: 0;
+    padding: 24px;
+    font: 15px/1.6 "Segoe UI", system-ui, sans-serif;
+    background: #101a12;
+    color: #dff3e3;
+}
+h1 { color: #8fdca0; }
+code { background: #1b2a1f; padding: 1px 5px; border-radius: 4px; }
+a { color: #9fd8ff; }

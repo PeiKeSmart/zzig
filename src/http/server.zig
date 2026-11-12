@@ -35,6 +35,8 @@ pub const Reply = struct {
     status: std.http.Status = .ok,
     body: []const u8 = "",
     content_type: []const u8 = "application/json; charset=utf-8",
+    /// 附加响应头（`location`/`etag`/`allow` 等；与 `content-type`/`connection` 重名时以后者为准）
+    headers: []const std.http.Header = &.{},
 };
 
 pub const Options = struct {
@@ -206,13 +208,23 @@ pub const Server = struct {
 
         try req.respond(reply.body, .{
             .status = reply.status,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = reply.content_type },
-                .{ .name = "connection", .value = "close" },
-            },
+            .extra_headers = try buildHeaders(arena, reply),
         });
     }
 };
+
+/// 组装响应头：`content-type` → 业务附加头（跳过重名）→ `connection: close`。
+fn buildHeaders(arena: std.mem.Allocator, reply: Reply) ![]const std.http.Header {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
+    for (reply.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        try headers.append(arena, header);
+    }
+    try headers.append(arena, .{ .name = "connection", .value = "close" });
+    return headers.items;
+}
 
 const testing = std.testing;
 

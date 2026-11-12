@@ -401,6 +401,25 @@ const versions = struct {
         const xml_test_step = b.step("xml-test", "运行 XML 模块单元测试");
         xml_test_step.dependOn(&run_xml_tests.step);
 
+        // ========== Web（Controller / 视图 / 区域 / wwwroot）示例 ==========
+        const web_example_module = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ "examples", "web_mvc_example.zig" })),
+            .target = target,
+            .optimize = optimize,
+        });
+        web_example_module.addImport("zzig", zzig);
+
+        const web_example_exe = b.addExecutable(.{
+            .name = "web_mvc_example",
+            .root_module = web_example_module,
+        });
+        if (build_examples) b.installArtifact(web_example_exe);
+
+        const run_web_example = b.addRunArtifact(web_example_exe);
+
+        const web_example_step = b.step("web-demo", "运行 Web MVC 示例（Controller + 视图 + 区域 + wwwroot）");
+        web_example_step.dependOn(&run_web_example.step);
+
         const test_step = b.step("test", "Run unit tests");
 
         // 创建测试模块

@@ -1,0 +1,9 @@
+@{ Layout = "Shared/_Layout"; }
+<h1>@Model.Title</h1>
+<p>共 <strong>@Model.Count</strong> 项：</p>
+<ul>
+@foreach (var item in Model.Items) {<li>@item</li>}
+</ul>
+@if (Model.Count > 2) {<p class="hint">条目多于 2 条（条件与比较运算）。</p>} else {<p class="hint">条目不超过 2 条。</p>}
+<p class="hint">上面这行是真实的条件输出；要输出字面量 Razor 标记请写 <code>@@if</code>。</p>
+@section Scripts {<script>console.log("index ready");</script>}

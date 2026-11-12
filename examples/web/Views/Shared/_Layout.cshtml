@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@Model.Title - zzig Web</title>
+    <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+    <header class="topbar">
+        <strong>zzig Web</strong>
+        <nav>
+            <a href="/home/index">首页</a>
+            <a href="/home/about">关于</a>
+            <a href="/admin/dashboard/index">区域后台</a>
+            <a href="/api/ping">ping</a>
+        </nav>
+    </header>
+    <main>@RenderBody()</main>
+    <footer class="footer">zzig Web MVC 示例 · 视图来自 Views/Shared/_Layout.cshtml</footer>
+    @RenderSection("Scripts", false)
+</body>
+</html>
