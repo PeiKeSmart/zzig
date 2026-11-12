@@ -17,6 +17,7 @@
 const std = @import("std");
 const fsio = @import("../file/fsio.zig");
 const router = @import("router.zig");
+const strings = @import("../string/strings.zig");
 
 /// 嵌入资源条目（编译期数据）。
 pub const EmbeddedFile = struct {
@@ -326,7 +327,7 @@ pub const StaticFiles = struct {
         }
         // 内容协商：客户端接受 gzip 时优先下发预压缩的 `.gz`
         const ae = req.header("accept-encoding") orelse "";
-        const accept_gzip = containsIgnoreCase(ae, "gzip");
+        const accept_gzip = strings.containsIgnoreCase(ae, "gzip");
         const response = try self.serveInternal(arena, req.path, req.header("if-none-match"), accept_gzip);
         if (response) |resp| {
             if (std.ascii.eqlIgnoreCase(req.method, "HEAD")) {
@@ -687,17 +688,6 @@ const gzip_headers = [_]std.http.Header{
     .{ .name = "content-encoding", .value = "gzip" },
     .{ .name = "vary", .value = "accept-encoding" },
 };
-
-/// 大小写不敏感的子串查找（`Accept-Encoding: GZip, deflate` 这类头值）。
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
 
 /// 磁盘响应的可选调整（预压缩用）。
 const DiskOpts = struct {

@@ -51,6 +51,19 @@ pub fn Contains(a: []const u8, b: []const u8) bool {
 ///
 /// 返回值:
 /// - 返回值: 如果 a 小于 b，则返回 true；否则返回 false。
+/// 大小写不敏感的子串查找（HTTP 头值匹配用，如 `Accept-Encoding: GZip, deflate`）。
+///
+/// 为什么放这里：`http/web.zig` 与 `http/static_files.zig` 都要用它，
+/// 原先各写一份 —— 同一逻辑出现第二份就下沉（避免两处行为漂移）。
+pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
 pub fn CompareStrings(context: void, a: []const u8, b: []const u8) bool {
     _ = context; // 避免未使用参数的警告
     return std.mem.lessThan(u8, a, b); // 使用 std.mem.lessThan 比较字符串

@@ -47,6 +47,30 @@ pub fn gzipDecompressAlloc(allocator: std.mem.Allocator, compressed: []const u8)
     return try output.toOwnedSlice();
 }
 
+/// gzip 压缩（服务端响应 / gRPC 消息用）。`level` 见 `std.compress.flate.Compress.Options`。
+///
+/// 注意：`Compress.init` 断言输出缓冲 > 8 字节，所以必须用 `initCapacity` 预分配。
+pub fn gzipCompressAlloc(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    level: std.compress.flate.Compress.Options,
+) ![]u8 {
+    var output = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+    errdefer output.deinit();
+
+    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(window);
+
+    // Compress 结构体约 224K，放堆上避免大栈帧
+    const compressor = try allocator.create(std.compress.flate.Compress);
+    defer allocator.destroy(compressor);
+    compressor.* = try std.compress.flate.Compress.init(&output.writer, window, .gzip, level);
+    try compressor.writer.writeAll(input);
+    try compressor.finish();
+
+    return try output.toOwnedSlice();
+}
+
 pub fn percentEncodeFormComponent(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);

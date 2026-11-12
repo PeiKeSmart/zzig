@@ -26,6 +26,8 @@ const controller = @import("controller.zig");
 const static_files = @import("static_files.zig");
 const view = @import("view.zig");
 const value = @import("value.zig");
+const http = @import("http.zig");
+const strings = @import("../string/strings.zig");
 
 /// 请求上下文。
 pub const Ctx = router.Ctx;
@@ -48,6 +50,11 @@ pub const Options = struct {
     spa_fallback: bool = false,
     /// SPA 回退排除前缀（后端 API 前缀保持 JSON 404）
     spa_excludes: []const []const u8 = &.{"/api"},
+
+    /// 动态响应 gzip（JSON/HTML 等文本类；静态文件另由预压缩负责）
+    gzip: bool = true,
+    /// 动态响应压缩的最小体积（小报文压完反而变大，对齐 DH.RustBase 的 256）
+    gzip_min_size: usize = 256,
 };
 
 /// Web 应用。
@@ -167,6 +174,62 @@ pub const App = struct {
 
     /// 处理一个请求（路由 → 静态资源 → 404）。
     pub fn dispatch(self: *App, arena: std.mem.Allocator, req: Request) !Response {
+        const response = try self.dispatchInner(arena, req);
+        return self.maybeCompress(arena, req, response);
+    }
+
+    /// 动态响应 gzip（对齐 DH.RustBase 的 `finalize_http_response`）：
+    /// 文本类 + 达阈值 + 客户端接受；流式文件/HEAD/已编码的请求一律不碰。
+    fn maybeCompress(
+        self: *App,
+        arena: std.mem.Allocator,
+        req: Request,
+        response: Response,
+    ) !Response {
+        // 流式文件（大静态资源）与 HEAD（只声明长度）不参与压缩
+        if (response.file != null or response.content_length != null) return response;
+        // 空正文（302/204 等）既无压缩价值，也不该被加上 Vary
+        if (response.body.len == 0) return response;
+        if (!isCompressibleType(response.content_type)) return response;
+        // 已经编码过的不动
+        for (response.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-encoding")) return response;
+        }
+
+        var accept_gzip = false;
+        for (req.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding") and containsIgnoreCase(h.value, "gzip")) {
+                accept_gzip = true;
+                break;
+            }
+        }
+
+        const try_gzip = self.options.gzip and accept_gzip and response.body.len >= self.options.gzip_min_size;
+        if (!try_gzip) return withVary(arena, response);
+
+        const gz = http.gzipCompressAlloc(arena, response.body, .default) catch |e| {
+            std.debug.print("[zzig.web] 响应 gzip 失败（{d} 字节，{s}）：{s}\n", .{
+                response.body.len, response.content_type, @errorName(e),
+            });
+            return withVary(arena, response);
+        };
+        // 压完不更小就不压（小报文/已压缩内容常见）
+        if (gz.len >= response.body.len) return withVary(arena, response);
+
+        const headers = try arena.alloc(std.http.Header, response.headers.len + 2);
+        @memcpy(headers[0..response.headers.len], response.headers);
+        headers[response.headers.len] = .{ .name = "content-encoding", .value = "gzip" };
+        headers[response.headers.len + 1] = .{ .name = "vary", .value = "accept-encoding" };
+
+        return .{
+            .status = response.status,
+            .content_type = response.content_type,
+            .body = gz,
+            .headers = headers,
+        };
+    }
+
+    fn dispatchInner(self: *App, arena: std.mem.Allocator, req: Request) !Response {
         var ctx = try Ctx.build(arena, req);
         defer ctx.deinit();
 
@@ -253,6 +316,41 @@ pub const App = struct {
 
 const testing = std.testing;
 const compat = @import("../compat.zig");
+
+/// 可压缩类型的 Content-Type 判定（文本类 + JSON/JS/XML/SVG；已压缩格式明确排除）。
+fn isCompressibleType(content_type: []const u8) bool {
+    const semi = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    const ct = std.mem.trim(u8, content_type[0..semi], " \t");
+    if (ct.len >= 5 and std.ascii.eqlIgnoreCase(ct[0..5], "text/")) return true;
+    const list = [_][]const u8{
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/manifest+json",
+        "image/svg+xml",
+    };
+    for (list) |x| {
+        if (std.ascii.eqlIgnoreCase(ct, x)) return true;
+    }
+    return false;
+}
+
+/// 大小写不敏感的子串查找（`Accept-Encoding: GZip, deflate`）—— 共享实现见 `string/strings.zig`.
+const containsIgnoreCase = strings.containsIgnoreCase;
+
+/// 可压缩类型但本次没压缩时也要带 `Vary`（否则代理/缓存会把两种表示混用）。
+fn withVary(arena: std.mem.Allocator, response: Response) !Response {
+    for (response.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "vary")) return response;
+    }
+    const headers = try arena.alloc(std.http.Header, response.headers.len + 1);
+    @memcpy(headers[0..response.headers.len], response.headers);
+    headers[response.headers.len] = .{ .name = "vary", .value = "accept-encoding" };
+    var out = response;
+    out.headers = headers;
+    return out;
+}
 
 fn buildRequest(method: []const u8, path: []const u8) Request {
     return .{ .method = method, .path = path };
@@ -509,4 +607,70 @@ test "web：wwwroot 可改 + 额外静态根 + 流式文件桥接" {
     try testing.expect(reply.file != null);
     try testing.expectEqual(@as(u64, 10), reply.file.?.length);
     reply.file.?.file.close(io);
+}
+
+test "web：动态响应按 Accept-Encoding 做 gzip（JSON ≥ 阈值，带 Vary）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    var app = try App.init(testing.allocator, io, .{ .wwwroot = null });
+    defer app.deinit();
+
+    // 构造 > 256 字节的可压缩正文
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    for (0..20) |i| {
+        try big.appendSlice(arena, "{\"k\":\"vvvvvvvvvvvvvvvv\"},");
+        _ = i;
+    }
+    const payload = big.items;
+    const resp = Response{
+        .status = .ok,
+        .content_type = "application/json; charset=utf-8",
+        .body = payload,
+    };
+
+    const with_gzip = Request{
+        .method = "GET",
+        .path = "/api/x",
+        .headers = &.{.{ .name = "accept-encoding", .value = "GZip, deflate" }},
+    };
+    const gz = try app.maybeCompress(arena, with_gzip, resp);
+    try testing.expect(gz.body.len < payload.len);
+    var saw_ce = false;
+    var saw_vary = false;
+    for (gz.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding") and std.ascii.eqlIgnoreCase(h.value, "gzip")) saw_ce = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "vary")) saw_vary = true;
+    }
+    try testing.expect(saw_ce);
+    try testing.expect(saw_vary);
+
+    // 解压回来必须与原正文一致
+    const round = try http.gzipDecompressAlloc(testing.allocator, gz.body);
+    defer testing.allocator.free(round);
+    try testing.expectEqualStrings(payload, round);
+
+    // 不带 Accept-Encoding → 原文，但仍带 Vary（同 URL 两种表示）
+    const no_gzip = Request{ .method = "GET", .path = "/api/x" };
+    const plain_resp = try app.maybeCompress(arena, no_gzip, resp);
+    try testing.expectEqualStrings(payload, plain_resp.body);
+    var saw_vary2 = false;
+    for (plain_resp.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "vary")) saw_vary2 = true;
+    }
+    try testing.expect(saw_vary2);
+
+    // 小正文（< 256）不压
+    const small_resp = Response{ .status = .ok, .content_type = "application/json", .body = "{\"a\":1}" };
+    const small = try app.maybeCompress(arena, with_gzip, small_resp);
+    try testing.expectEqualStrings("{\"a\":1}", small.body);
+
+    // 流式文件不压
+    var file_resp = resp;
+    file_resp.file = .{ .file = undefined, .length = payload.len };
+    const untouched = try app.maybeCompress(arena, with_gzip, file_resp);
+    try testing.expect(untouched.file != null);
+    try testing.expectEqual(payload.len, untouched.body.len);
 }
