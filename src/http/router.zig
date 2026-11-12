@@ -47,12 +47,26 @@ pub const Request = struct {
     }
 };
 
+/// 文件响应体（大文件走流式，避免整个读进内存）。
+///
+/// **句柄所有权**：谁最终发送就由谁关闭——`App.serverHandler` 交给 `http/server` 后由服务端关闭；
+/// 直接调用 `dispatch` 的调用方需自行 `file.close(io)`。
+pub const FileBody = struct {
+    file: std.Io.File,
+    /// 要发送的字节数（从文件起始位置 0 开始）
+    length: u64,
+};
+
 /// 业务层返回的响应（`body` 生命周期由调用方保证：通常借用请求 arena）。
 pub const Response = struct {
     status: std.http.Status = .ok,
     content_type: []const u8 = "application/json; charset=utf-8",
     body: []const u8 = "",
     headers: []const std.http.Header = &.{},
+    /// 非空时忽略 `body`，由服务端流式发送文件
+    file: ?FileBody = null,
+    /// 无正文但需声明长度（典型：`HEAD`）；`null` = 由 `body` 长度决定
+    content_length: ?u64 = null,
 
     /// JSON 响应（200）。
     pub fn json(body: []const u8) Response {

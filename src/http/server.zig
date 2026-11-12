@@ -37,6 +37,16 @@ pub const Reply = struct {
     content_type: []const u8 = "application/json; charset=utf-8",
     /// 附加响应头（`location`/`etag`/`allow` 等；与 `content-type`/`connection` 重名时以后者为准）
     headers: []const std.http.Header = &.{},
+    /// 非空时忽略 `body`，从文件起始位置流式发送 `length` 字节；**句柄由服务端负责关闭**
+    file: ?FileBody = null,
+    /// 无正文但需声明长度（典型：`HEAD`）；`null` = 由 `body` 长度决定
+    content_length: ?u64 = null,
+};
+
+/// 文件响应体（大文件用；避免整个读进内存）。
+pub const FileBody = struct {
+    file: std.Io.File,
+    length: u64,
 };
 
 pub const Options = struct {
@@ -206,6 +216,65 @@ pub const Server = struct {
             return;
         };
 
+        // 文件响应：流式发送（大文件不整读进内存）
+        if (reply.file) |file_body| {
+            defer file_body.file.close(self.io);
+
+            var body_buf: [8 * 1024]u8 = undefined;
+            var bw = try req.respondStreaming(&body_buf, .{
+                .content_length = file_body.length,
+                .respond_options = .{
+                    .status = reply.status,
+                    .extra_headers = try buildHeaders(arena, reply),
+                },
+            });
+
+            // HEAD：只发头（respondStreaming 已按 content-length 写好），不读文件。
+            // 注意：eliding 分支不会递减 content-length 状态，此处**不能** end()（会断言长度不符），
+            // 只把已写的响应头刷出去即可。
+            if (req.head.method == .HEAD) {
+                try bw.flush();
+                return;
+            }
+
+            var read_buf: [32 * 1024]u8 = undefined;
+            var remaining = file_body.length;
+            while (remaining > 0) {
+                const want: usize = @intCast(@min(remaining, read_buf.len));
+                const n = file_body.file.readStreaming(self.io, &.{read_buf[0..want]}) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    else => return e,
+                };
+                if (n == 0) break;
+                try bw.writer.writeAll(read_buf[0..n]);
+                remaining -= n;
+            }
+
+            if (remaining > 0) {
+                // 文件被截断：content-length 已声明，不能再 end()（会断言长度不符），
+                // 直接返回让连接关闭，并留下可定位的日志。
+                std.debug.print(
+                    "[zzig.http] 发送文件时被截断：已声明 {d} 字节，还差 {d} 字节\n",
+                    .{ file_body.length, remaining },
+                );
+                return;
+            }
+            try bw.end();
+            return;
+        }
+
+        // 无正文但需声明长度（通常 HEAD）：transfer-encoding none + 自填 content-length
+        if (reply.content_length) |length| {
+            const headers = try buildHeadersWithLength(arena, reply, length);
+            try req.respond("", .{
+                .status = reply.status,
+                .transfer_encoding = .none,
+                .keep_alive = false,
+                .extra_headers = headers,
+            });
+            return;
+        }
+
         try req.respond(reply.body, .{
             .status = reply.status,
             .extra_headers = try buildHeaders(arena, reply),
@@ -220,8 +289,27 @@ fn buildHeaders(arena: std.mem.Allocator, reply: Reply) ![]const std.http.Header
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         try headers.append(arena, header);
     }
+    try headers.append(arena, .{ .name = "connection", .value = "close" });
+    return headers.items;
+}
+
+/// 同上，但额外带上明确的 `content-length`（无正文的 HEAD 响应）。
+fn buildHeadersWithLength(arena: std.mem.Allocator, reply: Reply, length: u64) ![]const std.http.Header {
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
+    for (reply.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        try headers.append(arena, header);
+    }
+    try headers.append(arena, .{
+        .name = "content-length",
+        .value = try std.fmt.allocPrint(arena, "{d}", .{length}),
+    });
     try headers.append(arena, .{ .name = "connection", .value = "close" });
     return headers.items;
 }
@@ -320,4 +408,140 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
     try testing.expect(std.mem.indexOf(u8, resp_buf[0..got], "{\"len\":5}") != null);
     try testing.expect(ctx.ok);
     std.debug.print("[http] 端到端 OK：收到 {d} 字节响应\n", .{got});
+}
+
+test "HTTP 服务端：文件流式响应（真 socket，GET + HEAD）" {
+    const Ctx = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        impl: Server,
+        path: []const u8,
+        ok: bool = false,
+
+        fn handler(raw: *anyopaque, _: RequestView, _: std.mem.Allocator) anyerror!Reply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // 每次请求各开一个句柄（服务端负责关闭）
+            const file = try std.Io.Dir.cwd().openFile(self.io, self.path, .{});
+            return .{
+                .content_type = "application/octet-stream",
+                .file = .{ .file = file, .length = 10 },
+            };
+        }
+
+        fn serve(self: *@This()) void {
+            const stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            self.impl.serveOne(stream) catch |e| {
+                std.debug.print("[FAIL] serveOne（文件流）：{s}\n", .{@errorName(e)});
+                return;
+            };
+            self.ok = true;
+        }
+    };
+
+    const io = compat.currentIo();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/http-stream-{d}.bin", .{compat.nanoTimestamp()});
+    defer testing.allocator.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "0123456789");
+    }
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39351;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39370) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39351-39369 端口均不可用，跳过文件流式用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+        .path = path,
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+
+    // 第一轮：GET —— 校验正文与 content-length
+    {
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+            th.join();
+            std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+            return;
+        };
+        defer stream.close(io);
+
+        var cw_buf: [2048]u8 = undefined;
+        var cw = stream.writer(io, &cw_buf);
+        try cw.interface.writeAll("GET /pkg HTTP/1.1\r\nHost: x\r\n\r\n");
+        try cw.interface.flush();
+
+        var cr_buf: [4096]u8 = undefined;
+        var cr = stream.reader(io, &cr_buf);
+        var resp_buf: [2048]u8 = undefined;
+        var got: usize = 0;
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) {
+            const n = try cr.interface.readSliceShort(resp_buf[got..]);
+            if (n == 0) break;
+            got += n;
+            if (std.mem.indexOf(u8, resp_buf[0..got], "0123456789") != null) break;
+        }
+        th.join();
+
+        const response = resp_buf[0..got];
+        try testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try testing.expect(std.mem.indexOf(u8, response, "content-length: 10") != null);
+        try testing.expect(std.mem.indexOf(u8, response, "0123456789") != null);
+        try testing.expect(ctx.ok);
+    }
+
+    // 第二轮：HEAD —— 只发头，content-length 必须准确，且不得触发 end() 的长度断言
+    {
+        ctx.ok = false;
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+        defer stream.close(io);
+
+        var cw_buf: [2048]u8 = undefined;
+        var cw = stream.writer(io, &cw_buf);
+        try cw.interface.writeAll("HEAD /pkg HTTP/1.1\r\nHost: x\r\n\r\n");
+        try cw.interface.flush();
+
+        var cr_buf: [4096]u8 = undefined;
+        var cr = stream.reader(io, &cr_buf);
+        var resp_buf: [2048]u8 = undefined;
+        var got: usize = 0;
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) {
+            const n = try cr.interface.readSliceShort(resp_buf[got..]);
+            if (n == 0) break;
+            got += n;
+            if (std.mem.indexOf(u8, resp_buf[0..got], "\r\n\r\n") != null) break;
+        }
+        th.join();
+
+        const response = resp_buf[0..got];
+        try testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try testing.expect(std.mem.indexOf(u8, response, "content-length: 10") != null);
+        try testing.expect(std.mem.indexOf(u8, response, "0123456789") == null);
+        try testing.expect(ctx.ok);
+        std.debug.print("[http] 文件流式端到端 OK：GET + HEAD 均通过（HEAD 收到 {d} 字节）\n", .{got});
+    }
 }

@@ -37,8 +37,28 @@ const Embedded = struct {
 const Root = struct {
     /// URL 前缀（已归一化：空串或 `/admin`）
     url_prefix: []const u8,
-    /// 磁盘目录
+    /// 磁盘目录（支持相对路径与绝对路径，如 `D:\\downloads`）
     dir: []const u8,
+    /// 单文件大小上限（覆盖全局；`null` = 用全局）
+    max_bytes: ?usize = null,
+    /// 超过此大小改为流式发送（覆盖全局；`null` = 用全局）
+    stream_threshold: ?usize = null,
+    /// 缓存头（覆盖全局；`null` = 用全局）
+    cache_control: ?[]const u8 = null,
+};
+
+/// 静态根配置（供 `addRootOptions` / `App.Options.static_roots` 使用）。
+pub const RootOptions = struct {
+    /// URL 前缀（空串 = 网站根；`"/downloads"` = 该前缀下）
+    url_prefix: []const u8 = "",
+    /// 磁盘目录（相对项目目录或绝对路径均可）
+    dir: []const u8,
+    /// 单文件大小上限（字节；`null` = 全局默认）
+    max_bytes: ?usize = null,
+    /// 超过此大小改为流式发送（字节；`null` = 全局默认）
+    stream_threshold: ?usize = null,
+    /// 该根的 `Cache-Control`（`null` = 全局默认）
+    cache_control: ?[]const u8 = null,
 };
 
 /// 静态文件服务。
@@ -51,7 +71,10 @@ pub const StaticFiles = struct {
     spa: bool = false,
     spa_excludes: std.ArrayList([]const u8) = .empty,
     cache_control: []const u8 = "no-cache",
-    max_bytes: usize = 32 * 1024 * 1024,
+    /// 单文件大小上限（默认 1 GB；超过直接不返回，避免误传超大文件）
+    max_bytes: usize = 1024 * 1024 * 1024,
+    /// 超过此大小改为流式发送（默认 4 MB；小于它的读入内存，命中缓存更省次数）
+    stream_threshold: usize = 4 * 1024 * 1024,
 
     /// 以目录为根创建（默认约定 `wwwroot`）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !StaticFiles {
@@ -60,11 +83,12 @@ pub const StaticFiles = struct {
         return files;
     }
 
-    /// 释放（URL 前缀/目录/嵌入表/排除前缀都归本对象所有）。
+    /// 释放（URL 前缀/目录/每根缓存头/嵌入表/排除前缀都归本对象所有）。
     pub fn deinit(self: *StaticFiles) void {
         for (self.roots.items) |root| {
             self.allocator.free(root.url_prefix);
             self.allocator.free(root.dir);
+            if (root.cache_control) |value| self.allocator.free(value);
         }
         self.roots.deinit(self.allocator);
 
@@ -81,10 +105,39 @@ pub const StaticFiles = struct {
 
     /// 追加磁盘根（`url_prefix` 为空或 `/admin` 形式）。
     pub fn addRoot(self: *StaticFiles, url_prefix: []const u8, dir: []const u8) !void {
+        try self.addRootOptions(.{ .url_prefix = url_prefix, .dir = dir });
+    }
+
+    /// 追加磁盘根（带每根配置：大小上限 / 流式阈值 / 缓存头）。
+    pub fn addRootOptions(self: *StaticFiles, options: RootOptions) !void {
+        const url_prefix = try normalizePrefix(self.allocator, options.url_prefix);
+        errdefer self.allocator.free(url_prefix);
+
+        const dir = try self.allocator.dupe(u8, std.mem.trimEnd(u8, options.dir, "/\\"));
+        errdefer self.allocator.free(dir);
+
+        const cache_control = if (options.cache_control) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (cache_control) |value| self.allocator.free(value);
+
         try self.roots.append(self.allocator, .{
-            .url_prefix = try normalizePrefix(self.allocator, url_prefix),
-            .dir = try self.allocator.dupe(u8, std.mem.trimEnd(u8, dir, "/\\")),
+            .url_prefix = url_prefix,
+            .dir = dir,
+            .max_bytes = options.max_bytes,
+            .stream_threshold = options.stream_threshold,
+            .cache_control = cache_control,
         });
+    }
+
+    /// 已注册磁盘根数量。
+    pub fn rootsCount(self: *const StaticFiles) usize {
+        return self.roots.items.len;
+    }
+
+    /// 第 `index` 个根的 URL 前缀与目录（诊断/自检用）。
+    pub fn rootAt(self: *const StaticFiles, index: usize) ?struct { url_prefix: []const u8, dir: []const u8 } {
+        if (index >= self.roots.items.len) return null;
+        const root = self.roots.items[index];
+        return .{ .url_prefix = root.url_prefix, .dir = root.dir };
     }
 
     /// 设置默认文档（默认 `index.html`）。
@@ -97,9 +150,14 @@ pub const StaticFiles = struct {
         self.cache_control = value;
     }
 
-    /// 设置单文件读取上限（默认 32 MB）。
+    /// 设置单文件大小上限（默认 1 GB）。
     pub fn setMaxBytes(self: *StaticFiles, value: usize) void {
         self.max_bytes = value;
+    }
+
+    /// 设置流式发送阈值（默认 4 MB；小于它的读入内存）。
+    pub fn setStreamThreshold(self: *StaticFiles, value: usize) void {
+        self.stream_threshold = value;
     }
 
     /// 启用 SPA 深链接回退（`MapFallbackToFile("index.html")` 等价）。
@@ -160,6 +218,9 @@ pub const StaticFiles = struct {
                     .content_type = resp.content_type,
                     .body = "",
                     .headers = resp.headers,
+                    .file = resp.file,
+                    // HEAD 不发正文，但长度要准（下载器/代理会读它）
+                    .content_length = if (resp.file) |file| file.length else resp.body.len,
                 };
             }
         }
@@ -251,7 +312,7 @@ pub const StaticFiles = struct {
 
         const rel = std.mem.trimStart(u8, path[root.url_prefix.len..], "/");
         if (rel.len > 0) {
-            if (try self.diskResponse(arena, root.dir, rel, if_none_match)) |response| return response;
+            if (try self.diskResponse(arena, root, rel, if_none_match)) |response| return response;
         }
 
         if (rel.len == 0 or path[path.len - 1] == '/') {
@@ -260,7 +321,7 @@ pub const StaticFiles = struct {
                     try arena.dupe(u8, doc)
                 else
                     try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, doc });
-                if (try self.diskResponse(arena, root.dir, full, if_none_match)) |response| return response;
+                if (try self.diskResponse(arena, root, full, if_none_match)) |response| return response;
             }
         }
         return null;
@@ -269,27 +330,59 @@ pub const StaticFiles = struct {
     fn diskResponse(
         self: *const StaticFiles,
         arena: std.mem.Allocator,
-        dir: []const u8,
+        root: Root,
         rel: []const u8,
         if_none_match: ?[]const u8,
     ) !?router.Response {
         if (!isSafePath(rel)) return null;
 
-        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, rel });
-        const stat = fsio.statFile(self.io, full) catch return null;
+        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root.dir, rel });
+        const stat = fsio.statFile(self.io, full) catch |e| {
+            if (e != error.FileNotFound) {
+                std.debug.print("[zzig.static] 读取文件信息失败：{s}（{s}）\n", .{ full, @errorName(e) });
+            }
+            return null;
+        };
         if (stat.kind != .file) return null;
 
+        const max_bytes = root.max_bytes orelse self.max_bytes;
+        if (stat.size > max_bytes) {
+            std.debug.print(
+                "[zzig.static] 文件超过上限，未发送：{s}（{d} 字节 > {d} 字节；可调 setMaxBytes 或根级 max_bytes）\n",
+                .{ full, stat.size, max_bytes },
+            );
+            return null;
+        }
+
+        const cache_control = root.cache_control orelse self.cache_control;
         const etag = try std.fmt.allocPrint(arena, "W/\"{x}-{x}\"", .{ stat.size, stat.mtime.toMilliseconds() });
         const content_type = mimeType(rel);
         if (etagMatches(if_none_match, etag)) {
-            return try buildResponse(arena, .not_modified, content_type, "", etag, self.cache_control);
+            return try buildResponse(arena, .not_modified, content_type, "", etag, cache_control);
         }
 
-        const body = fsio.readFileAlloc(self.io, arena, full, self.max_bytes) catch |e| switch (e) {
-            error.FileTooBig => return null,
-            else => return null,
+        // 大文件流式发送（不整读进内存）；小文件仍然一次读完（少一次打开/循环）
+        const threshold = root.stream_threshold orelse self.stream_threshold;
+        if (stat.size > threshold) {
+            const file = fsio.cwd().openFile(self.io, full, .{}) catch |e| {
+                std.debug.print("[zzig.static] 打开文件失败：{s}（{s}）\n", .{ full, @errorName(e) });
+                return null;
+            };
+            const headers = try buildStaticHeaders(arena, etag, cache_control);
+            return .{
+                .status = .ok,
+                .content_type = content_type,
+                .body = "",
+                .headers = headers,
+                .file = .{ .file = file, .length = stat.size },
+            };
+        }
+
+        const body = fsio.readFileAlloc(self.io, arena, full, max_bytes) catch |e| {
+            std.debug.print("[zzig.static] 读取文件失败：{s}（{s}）\n", .{ full, @errorName(e) });
+            return null;
         };
-        return try buildResponse(arena, .ok, content_type, body, etag, self.cache_control);
+        return try buildResponse(arena, .ok, content_type, body, etag, cache_control);
     }
 
     /// 按扩展名推断 `Content-Type`（未知按 `application/octet-stream`）。
@@ -395,15 +488,24 @@ fn buildResponse(
     etag: []const u8,
     cache_control: []const u8,
 ) !router.Response {
-    const headers = try arena.alloc(std.http.Header, 2);
-    headers[0] = .{ .name = "etag", .value = etag };
-    headers[1] = .{ .name = "cache-control", .value = cache_control };
     return .{
         .status = status,
         .content_type = content_type,
         .body = body,
-        .headers = headers,
+        .headers = try buildStaticHeaders(arena, etag, cache_control),
     };
+}
+
+/// 静态资源统一响应头（`ETag` + `Cache-Control`）。
+fn buildStaticHeaders(
+    arena: std.mem.Allocator,
+    etag: []const u8,
+    cache_control: []const u8,
+) ![]const std.http.Header {
+    const headers = try arena.alloc(std.http.Header, 2);
+    headers[0] = .{ .name = "etag", .value = etag };
+    headers[1] = .{ .name = "cache-control", .value = cache_control };
+    return headers;
 }
 
 fn fnv1a64(data: []const u8) u64 {
@@ -524,4 +626,113 @@ test "static：SPA 回退与排除前缀" {
 
     try testing.expect((try files.serve(arena, "/api/orders", null)) == null);
     try testing.expect((try files.serve(arena, "/app.js", null)) == null);
+}
+
+test "static：额外静态根（前缀隔离 + 最长前缀优先）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const site_dir = try makeTempDir("static-site");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, site_dir) catch {};
+        testing.allocator.free(site_dir);
+    }
+    const dl_dir = try makeTempDir("static-downloads");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dl_dir) catch {};
+        testing.allocator.free(dl_dir);
+    }
+    const dl_admin_dir = try makeTempDir("static-downloads-admin");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dl_admin_dir) catch {};
+        testing.allocator.free(dl_admin_dir);
+    }
+
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/app.js", .{site_dir}), "site-app");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/a.txt", .{dl_dir}), "download-a");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/a.txt", .{dl_admin_dir}), "admin-a");
+
+    var files = try StaticFiles.init(testing.allocator, io, site_dir);
+    defer files.deinit();
+    try files.addRoot("/downloads", dl_dir);
+    try files.addRoot("/downloads/admin", dl_admin_dir);
+
+    const site = (try files.serve(arena, "/app.js", null)).?;
+    try testing.expectEqualStrings("site-app", site.body);
+
+    const download = (try files.serve(arena, "/downloads/a.txt", null)).?;
+    try testing.expectEqualStrings("download-a", download.body);
+
+    // 最长前缀优先
+    const admin = (try files.serve(arena, "/downloads/admin/a.txt", null)).?;
+    try testing.expectEqualStrings("admin-a", admin.body);
+
+    // 根目录不能越前缀取到下载目录的文件
+    try testing.expect((try files.serve(arena, "/a.txt", null)) == null);
+}
+
+test "static：根级 max_bytes 与 Cache-Control 覆盖" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("static-root-opts");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/big.bin", .{dir}), "0123456789");
+
+    var files = try StaticFiles.init(testing.allocator, io, "not-exists-wwwroot");
+    defer files.deinit();
+    try files.addRootOptions(.{
+        .url_prefix = "/dl",
+        .dir = dir,
+        .max_bytes = 4,
+        .cache_control = "public, max-age=60",
+    });
+
+    // 超过根级上限：不返回
+    try testing.expect((try files.serve(arena, "/dl/big.bin", null)) == null);
+
+    try files.addRootOptions(.{
+        .url_prefix = "/dl2",
+        .dir = dir,
+        .cache_control = "public, max-age=60",
+    });
+    const ok = (try files.serve(arena, "/dl2/big.bin", null)).?;
+    try testing.expectEqualStrings("0123456789", ok.body);
+
+    var cache: ?[]const u8 = null;
+    for (ok.headers) |header| {
+        if (std.mem.eql(u8, header.name, "cache-control")) cache = header.value;
+    }
+    try testing.expectEqualStrings("public, max-age=60", cache.?);
+}
+
+test "static：大文件走流式（不整读进内存）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("static-stream");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/pkg.zip", .{dir}), "0123456789");
+
+    var files = try StaticFiles.init(testing.allocator, io, dir);
+    defer files.deinit();
+    files.setStreamThreshold(1);
+
+    const response = (try files.serve(arena, "/pkg.zip", null)).?;
+    try testing.expect(response.file != null);
+    try testing.expectEqualStrings("", response.body);
+    try testing.expectEqual(@as(u64, 10), response.file.?.length);
+    response.file.?.file.close(io);
 }

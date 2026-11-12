@@ -7,4 +7,5 @@
 @if (Model.Count > 2) {<p class="hint">条目多于 2 条（条件与比较运算）。</p>} else {<p class="hint">条目不超过 2 条。</p>}
 <p class="hint">上面这行是真实的条件输出；要输出字面量 Razor 标记请写 <code>@@if</code>。</p>
 @await Component.InvokeAsync("Stats", Model)
+<p class="hint"><a href="/downloads/readme.txt">下载目录示例</a>（额外静态根：examples/web/downloads → /downloads）</p>
 @section Scripts {<script>console.log("index ready");</script>}

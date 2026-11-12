@@ -7,7 +7,8 @@
 //!   http://127.0.0.1:8080/home/about        另一个视图
 //!   http://127.0.0.1:8080/api/ping          JSON 信封响应
 //!   http://127.0.0.1:8080/admin/dashboard/index   区域视图（Areas/Admin/Views）
-//!   http://127.0.0.1:8080/app.css           wwwroot 静态资源
+//!   http://127.0.0.1:8080/app.css           wwwroot 静态资源（默认目录已改为 examples/web/wwwroot）
+//!   http://127.0.0.1:8080/downloads/readme.txt   额外静态根（examples/web/downloads → /downloads）
 //!   http://127.0.0.1:8080/admin/admin.css   区域 wwwroot（/admin 前缀）
 //!   http://127.0.0.1:8080/user/42           SPA 回退到 index.html
 
@@ -100,6 +101,9 @@ pub fn main() !void {
 
     // 区域静态资源：Areas/Admin/wwwroot → /admin
     try app.addArea("Admin");
+
+    // 额外静态根：下载目录（也可以换成绝对路径，如 "D:\\downloads"）
+    try app.addStaticRoot("/downloads", "examples/web/downloads");
 
     // 组件式调用（模板里 `@await Component.InvokeAsync("Stats", Model)`）
     try app.registerComponent("Stats", null, Stats.render);

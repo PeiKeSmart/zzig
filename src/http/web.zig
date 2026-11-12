@@ -36,8 +36,10 @@ pub const Request = router.Request;
 
 /// 应用选项（默认值即 ASP.NET Core 约定目录）。
 pub const Options = struct {
-    /// 主静态资源目录（`null` = 不提供静态资源）
+    /// 主静态资源目录（`null` = 不提供静态资源；可改成任意相对/绝对路径）
     wwwroot: ?[]const u8 = "wwwroot",
+    /// 额外静态根（如 `.{ .url_prefix = "/downloads", .dir = "data/downloads" }`）
+    static_roots: []const static_files.RootOptions = &.{},
     /// 视图根（默认 `Views`）
     views_root: []const u8 = "Views",
     /// 区域根（默认 `Areas`）
@@ -69,6 +71,9 @@ pub const App = struct {
         if (options.spa_fallback) {
             statics.spaFallback(true);
             try statics.spaExcludes(options.spa_excludes);
+        }
+        for (options.static_roots) |root| {
+            try statics.addRootOptions(root);
         }
 
         return .{
@@ -121,6 +126,16 @@ pub const App = struct {
     /// 注册视图组件（模板里用 `@await Component.InvokeAsync("名称", 参数)` 调用）。
     pub fn registerComponent(self: *App, name: []const u8, ctx: ?*anyopaque, func: view.ComponentFn) !void {
         try self.components.register(name, ctx, func);
+    }
+
+    /// 追加静态根（`url_prefix` 为空或 `/downloads` 形式；目录支持绝对路径）。
+    pub fn addStaticRoot(self: *App, url_prefix: []const u8, dir: []const u8) !void {
+        try self.statics.addRoot(url_prefix, dir);
+    }
+
+    /// 追加静态根（带每根配置：大小上限 / 流式阈值 / 缓存头）。
+    pub fn addStaticRootOptions(self: *App, options: static_files.RootOptions) !void {
+        try self.statics.addRootOptions(options);
     }
 
     /// 注册区域：自动挂载 `Areas/{Area}/wwwroot` 到 `/{area}`（目录不存在则跳过）。
@@ -208,6 +223,12 @@ pub const App = struct {
             .body = response.body,
             .content_type = response.content_type,
             .headers = response.headers,
+            // 文件响应交由服务端流式发送并关闭句柄
+            .file = if (response.file) |file_body| .{
+                .file = file_body.file,
+                .length = file_body.length,
+            } else null,
+            .content_length = response.content_length,
         };
     }
 
@@ -385,8 +406,7 @@ test "web：处理失败返回 500 且带错误名" {
     try testing.expect(std.mem.indexOf(u8, reply.body, "DatabaseDown") != null);
 }
 
-test "web：注册组件后可在控制器视图中调用" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+test "web：注册组件后可在控制器视图中调用" {    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = compat.currentIo();
@@ -426,4 +446,49 @@ test "web：注册组件后可在控制器视图中调用" {
 
     const response = try app.dispatch(arena, buildRequest("GET", "/home/index"));
     try testing.expectEqualStrings("<main><span>tick:42</span></main>", response.body);
+}
+
+test "web：wwwroot 可改 + 额外静态根 + 流式文件桥接" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const site_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/web-site-{d}", .{compat.nanoTimestamp()});
+    const dl_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/web-downloads-{d}", .{compat.nanoTimestamp()});
+    defer std.Io.Dir.cwd().deleteTree(io, site_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dl_dir) catch {};
+
+    try fsio.makePath(io, site_dir);
+    try fsio.makePath(io, dl_dir);
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/app.css", .{site_dir}), "site-css");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/a.txt", .{dl_dir}), "download-a");
+
+    var app = try App.init(testing.allocator, io, .{
+        // 改默认静态目录路径
+        .wwwroot = site_dir,
+        // 额外静态根（下载目录）
+        .static_roots = &.{.{ .url_prefix = "/downloads", .dir = dl_dir }},
+    });
+    defer app.deinit();
+
+    const css = try app.dispatch(arena, buildRequest("GET", "/app.css"));
+    try testing.expectEqualStrings("site-css", css.body);
+
+    const download = try app.dispatch(arena, buildRequest("GET", "/downloads/a.txt"));
+    try testing.expectEqualStrings("download-a", download.body);
+
+    // 大文件阈值调到 1 字节：改为流式，经 serverHandler 传给服务端并由服务端关闭
+    app.statics.setStreamThreshold(1);
+    const request_view = server.RequestView{
+        .method = .GET,
+        .target = "/downloads/a.txt",
+        .path = "/downloads/a.txt",
+        .query = "",
+        .body = "",
+    };
+    const reply = try App.serverHandler(@ptrCast(&app), request_view, arena);
+    try testing.expect(reply.file != null);
+    try testing.expectEqual(@as(u64, 10), reply.file.?.length);
+    reply.file.?.file.close(io);
 }

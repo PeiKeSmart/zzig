@@ -210,18 +210,70 @@ try app.registerComponent("Stats", null, Stats.render);
   避免缺失的 `.js/.css` 被返回成 HTML；
 - 缓存头：默认 `Cache-Control: no-cache`，带哈希指纹的产物可 `setCacheControl("public, max-age=31536000, immutable")`。
 
+### 6.1 目录配置（改默认目录 / 追加目录）
+
+**默认目录可改**（相对项目目录或绝对路径都行）：
+
+```zig
+var app = try zzig.web.App.init(allocator, io, .{
+    .wwwroot = "assets/public",        // 不再用 wwwroot
+    // .wwwroot = null,                // 完全不提供静态资源
+});
+```
+
+**追加额外静态根**（例如下载目录）；`url_prefix` 为空串则与主根合并按最长前缀匹配：
+
+```zig
+var app = try zzig.web.App.init(allocator, io, .{
+    .wwwroot = "wwwroot",
+    .static_roots = &.{
+        .{ .url_prefix = "/downloads", .dir = "data/downloads" },
+        .{ .url_prefix = "/files", .dir = "D:\\exports" },              // 绝对路径
+        .{ .url_prefix = "/pkg", .dir = "data/pkg", .cache_control = "public, max-age=3600" },
+    },
+});
+```
+
+运行期追加同样可用：
+
+```zig
+try app.addStaticRoot("/downloads", "data/downloads");
+try app.addStaticRootOptions(.{ .url_prefix = "/pkg", .dir = "data/pkg", .max_bytes = 8 * 1024 * 1024 * 1024 });
+```
+
+**每根可覆盖的选项**（`static_files.RootOptions`）：
+
+| 字段 | 含义 | 默认 |
+|---|---|---|
+| `url_prefix` | URL 前缀（`""` = 站点根） | `""` |
+| `dir` | 磁盘目录（相对项目目录或绝对路径） | 必填 |
+| `max_bytes` | 该根允许发送的单文件上限 | 全局 `1 GB` |
+| `stream_threshold` | 超过该大小改为**流式发送**（不整读进内存） | 全局 `4 MB` |
+| `cache_control` | 该根的 `Cache-Control` | 全局 `no-cache` |
+
+全局调整：`app.statics.setMaxBytes(...)`、`app.statics.setStreamThreshold(...)`、`app.statics.setCacheControl(...)`。
+
+**大文件下载**：文件大小超过 `stream_threshold` 时不再读入内存——`Response.file` 携带文件句柄与长度，
+`http/server` 用 `respondStreaming` + `content-length` 直接发送（`HEAD` 只发头），句柄由服务端关闭。
+因此把备份包/安装包目录挂成 `/downloads` 不需要额外配置；上限与阈值可按根单独放大。
+
+**优先级**：嵌入资源 → 磁盘根（**最长 URL 前缀优先**，`""` 主根兜底）→ SPA 回退。
+不同根之间互不可见（`/downloads` 根里的文件不能通过 `/a.txt` 访问）。
+
 ## 7. 与 `http/server.zig` 的桥接
 
 `App.makeServer(server_options)` 返回底层 `Server`（需要自己控制 `run`/`stop` 时用）；
 `App.run(host, port, options)` 直接阻塞运行。桥接函数 `App.serverHandler` 会把
 `Response.headers`（`location` / `etag` / `allow` …）一并写回响应——为此 `server.Reply`
 新增了 `headers` 字段（与 `content-type`/`connection` 重名时忽略业务侧的同名头）。
+`Response.file`（大文件流式）也会转为 `server.Reply.file`，由服务端 `respondStreaming` 发送并关闭句柄。
 
 处理中抛错时：日志打印 `方法 + 路径 + 错误名`，响应 `500` 且 `detail` 带错误名（可定位，不是笼统文案）。
 
 ## 8. 已知边界
 
 - 不做多段路由参数之外的复杂约束（正则/可选段/默认值）；需要时在动作里自行校验；
+- 静态文件不支持 `Range`（断点续传/分片下载）；大文件是整文件顺序流式发送；
 - 不做 `multipart/form-data` 解析（文件上传）——这是下一批工作；
 - 模板不支持 `@using`/`@inject`/`@functions`/`@switch`/LINQ/任意方法调用，子集外**报错不静默**；
 - 控制器/区域需显式注册（Zig 无反射，不存在按程序集扫描）；
