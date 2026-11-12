@@ -52,6 +52,116 @@ const PKT_RESPONSE: u8 = 0x04;
 pub const PKT_LOGIN7: u8 = 0x10;
 pub const PKT_PRELOGIN: u8 = 0x12;
 
+// ── 传输层：TCP 或 Windows 命名管道 ────────────────────────────────────────
+//
+// 为什么需要命名管道：SQL Server **LocalDB**（免安装、按用户运行，`sqllocaldb create/start`
+// 即可用）只提供 Shared Memory 与 Named Pipes，**不开 TCP 监听**。要让 TDS 驱动能连 LocalDB
+// 做真库调测，就必须支持命名管道。管道上的字节流与 TDS 完全一致，只是换了传输方式。
+
+const builtin = @import("builtin");
+
+/// Windows 命名管道（`\\.\pipe\<name>`）。非 Windows 平台报 `error.Unsupported`。
+pub const Pipe = struct {
+    handle: std.os.windows.HANDLE,
+
+    const win = struct {
+        extern "kernel32" fn CreateFileW(
+            lpFileName: [*:0]const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: ?*anyopaque,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: ?std.os.windows.HANDLE,
+        ) callconv(.winapi) std.os.windows.HANDLE;
+        extern "kernel32" fn ReadFile(
+            hFile: std.os.windows.HANDLE,
+            lpBuffer: [*]u8,
+            nNumberOfBytesToRead: u32,
+            lpNumberOfBytesRead: ?*u32,
+            lpOverlapped: ?*anyopaque,
+        ) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn WriteFile(
+            hFile: std.os.windows.HANDLE,
+            lpBuffer: [*]const u8,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: ?*u32,
+            lpOverlapped: ?*anyopaque,
+        ) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn CloseHandle(hObject: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    };
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+
+    /// 打开管道；`path` 形如 `\\.\pipe\LOCALDB#XXXX\tsql\query`（也接受 `np:` 前缀）。
+    pub fn open(path_in: []const u8) !Pipe {
+        if (builtin.os.tag != .windows) {
+            std.debug.print("[zzig.tds] 命名管道仅支持 Windows（当前 {s}）；请改用 TCP 连接串\n", .{@tagName(builtin.os.tag)});
+            return error.Unsupported;
+        }
+        var path = path_in;
+        if (std.ascii.startsWithIgnoreCase(path, "np:")) path = path[3..];
+
+        // 转 UTF-16LE + NUL
+        var buf: [1024]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(&buf, path) catch {
+            std.debug.print("[zzig.tds] 管道路径包含非法 UTF-8：{s}\n", .{path});
+            return error.InvalidPath;
+        };
+        if (n >= buf.len) return error.InvalidPath;
+        buf[n] = 0;
+        const z: [*:0]const u16 = @ptrCast(&buf);
+
+        const handle = win.CreateFileW(z, GENERIC_READ | GENERIC_WRITE, 0, null, OPEN_EXISTING, 0, null);
+        if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+            const code = std.os.windows.GetLastError();
+            std.debug.print("[zzig.tds] 打开命名管道失败：{s}（GetLastError={d}）\n", .{ path, code });
+            return error.PipeOpenFailed;
+        }
+        return .{ .handle = handle };
+    }
+
+    pub fn read(self: *Pipe, dst: []u8) !usize {
+        if (dst.len == 0) return 0;
+        var got: u32 = 0;
+        if (!win.ReadFile(self.handle, dst.ptr, @intCast(dst.len), &got, null).toBool()) {
+            const code = std.os.windows.GetLastError();
+            std.debug.print("[zzig.tds] 读命名管道失败（GetLastError={d}）\n", .{code});
+            return error.ReadFailed;
+        }
+        return @intCast(got);
+    }
+
+    pub fn write(self: *Pipe, src: []const u8) !usize {
+        var sent: u32 = 0;
+        if (!win.WriteFile(self.handle, src.ptr, @intCast(src.len), &sent, null).toBool()) {
+            const code = std.os.windows.GetLastError();
+            std.debug.print("[zzig.tds] 写命名管道失败（GetLastError={d}）\n", .{code});
+            return error.WriteFailed;
+        }
+        return @intCast(sent);
+    }
+
+    pub fn close(self: *Pipe) void {
+        _ = win.CloseHandle(self.handle);
+    }
+};
+
+/// 传输层：TCP socket 或命名管道。
+pub const Transport = union(enum) {
+    tcp: std.Io.net.Stream,
+    pipe: Pipe,
+
+    pub fn close(self: *Transport, io: std.Io) void {
+        switch (self.*) {
+            .tcp => |st| st.close(io),
+            .pipe => |*p| p.close(),
+        }
+    }
+};
+
 /// 包状态位：0x01 = 本消息最后一包（EOM）
 const STATUS_EOM: u8 = 0x01;
 
@@ -117,6 +227,9 @@ pub const Options = struct {
     user: []const u8,
     password: []const u8 = "",
     database: []const u8 = "",
+    /// 命名管道路径（`\\.\pipe\...`，也接受 `np:` 前缀）。非空时**忽略 host/port 走管道**，
+    /// 用于 SQL Server LocalDB（它不开 TCP 监听，只提供 Shared Memory 与 Named Pipes）。
+    pipe_name: []const u8 = "",
     /// 连接串里的 `Application Name`（出现在 `sys.dm_exec_sessions.program_name`，排查连接来源用）
     app_name: []const u8 = "pek-zcode",
     /// 客户端包长（服务端通常接受 4096）
@@ -265,7 +378,8 @@ const Reader = struct {
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    stream: std.Io.net.Stream,
+    /// 传输层：TCP 或命名管道（LocalDB 只能走后者）
+    transport: Transport,
     /// 一条**消息**（可能由多个包拼成）的载荷；每次 `readMessage` 后失效
     rx: std.ArrayList(u8) = .empty,
     /// 发送缓冲（整条消息拼好后一次发）
@@ -329,16 +443,28 @@ pub const Conn = struct {
 
     pub fn open(gpa: std.mem.Allocator, opts: Options) !Conn {
         const io = compat.currentIo();
-        const address = std.Io.net.IpAddress.resolve(io, opts.host, opts.port) catch |e| {
-            std.debug.print("[zzig.tds] 解析主机失败：host={s} port={d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
-            return e;
-        };
-        const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
-            std.debug.print("[zzig.tds] 连接失败：{s}:{d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
-            return e;
-        };
 
-        var self = Conn{ .gpa = gpa, .io = io, .stream = stream, .packet_size = opts.packet_size };
+        // 命名管道优先：LocalDB 没有 TCP 监听，只能走管道
+        var transport: Transport = undefined;
+        if (opts.pipe_name.len > 0) {
+            const pipe = Pipe.open(opts.pipe_name) catch |e| {
+                std.debug.print("[zzig.tds] 打开管道失败：{s} 原因={s}\n", .{ opts.pipe_name, @errorName(e) });
+                return e;
+            };
+            transport = .{ .pipe = pipe };
+        } else {
+            const address = std.Io.net.IpAddress.resolve(io, opts.host, opts.port) catch |e| {
+                std.debug.print("[zzig.tds] 解析主机失败：host={s} port={d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
+                return e;
+            };
+            const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+                std.debug.print("[zzig.tds] 连接失败：{s}:{d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
+                return e;
+            };
+            transport = .{ .tcp = stream };
+        }
+
+        var self = Conn{ .gpa = gpa, .io = io, .transport = transport, .packet_size = opts.packet_size };
         // 登录失败时 `Conn` 不会交给调用方，收发缓冲必须在这里自己释放（否则每次连不上都漏一块）
         errdefer {
             self.closeQuietly();
@@ -367,7 +493,7 @@ pub const Conn = struct {
     fn closeQuietly(self: *Conn) void {
         if (self.closed) return;
         self.closed = true;
-        self.stream.close(self.io);
+        self.transport.close(self.io);
     }
 
     pub fn close(self: *Conn) void {
@@ -658,43 +784,73 @@ pub const Conn = struct {
     }
 
     fn readSome(self: *Conn, dst: []u8) !usize {
-        var slices = [_][]u8{dst};
-        const r = self.io.operate(.{ .net_read = .{
-            .socket_handle = self.stream.socket.handle,
-            .data = &slices,
-        } }) catch |e| {
-            self.setError("读 socket 失败：{s}", .{@errorName(e)});
-            return e;
-        };
-        const res = r.net_read catch |e| {
-            self.setError("读 socket 失败：{s}", .{@errorName(e)});
-            return e;
-        };
-        return res.data_len;
+        switch (self.transport) {
+            .pipe => |*p| {
+                return p.read(dst) catch |e| {
+                    self.setError("读命名管道失败：{s}", .{@errorName(e)});
+                    return e;
+                };
+            },
+            .tcp => |st| {
+                var slices = [_][]u8{dst};
+                const r = self.io.operate(.{ .net_read = .{
+                    .socket_handle = st.socket.handle,
+                    .data = &slices,
+                } }) catch |e| {
+                    self.setError("读 socket 失败：{s}", .{@errorName(e)});
+                    return e;
+                };
+                const res = r.net_read catch |e| {
+                    self.setError("读 socket 失败：{s}", .{@errorName(e)});
+                    return e;
+                };
+                return res.data_len;
+            },
+        }
     }
 
     fn writeRaw(self: *Conn, bytes: []const u8) !void {
-        var sent: usize = 0;
-        while (sent < bytes.len) {
-            var slices = [_][]const u8{bytes[sent..]};
-            const r = self.io.operate(.{ .net_write = .{
-                .socket_handle = self.stream.socket.handle,
-                .data = &slices,
-            } }) catch |e| {
-                self.setError("写 socket 失败：{s}", .{@errorName(e)});
-                self.closed = true;
-                return e;
-            };
-            const n = r.net_write catch |e| {
-                self.setError("写 socket 失败：{s}", .{@errorName(e)});
-                self.closed = true;
-                return e;
-            };
-            if (n == 0) {
-                self.closed = true;
-                return error.ConnectionClosed;
-            }
-            sent += n;
+        switch (self.transport) {
+            .pipe => |*p| {
+                var sent: usize = 0;
+                while (sent < bytes.len) {
+                    const n = p.write(bytes[sent..]) catch |e| {
+                        self.setError("写命名管道失败：{s}", .{@errorName(e)});
+                        self.closed = true;
+                        return e;
+                    };
+                    if (n == 0) {
+                        self.closed = true;
+                        return error.ConnectionClosed;
+                    }
+                    sent += n;
+                }
+                return;
+            },
+            .tcp => |st| {
+                var sent: usize = 0;
+                while (sent < bytes.len) {
+                    var slices = [_][]const u8{bytes[sent..]};
+                    const r = self.io.operate(.{ .net_write = .{
+                        .socket_handle = st.socket.handle,
+                        .data = &slices,
+                    } }) catch |e| {
+                        self.setError("写 socket 失败：{s}", .{@errorName(e)});
+                        self.closed = true;
+                        return e;
+                    };
+                    const n = r.net_write catch |e| {
+                        self.setError("写 socket 失败：{s}", .{@errorName(e)});
+                        self.closed = true;
+                        return e;
+                    };
+                    if (n == 0) {
+                        self.closed = true;
+                        return error.ConnectionClosed;
+                    }
+                    sent += n;
+                }
+            },
         }
     }
 
