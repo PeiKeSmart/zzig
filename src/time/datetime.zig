@@ -217,6 +217,25 @@ pub const DateTime = struct {
         return 0;
     }
 
+    /// 距 1970-01-01 的**天数**（Howard Hinnant 的 days_from_civil，与 `fromUnixSeconds` 互逆）。
+    pub fn daysSinceUnixEpoch(self: DateTime) i64 {
+        const m = @as(i64, self.month);
+        const d = @as(i64, self.day);
+        const y = if (m <= 2) @as(i64, self.year) - 1 else @as(i64, self.year);
+        const era = @divFloor(y, 400);
+        const yoe = y - era * 400;
+        const mp = if (m > 2) m - 3 else m + 9;
+        const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
+    }
+
+    /// 转 Unix 秒（向下取整，与 `fromUnixSeconds` 互逆；纳秒不进秒）。
+    pub fn toUnixSeconds(self: DateTime) i64 {
+        return self.daysSinceUnixEpoch() * 86400 +
+            @as(i64, self.hour) * 3600 + @as(i64, self.minute) * 60 + @as(i64, self.second);
+    }
+
     /// 是否早于另一个时间。
     pub fn before(self: DateTime, other: DateTime) bool {
         if (self.year != other.year) return self.year < other.year;
@@ -271,6 +290,22 @@ test "Unix 秒换算" {
     try std.testing.expectEqual(@as(u8, 18), dt.hour);
     try std.testing.expectEqual(@as(u8, 1), dt.minute);
     try std.testing.expectEqual(@as(u8, 2), dt.second);
+}
+
+test "Unix 秒与天数换算往返（含 1970 前与跨世纪）" {
+    // 反方向：toUnixSeconds 必须与 fromUnixSeconds 互逆
+    try std.testing.expectEqual(@as(i64, 1790445662), DateTime.fromUnixSeconds(1790445662).toUnixSeconds());
+    try std.testing.expectEqual(@as(i64, 0), DateTime.fromUnixSeconds(0).toUnixSeconds());
+    // 1970-01-01 与 2000-01-01 的天数（.NET ticks 换算要用到这两个锚点）
+    try std.testing.expectEqual(@as(i64, 0), (DateTime{ .year = 1970, .month = 1, .day = 1 }).daysSinceUnixEpoch());
+    try std.testing.expectEqual(@as(i64, 10957), (DateTime{ .year = 2000, .month = 1, .day = 1 }).daysSinceUnixEpoch());
+    try std.testing.expectEqual(@as(i64, 19723), (DateTime{ .year = 2024, .month = 1, .day = 1 }).daysSinceUnixEpoch());
+    // 1970 之前：1969-12-31 = -1 天
+    try std.testing.expectEqual(@as(i64, -1), (DateTime{ .year = 1969, .month = 12, .day = 31 }).daysSinceUnixEpoch());
+    try std.testing.expectEqual(@as(i64, -86400), (DateTime{ .year = 1969, .month = 12, .day = 31 }).toUnixSeconds());
+    // 纳秒不进秒
+    const with_nanos = DateTime{ .year = 2026, .month = 11, .day = 12, .hour = 8, .minute = 30, .second = 15, .nanos = 123_456_700 };
+    try std.testing.expectEqual(@as(i64, 1794472215), with_nanos.toUnixSeconds());
 }
 
 test "非法时间" {
