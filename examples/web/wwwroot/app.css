@@ -27,6 +27,19 @@ main { padding: 20px; }
     font-size: 13px;
 }
 .hint { color: #9fd39f; }
+.component {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 12px;
+    padding: 10px 14px;
+    border: 1px solid #2f6b3a;
+    border-radius: 8px;
+    background: #16221a;
+    color: #cfe9d4;
+    font-size: 13px;
+}
+.component .muted { color: #7f9a88; }
 code {
     background: #1f2530;
     padding: 1px 5px;

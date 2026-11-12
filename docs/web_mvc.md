@@ -137,6 +137,7 @@ JSON body 懒解析并缓存在 `Ctx` 上（同一次请求只解析一次）。
 | `@RenderBody()` | 布局中插入页面主体 |
 | `@section Name { }` / `@RenderSection("Name", true)` / `@await RenderSectionAsync("Name", false)` | 分区 |
 | `@Html.Partial("Name", 模型)` / `@await Html.PartialAsync("Name", 模型)` | 分部视图（默认继承当前模型） |
+| `@await Component.InvokeAsync("Name", 参数)` / `@Component("Name", 参数)` | 视图组件（见 5.1） |
 
 表达式子集：路径（`.` / `[下标]`）、字符串/整数/浮点/`true`/`false`/`null`、
 `! - + * / %`、`== != < > <= >=`、`&& ||`、`? :`、`??`、括号。**不支持任意方法调用**——
@@ -147,6 +148,53 @@ JSON body 懒解析并缓存在 `Ctx` 上（同一次请求只解析一次）。
 
 缓存：按「文件修改时间 + 长度」失效，命中时零文件读取；热改产生的旧模板在 `ViewRenderer.deinit`
 统一释放。分部视图/布局嵌套上限 8 层（防循环引用）。
+
+### 5.1 组件（View Components）
+
+组件 = **有逻辑的局部渲染单元**（对比 Partial：只有模板，没有处理函数）。对齐 ASP.NET Core View Components 的用法与目录约定。
+
+**注册**（启动期注册、运行期只读，名称大小写不敏感）：
+
+```zig
+const Stats = struct {
+    fn render(_: ?*anyopaque, c: *zzig.web.ComponentContext) anyerror!zzig.web.ComponentResult {
+        const count = (c.args.get("Count") orelse zzig.web.value.ofInt(0)).asInt() orelse 0;
+        var model = zzig.web.value.ObjectBuilder.init(c.arena);
+        try model.int("Count", count);
+        try model.str("Label", if (count > 2) "条目较多" else "条目较少");
+        return .{ .view = .{ .model = model.finish() } };  // 也可以 `.{ .html = "<span>…</span>" }`
+    }
+};
+
+try app.registerComponent("Stats", null, Stats.render);
+```
+
+`registerComponent` 的第二个参数是注册时携带的上下文指针（组件里通过 `self` 取应用状态），无状态传 `null`。
+
+**调用**（两种写法等价，可写在页面、布局、Partials、其他组件里）：
+
+```html
+@await Component.InvokeAsync("Stats", Model)
+@Component("Stats", Model)          <!-- 简写 -->
+@Component("Stats")                  <!-- 不传参：参数默认为外层模型 -->
+```
+
+**视图查找顺序**（`Default` 为未指定视图名时的默认名；全部支持 Pascal/原样两套候选）：
+
+1. `Areas/{Area}/Views/{Controller}/Components/{Name}/{View}.cshtml`
+2. `Views/{Controller}/Components/{Name}/{View}.cshtml`
+3. `Areas/{Area}/Views/Shared/Components/{Name}/{View}.cshtml`
+4. `Views/Shared/Components/{Name}/{View}.cshtml`
+
+配了回退区域时，再把区域换成回退区域重试一遍（同视图解析规则）。
+
+**`ComponentContext` 提供的字段**：`arena`（请求 arena）、`renderer`（可继续用 Partial）、
+`controller`（调用方控制器前缀，含区域）、`args`（调用方传入的参数）、`parent_model`（外层模型）。
+
+**边界**：
+- 组件视图**不参与布局链**（`@{ Layout = ... }` 在组件里被忽略），也不会往页面分区里写内容；
+- 组件可嵌套组件，但整体嵌套（布局/Partial/组件）上限 8 层，超出显式报错；
+- 组件返回 `error` 时渲染失败信息会带上组件名与错误名，便于定位。
 
 ## 6. 静态资源（wwwroot）
 

@@ -24,6 +24,8 @@ const server = @import("server.zig");
 const router = @import("router.zig");
 const controller = @import("controller.zig");
 const static_files = @import("static_files.zig");
+const view = @import("view.zig");
+const value = @import("value.zig");
 
 /// 请求上下文。
 pub const Ctx = router.Ctx;
@@ -54,6 +56,8 @@ pub const App = struct {
     router: router.Router,
     statics: static_files.StaticFiles,
     areas: std.ArrayList([]const u8) = .empty,
+    /// 视图组件注册表（启动期注册、运行期只读）
+    components: view.ComponentRegistry,
 
     /// 创建应用（静态资源与路由器一并初始化）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !App {
@@ -73,15 +77,17 @@ pub const App = struct {
             .options = options,
             .router = router.Router.init(allocator),
             .statics = statics,
+            .components = view.ComponentRegistry.init(allocator),
         };
     }
 
-    /// 释放路由器、静态资源与区域记录。
+    /// 释放路由器、静态资源、区域记录与组件注册表。
     pub fn deinit(self: *App) void {
         self.router.deinit();
         self.statics.deinit();
         for (self.areas.items) |area| self.allocator.free(area);
         self.areas.deinit(self.allocator);
+        self.components.deinit();
     }
 
     /// 注册路由。
@@ -104,11 +110,17 @@ pub const App = struct {
         try self.router.useMiddleware(mw);
     }
 
-    /// 挂载控制器（统一使用本应用的视图根/区域根）。
+    /// 挂载控制器（统一使用本应用的视图根/区域根/组件注册表）。
     pub fn mountController(self: *App, ctrl: *controller.Controller) !void {
         ctrl.setViewsRoot(self.options.views_root);
         ctrl.setAreasRoot(self.options.areas_root);
+        ctrl.setComponents(&self.components);
         try ctrl.mount(&self.router);
+    }
+
+    /// 注册视图组件（模板里用 `@await Component.InvokeAsync("名称", 参数)` 调用）。
+    pub fn registerComponent(self: *App, name: []const u8, ctx: ?*anyopaque, func: view.ComponentFn) !void {
+        try self.components.register(name, ctx, func);
     }
 
     /// 注册区域：自动挂载 `Areas/{Area}/wwwroot` 到 `/{area}`（目录不存在则跳过）。
@@ -331,14 +343,14 @@ test "web：serverHandler 桥接保留响应头（302 + Location）" {
     };
     try app.get("/old", router.handler(S.go));
 
-    const view = server.RequestView{
+    const request_view = server.RequestView{
         .method = .GET,
         .target = "/old",
         .path = "/old",
         .query = "",
         .body = "",
     };
-    const reply = try App.serverHandler(@ptrCast(&app), view, arena);
+    const reply = try App.serverHandler(@ptrCast(&app), request_view, arena);
     try testing.expectEqual(std.http.Status.found, reply.status);
     try testing.expectEqual(@as(usize, 1), reply.headers.len);
     try testing.expectEqualStrings("location", reply.headers[0].name);
@@ -361,14 +373,57 @@ test "web：处理失败返回 500 且带错误名" {
     };
     try app.get("/boom", router.handler(S.boom));
 
-    const view = server.RequestView{
+    const request_view = server.RequestView{
         .method = .GET,
         .target = "/boom",
         .path = "/boom",
         .query = "",
         .body = "",
     };
-    const reply = try App.serverHandler(@ptrCast(&app), view, arena);
+    const reply = try App.serverHandler(@ptrCast(&app), request_view, arena);
     try testing.expectEqual(std.http.Status.internal_server_error, reply.status);
     try testing.expect(std.mem.indexOf(u8, reply.body, "DatabaseDown") != null);
+}
+
+test "web：注册组件后可在控制器视图中调用" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/web-component-{d}", .{compat.nanoTimestamp()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const page_path = try std.fmt.allocPrint(arena, "{s}/Views/Home/Index.cshtml", .{dir});
+    const widget_path = try std.fmt.allocPrint(arena, "{s}/Views/Shared/Components/Clock/Default.cshtml", .{dir});
+    try fsio.ensureParent(io, page_path);
+    try fsio.writeFile(io, page_path, "<main>@await Component.InvokeAsync(\"Clock\", Model)</main>");
+    try fsio.ensureParent(io, widget_path);
+    try fsio.writeFile(io, widget_path, "<span>tick:@Model.Ticks</span>");
+
+    var app = try App.init(testing.allocator, io, .{ .wwwroot = null, .views_root = try std.fmt.allocPrint(arena, "{s}/Views", .{dir}) });
+    defer app.deinit();
+
+    const Clock = struct {
+        fn render(_: ?*anyopaque, c: *view.ComponentContext) anyerror!view.ComponentResult {
+            var model = value.ObjectBuilder.init(c.arena);
+            try model.int("Ticks", (c.args.get("Ticks") orelse value.ofInt(0)).asInt() orelse 0);
+            return .{ .view = .{ .model = model.finish() } };
+        }
+    };
+    try app.registerComponent("Clock", null, Clock.render);
+
+    var ctrl = try controller.Controller.init(testing.allocator, io, "home");
+    defer ctrl.deinit();
+    try ctrl.get("index", struct {
+        fn index(c: *Ctx) anyerror!controller.ActionResult {
+            var model = value.ObjectBuilder.init(c.arena);
+            try model.int("Ticks", 42);
+            return .{ .view = .{ .model = model.finish() } };
+        }
+    }.index);
+    try app.mountController(&ctrl);
+
+    const response = try app.dispatch(arena, buildRequest("GET", "/home/index"));
+    try testing.expectEqualStrings("<main><span>tick:42</span></main>", response.body);
 }

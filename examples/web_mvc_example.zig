@@ -55,6 +55,18 @@ const Dashboard = struct {
     }
 };
 
+/// 组件式调用：`@await Component.InvokeAsync("Stats", Model)`
+/// 视图约定：`Views/Shared/Components/Stats/Default.cshtml`（区域内优先 `Areas/{Area}/Views/Shared/Components/...`）。
+const Stats = struct {
+    fn render(_: ?*anyopaque, c: *zzig.web.ComponentContext) anyerror!zzig.web.ComponentResult {
+        const count = (c.args.get("Count") orelse zzig.web.value.ofInt(0)).asInt() orelse 0;
+        var model = zzig.web.value.ObjectBuilder.init(c.arena);
+        try model.int("Count", count);
+        try model.str("Label", if (count > 2) "条目较多" else "条目较少");
+        return .{ .view = .{ .model = model.finish() } };
+    }
+};
+
 pub fn main() !void {
     // 服务端多线程：io 用线程安全的 page_allocator 构造（见 http/server.zig 的踩坑记录）
     const allocator = std.heap.page_allocator;
@@ -88,6 +100,9 @@ pub fn main() !void {
 
     // 区域静态资源：Areas/Admin/wwwroot → /admin
     try app.addArea("Admin");
+
+    // 组件式调用（模板里 `@await Component.InvokeAsync("Stats", Model)`）
+    try app.registerComponent("Stats", null, Stats.render);
 
     try app.run("127.0.0.1", 8080, .{});
 }

@@ -229,6 +229,11 @@ pub const Controller = struct {
         self.views.setFallbackArea(area);
     }
 
+    /// 注入组件注册表（通常由 `App.mountController` 自动完成）。
+    pub fn setComponents(self: *Controller, registry: ?*view.ComponentRegistry) void {
+        self.views.setComponents(registry);
+    }
+
     /// 挂载到路由器：注册 `/{prefix}/{action}` 统一入口。
     pub fn mount(self: *Controller, r: *router.Router) !void {
         var buffer: [512]u8 = undefined;

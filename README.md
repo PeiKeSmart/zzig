@@ -159,7 +159,7 @@ pub fn main() !void {
 | **Console** | [控制台工具文档](docs/console_usage.md) | UTF-8 + ANSI 颜色支持 |
 | **Logger** | [同步日志文档](docs/logger_usage.md) | 简单同步日志 |
 | **JSON** | [JSON 解析器教程](docs/json_usage.md) | 高性能 JSON 解析库 |
-| **Web（MVC）** | [Web MVC 一体化](docs/web_mvc.md) | Controller / Razor 子集视图 / 区域（Areas）/ wwwroot 静态资源 |
+| **Web（MVC）** | [Web MVC 一体化](docs/web_mvc.md) | Controller / Razor 子集视图 / 区域（Areas）/ 组件式调用 / wwwroot 静态资源 |
 | **File** | (开发中) | 文件和目录操作 |
 | **Strings** | (开发中) | 字符串处理工具 |
 | **Randoms** | (开发中) | 随机数生成器 |

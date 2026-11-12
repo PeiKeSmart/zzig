@@ -81,6 +81,10 @@ pub const web = struct {
     pub const viewNamed = @import("http/controller.zig").viewNamed;
 
     pub const ViewRenderer = @import("http/view.zig").ViewRenderer;
+    pub const ComponentRegistry = @import("http/view.zig").ComponentRegistry;
+    pub const ComponentContext = @import("http/view.zig").ComponentContext;
+    pub const ComponentResult = @import("http/view.zig").ComponentResult;
+    pub const ComponentFn = @import("http/view.zig").ComponentFn;
     pub const StaticFiles = @import("http/static_files.zig").StaticFiles;
 };
 

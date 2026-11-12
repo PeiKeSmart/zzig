@@ -16,7 +16,9 @@
 //! - 代码块 `@{ var a = 表达式; Layout = "Shared/_Layout"; }`；
 //! - 布局与分区 `@RenderBody()`、`@section Name { }`、`@RenderSection("Name", true)`、
 //!   `@await RenderSectionAsync("Name", false)`；
-//! - 分部视图 `@Html.Partial("Name", 表达式)`、`@await Html.PartialAsync("Name", 表达式)`。
+//! - 分部视图 `@Html.Partial("Name", 表达式)`、`@await Html.PartialAsync("Name", 表达式)`；
+//! - 组件 `@await Component.InvokeAsync("Name", 参数)`（也可简写 `@Component("Name", 参数)`），
+//!   按 ASP.NET Core View Components 约定渲染 `Views/Shared/Components/{Name}/Default.cshtml`。
 //!
 //! 表达式子集：路径访问（`.` / `[下标]`）、字面量（字符串/整数/浮点/`true`/`false`/`null`）、
 //! `! - + * / %`、`== != < > <= >=`、`&& ||`、`? :`、`??`、括号。**不支持任意方法调用**。
@@ -48,6 +50,95 @@ pub const Template = struct {
     nodes: []const Node,
 };
 
+// ————— 组件（对齐 ASP.NET Core View Components） —————
+
+/// 组件渲染上下文。
+pub const ComponentContext = struct {
+    /// 请求级分配器（组件返回的模型/HTML 用它兜底）
+    arena: std.mem.Allocator,
+    /// 视图渲染器（组件内部可继续用 Partial 等能力）
+    renderer: *ViewRenderer,
+    /// 调用方控制器前缀（含区域，如 `admin/dashboard`），用于解析区域内的组件视图
+    controller: []const u8,
+    /// 调用方传入的参数；未传时为外层视图模型
+    args: Value,
+    /// 外层视图模型（无论是否传参都可用）
+    parent_model: Value,
+};
+
+/// 组件返回值。
+pub const ComponentResult = union(enum) {
+    /// 渲染组件视图（`name` 缺省为 `Default`）
+    view: struct {
+        name: ?[]const u8 = null,
+        model: Value = .null,
+    },
+    /// 直接返回 HTML（不需要视图文件的小组件）
+    html: []const u8,
+};
+
+/// 组件处理函数（`self` 为注册时的上下文指针）。
+pub const ComponentFn = *const fn (self: ?*anyopaque, c: *ComponentContext) anyerror!ComponentResult;
+
+/// 已注册组件。
+pub const ComponentEntry = struct {
+    ctx: ?*anyopaque = null,
+    func: ComponentFn,
+};
+
+/// 组件注册表（**启动期注册、运行期只读**；名称大小写不敏感）。
+pub const ComponentRegistry = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMapUnmanaged(ComponentEntry) = .empty,
+
+    /// 创建空注册表。
+    pub fn init(allocator: std.mem.Allocator) ComponentRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    /// 释放组件名与表。
+    pub fn deinit(self: *ComponentRegistry) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.entries.deinit(self.allocator);
+    }
+
+    /// 注册组件（同名覆盖）。
+    pub fn register(self: *ComponentRegistry, name: []const u8, ctx: ?*anyopaque, func: ComponentFn) !void {
+        const key = try lowerAlloc(self.allocator, name);
+        errdefer self.allocator.free(key);
+        if (self.entries.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+        }
+        try self.entries.put(self.allocator, key, .{ .ctx = ctx, .func = func });
+    }
+
+    /// 取组件（大小写不敏感；未注册返回 `null`）。
+    pub fn get(self: *const ComponentRegistry, name: []const u8) ?ComponentEntry {
+        var buffer: [96]u8 = undefined;
+        if (name.len <= buffer.len) {
+            for (name, 0..) |c, index| buffer[index] = std.ascii.toLower(c);
+            return self.entries.get(buffer[0..name.len]);
+        }
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) return entry.value_ptr.*;
+        }
+        return null;
+    }
+
+    /// 已注册组件数量。
+    pub fn count(self: *const ComponentRegistry) usize {
+        return self.entries.count();
+    }
+};
+
+fn lowerAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const out = try allocator.alloc(u8, text.len);
+    for (text, 0..) |c, index| out[index] = std.ascii.toLower(c);
+    return out;
+}
+
 // ————— AST —————
 
 const Node = union(enum) {
@@ -62,6 +153,13 @@ const Node = union(enum) {
     render_body,
     render_section: SectionCall,
     partial: struct { name: Expr, model: ?Expr },
+    component: ComponentCall,
+};
+
+/// 组件调用（名称在编译期固定为字符串字面量，参数在渲染期求值）。
+const ComponentCall = struct {
+    name: []const u8,
+    args: ?Expr,
 };
 
 /// `@RenderSection(...)` / `@await RenderSectionAsync(...)` 参数。
@@ -272,6 +370,11 @@ const Parser = struct {
             self.pos += name.len;
             return self.parseAwait(nodes);
         }
+        if (std.mem.eql(u8, name, "Component")) {
+            // `@await Component.InvokeAsync(...)` / `@Component("...")`
+            const next = self.peekAt(name.len) orelse 0;
+            if (next == '.' or next == '(') return self.parseComponentCall(nodes);
+        }
         if (std.mem.eql(u8, name, "Html")) {
             // `@Html.Raw(...)` / `@Html.Partial(...)` / `@Html.PartialAsync(...)`
             if (self.peekAt(name.len) == '.') {
@@ -311,7 +414,41 @@ const Parser = struct {
         if (std.mem.eql(u8, name, "Html")) {
             return self.parseHtmlHelper(nodes);
         }
-        return self.fail("`@await` 只支持 `Html.PartialAsync(...)` 与 `RenderSectionAsync(...)`", .{});
+        if (std.mem.eql(u8, name, "Component")) {
+            return self.parseComponentCall(nodes);
+        }
+        return self.fail("`@await` 只支持 `Html.PartialAsync(...)`、`RenderSectionAsync(...)` 与 `Component.InvokeAsync(...)`", .{});
+    }
+
+    /// 解析组件调用：`Component.InvokeAsync("Name"[, 参数])` / `Component.Invoke(...)` / `Component("Name"[, 参数])`。
+    fn parseComponentCall(self: *Parser, nodes: *std.ArrayList(Node)) ParseError!void {
+        self.pos += "Component".len;
+        self.skipSpace();
+        if (self.peek() == '.') {
+            self.pos += 1;
+            self.skipSpace();
+            const method = self.readIdent() orelse return self.fail("`Component.` 后缺少方法名", .{});
+            if (!std.mem.eql(u8, method, "InvokeAsync") and !std.mem.eql(u8, method, "Invoke")) {
+                return self.fail("`Component.{s}` 不在子集内（仅支持 InvokeAsync / Invoke）", .{method});
+            }
+            self.skipSpace();
+        }
+        try self.expect('(');
+        self.skipSpace();
+        const name_expr = try self.parseExpr();
+        const component_name = switch (name_expr) {
+            .str_lit => |text| text,
+            else => return self.fail("组件名称必须是字符串字面量（如 `Component.InvokeAsync(\"Stats\")`）", .{}),
+        };
+        self.skipSpace();
+        var args: ?Expr = null;
+        if (self.peek() == ',') {
+            self.pos += 1;
+            args = try self.parseExpr();
+            self.skipSpace();
+        }
+        try self.expect(')');
+        try nodes.append(self.arena, .{ .component = .{ .name = component_name, .args = args } });
     }
 
     fn parseHtmlHelper(self: *Parser, nodes: *std.ArrayList(Node)) ParseError!void {
@@ -946,7 +1083,7 @@ fn renderNodes(
                 }
             },
             .partial => |partial| {
-                if (rc.depth >= 8) return renderFail(rc, "分部视图/布局嵌套超过 8 层（可能存在循环引用）", .{});
+                if (rc.depth >= 8) return renderFail(rc, "分部视图/布局/组件嵌套超过 8 层（可能存在循环引用）", .{});
                 const name_value = try eval(rc, partial.name, head);
                 const name = name_value.asString() orelse
                     return renderFail(rc, "`Html.Partial` 的视图名必须是字符串", .{});
@@ -960,22 +1097,66 @@ fn renderNodes(
                     .ok => |template| template,
                     .fail => |message| return renderFail(rc, "{s}", .{message}),
                 };
+                try renderSubTemplate(rc, template, model, writer);
+            },
+            .component => |call| {
+                if (rc.depth >= 8) return renderFail(rc, "分部视图/布局/组件嵌套超过 8 层（可能存在循环引用）", .{});
+                const registry = rc.renderer.components orelse
+                    return renderFail(rc, "未配置组件注册表：请在 App 上调用 `registerComponent`", .{});
+                const entry = registry.get(call.name) orelse
+                    return renderFail(rc, "未注册的组件 `{s}`（请先 `app.registerComponent(\"{s}\", ...)`）", .{ call.name, call.name });
 
-                const saved_model = rc.model;
-                const saved_body = rc.body;
-                rc.model = model;
-                rc.body = "";
-                rc.depth += 1;
-                defer {
-                    rc.model = saved_model;
-                    rc.body = saved_body;
-                    rc.depth -= 1;
+                const args = if (call.args) |expr| try eval(rc, expr, head) else rc.model;
+                var component_ctx = ComponentContext{
+                    .arena = rc.allocator,
+                    .renderer = rc.renderer,
+                    .controller = rc.controller,
+                    .args = args,
+                    .parent_model = rc.model,
+                };
+                const result = entry.func(entry.ctx, &component_ctx) catch |e| {
+                    return renderFail(rc, "组件 `{s}` 执行失败：{s}", .{ call.name, @errorName(e) });
+                };
+
+                switch (result) {
+                    .html => |html| try writer.writeAll(html),
+                    .view => |view_result| {
+                        const view_name = view_result.name orelse "Default";
+                        const path = switch (try rc.renderer.resolveComponent(
+                            rc.allocator,
+                            rc.controller,
+                            call.name,
+                            view_name,
+                        )) {
+                            .path => |path| path,
+                            .missing => |message| return renderFail(rc, "{s}", .{message}),
+                        };
+                        const template = switch (rc.renderer.loadTemplate(rc.allocator, path)) {
+                            .ok => |template| template,
+                            .fail => |message| return renderFail(rc, "{s}", .{message}),
+                        };
+                        try renderSubTemplate(rc, template, view_result.model, writer);
+                    },
                 }
-                var ignored: ?[]const u8 = null;
-                try renderNodes(rc, template.nodes, null, writer, &ignored);
             },
         }
     }
+}
+
+/// 用指定模型渲染子模板（分部视图 / 组件视图；不参与布局）。
+fn renderSubTemplate(rc: *RenderCtx, template: *Template, model: Value, writer: *std.Io.Writer) anyerror!void {
+    const saved_model = rc.model;
+    const saved_body = rc.body;
+    rc.model = model;
+    rc.body = "";
+    rc.depth += 1;
+    defer {
+        rc.model = saved_model;
+        rc.body = saved_body;
+        rc.depth -= 1;
+    }
+    var ignored: ?[]const u8 = null;
+    try renderNodes(rc, template.nodes, null, writer, &ignored);
 }
 
 fn eval(rc: *RenderCtx, expr: Expr, scope: ?*const Scope) anyerror!Value {
@@ -1164,6 +1345,8 @@ pub const ViewRenderer = struct {
     cache: std.StringHashMapUnmanaged(CacheEntry) = .empty,
     arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
     mutex: std.Io.Mutex = .init,
+    /// 组件注册表（由 App 注入；`null` 时模板里的组件调用会报错）
+    components: ?*ComponentRegistry = null,
 
     /// 创建渲染器（`io` 用于读模板，跨线程安全）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io) ViewRenderer {
@@ -1196,6 +1379,11 @@ pub const ViewRenderer = struct {
     /// 设置默认（回退）区域：区域视图缺失时回退到该区域的同名视图。
     pub fn setFallbackArea(self: *ViewRenderer, area: ?[]const u8) void {
         self.fallback_area = area;
+    }
+
+    /// 注入组件注册表（`null` = 禁用组件调用）。
+    pub fn setComponents(self: *ViewRenderer, registry: ?*ComponentRegistry) void {
+        self.components = registry;
     }
 
     /// 渲染视图（`controller` 可含区域前缀，如 `admin/home`）。
@@ -1333,6 +1521,79 @@ pub const ViewRenderer = struct {
         try pushCandidate(candidates, arena, try std.fmt.allocPrint(arena, "{s}/Views/Shared", .{area_root}), view);
         try pushCandidate(candidates, arena, try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ self.root, pascal(arena, area_name), pascal(arena, ctrl_leaf) }), view);
         try pushCandidate(candidates, arena, try std.fmt.allocPrint(arena, "{s}/{s}/Shared", .{ self.root, pascal(arena, area_name) }), view);
+    }
+
+    /// 解析组件视图（对齐 ASP.NET Core View Components 约定）：
+    ///
+    /// 1. `Areas/{Area}/Views/{Controller}/Components/{Name}/{View}.cshtml`
+    /// 2. `Views/{Controller}/Components/{Name}/{View}.cshtml`
+    /// 3. `Areas/{Area}/Views/Shared/Components/{Name}/{View}.cshtml`
+    /// 4. `Views/Shared/Components/{Name}/{View}.cshtml`
+    ///
+    /// 配了回退区域时，再把区域换成回退区域重试一遍。
+    pub fn resolveComponent(
+        self: *const ViewRenderer,
+        arena: std.mem.Allocator,
+        controller: []const u8,
+        component: []const u8,
+        view: []const u8,
+    ) !ResolveResult {
+        var candidates: std.ArrayList([]const u8) = .empty;
+        var tried: std.ArrayList([]const u8) = .empty;
+
+        const ctrl = std.mem.trim(u8, controller, "/");
+        const area = if (std.mem.indexOfScalar(u8, ctrl, '/')) |index| ctrl[0..index] else null;
+        const ctrl_leaf = if (std.mem.indexOfScalar(u8, ctrl, '/')) |index| ctrl[index + 1 ..] else ctrl;
+        const name_path = try std.fmt.allocPrint(arena, "Components/{s}", .{pascal(arena, component)});
+
+        if (area) |area_name| {
+            try self.pushAreaComponentCandidates(&candidates, arena, area_name, ctrl_leaf, name_path, view);
+            if (self.fallback_area) |fallback| {
+                if (!std.ascii.eqlIgnoreCase(fallback, area_name)) {
+                    try self.pushAreaComponentCandidates(&candidates, arena, fallback, ctrl_leaf, name_path, view);
+                }
+            }
+        }
+
+        try pushCandidate(&candidates, arena, try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ self.root, pascal(arena, ctrl_leaf), name_path }), view);
+        try pushCandidate(&candidates, arena, try std.fmt.allocPrint(arena, "{s}/Shared/{s}", .{ self.root, name_path }), view);
+
+        for (candidates.items) |candidate| {
+            if (!isCandidateSafe(candidate)) continue;
+            if (fsio.exists(self.io, candidate)) return .{ .path = candidate };
+            try tried.append(arena, candidate);
+        }
+
+        var message: std.Io.Writer.Allocating = .init(arena);
+        defer message.deinit();
+        try message.writer.print("组件视图不存在：Components/{s}/{s}.cshtml（控制器 {s}）；已尝试：", .{
+            pascal(arena, component),
+            pascal(arena, view),
+            controller,
+        });
+        for (tried.items, 0..) |candidate, index| {
+            if (index >= 8) {
+                try message.writer.writeAll(" …");
+                break;
+            }
+            if (index > 0) try message.writer.writeAll("、");
+            try message.writer.writeAll(candidate);
+        }
+        return .{ .missing = try message.toOwnedSlice() };
+    }
+
+    fn pushAreaComponentCandidates(
+        self: *const ViewRenderer,
+        candidates: *std.ArrayList([]const u8),
+        arena: std.mem.Allocator,
+        area_name: []const u8,
+        ctrl_leaf: []const u8,
+        name_path: []const u8,
+        view: []const u8,
+    ) !void {
+        const area_root = try std.fmt.allocPrint(arena, "{s}/{s}", .{ self.areas_root, pascal(arena, area_name) });
+        try pushCandidate(candidates, arena, try std.fmt.allocPrint(arena, "{s}/Views/{s}/{s}", .{ area_root, pascal(arena, ctrl_leaf), name_path }), view);
+        try pushCandidate(candidates, arena, try std.fmt.allocPrint(arena, "{s}/Views/Shared/{s}", .{ area_root, name_path }), view);
     }
 
     /// 读取并编译模板（按「修改时间 + 长度」缓存；命中零文件读取）。
@@ -1687,5 +1948,189 @@ test "view：模板缓存按修改时间失效" {
     switch (renderer.render(arena, "home", "index", value.ofNull())) {
         .html => |html| try testing.expectEqualStrings("v2-longer", html),
         .fail => return error.RenderFailed,
+    }
+}
+
+fn renderSourceWith(
+    arena: std.mem.Allocator,
+    renderer: *ViewRenderer,
+    controller: []const u8,
+    source: []const u8,
+    model: Value,
+) RenderOutcome {
+    const template = switch (compile(arena, source)) {
+        .ok => |template| template,
+        .fail => |message| return .{ .fail = message },
+    };
+    var rc = RenderCtx{
+        .allocator = arena,
+        .renderer = renderer,
+        .controller = controller,
+        .model = model,
+    };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    defer out.deinit();
+    var layout: ?[]const u8 = null;
+    renderNodes(&rc, template.nodes, null, &out.writer, &layout) catch |e| {
+        return .{ .fail = rc.err orelse std.fmt.allocPrint(arena, "渲染失败：{s}", .{@errorName(e)}) catch "渲染失败" };
+    };
+    return .{ .html = out.toOwnedSlice() catch "内存不足" };
+}
+
+test "view：组件式调用（返回 HTML / 名称大小写不敏感）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var renderer = ViewRenderer.init(testing.allocator, compat.currentIo());
+    defer renderer.deinit();
+
+    var registry = ComponentRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const S = struct {
+        fn hello(_: ?*anyopaque, c: *ComponentContext) anyerror!ComponentResult {
+            return .{ .html = try std.fmt.allocPrint(c.arena, "<em>{s}</em>", .{c.args.asString() orelse ""}) };
+        }
+    };
+    try registry.register("Hello", null, S.hello);
+    renderer.setComponents(&registry);
+
+    switch (renderSourceWith(arena, &renderer, "home", "<div>@await Component.InvokeAsync(\"hello\", \"世界\")</div>", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("<div><em>世界</em></div>", html),
+        .fail => |message| {
+            std.debug.print("组件渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+
+    // 简写 `@Component(...)` 也可用
+    switch (renderSourceWith(arena, &renderer, "home", "@Component(\"HELLO\")", value.ofString("x"))) {
+        .html => |html| try testing.expectEqualStrings("<em>x</em>", html),
+        .fail => return error.RenderFailed,
+    }
+}
+
+test "view：组件返回视图（Shared/Components/{Name}/Default.cshtml + 参数模型）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-component");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Shared/Components/Stats/Default.cshtml", .{dir}),
+        \\<span class="count">@Model.Count</span>
+    );
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    renderer.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir}));
+
+    var registry = ComponentRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const S = struct {
+        fn stats(_: ?*anyopaque, c: *ComponentContext) anyerror!ComponentResult {
+            return .{ .view = .{ .model = c.args } };
+        }
+    };
+    try registry.register("Stats", null, S.stats);
+    renderer.setComponents(&registry);
+
+    var model_builder = value.ObjectBuilder.init(arena);
+    try model_builder.int("Count", 7);
+    const model = model_builder.finish();
+
+    switch (renderSourceWith(arena, &renderer, "home", "@await Component.InvokeAsync(\"Stats\", Model)", model)) {
+        .html => |html| try testing.expectEqualStrings("<span class=\"count\">7</span>", html),
+        .fail => |message| {
+            std.debug.print("组件视图渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+}
+
+test "view：区域内组件视图优先于共享组件视图" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-component-area");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Shared/Components/Badge/Default.cshtml", .{dir}), "root-badge");
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Areas/Admin/Views/Shared/Components/Badge/Default.cshtml", .{dir}), "admin-badge");
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    renderer.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir}));
+    renderer.setAreasRoot(try std.fmt.allocPrint(arena, "{s}/Areas", .{dir}));
+
+    var registry = ComponentRegistry.init(testing.allocator);
+    defer registry.deinit();
+    const S = struct {
+        fn badge(_: ?*anyopaque, _: *ComponentContext) anyerror!ComponentResult {
+            return .{ .view = .{} };
+        }
+    };
+    try registry.register("Badge", null, S.badge);
+    renderer.setComponents(&registry);
+
+    switch (renderSourceWith(arena, &renderer, "admin/dashboard", "@Component(\"Badge\")", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("admin-badge", html),
+        .fail => |message| {
+            std.debug.print("区域组件渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+
+    switch (renderSourceWith(arena, &renderer, "home", "@Component(\"Badge\")", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("root-badge", html),
+        .fail => return error.RenderFailed,
+    }
+}
+
+test "view：未注册组件 / 未配置注册表都显式报错" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var renderer = ViewRenderer.init(testing.allocator, compat.currentIo());
+    defer renderer.deinit();
+
+    switch (renderSourceWith(arena, &renderer, "home", "@Component(\"Missing\")", value.ofNull())) {
+        .html => return error.TestUnexpectedResult,
+        .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "未配置组件注册表") != null),
+    }
+
+    var registry = ComponentRegistry.init(testing.allocator);
+    defer registry.deinit();
+    renderer.setComponents(&registry);
+
+    switch (renderSourceWith(arena, &renderer, "home", "@Component(\"Missing\")", value.ofNull())) {
+        .html => return error.TestUnexpectedResult,
+        .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "未注册的组件") != null),
+    }
+}
+
+test "view：组件语法子集外显式报错" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    switch (compile(arena, "@Component.InvokeAsync(Model.Name)")) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "字符串字面量") != null),
+    }
+    switch (compile(arena, "@await Component.RenderAsync(\"X\")")) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "仅支持 InvokeAsync / Invoke") != null),
     }
 }
