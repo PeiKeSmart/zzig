@@ -25,6 +25,9 @@ pub const RequestView = struct {
     /// 查询串（`?` 之后，无则为空）
     query: []const u8,
     body: []const u8,
+    /// 原始请求头（名称小写，值原样；已复制到本次请求的 arena）。
+    /// 鉴权/限流/追踪等业务层规则需要它；传输层本身不解读。
+    headers: []const std.http.Header = &.{},
 };
 
 /// 业务回调要回的响应。
@@ -116,6 +119,16 @@ pub const Server = struct {
         const path = req.head.target[0..path_end];
         const query = if (path_end < req.head.target.len) req.head.target[path_end + 1 ..] else "";
 
+        // 请求头必须在初始化 body 流之前复制：std 明确说明 head_buffer 随后失效。
+        var header_list: std.ArrayList(std.http.Header) = .empty;
+        var header_it = req.iterateHeaders();
+        while (header_it.next()) |h| {
+            try header_list.append(arena, .{
+                .name = try arena.dupe(u8, h.name),
+                .value = try arena.dupe(u8, h.value),
+            });
+        }
+
         // 早拒：声明长度超上限就不读 body
         var body: []const u8 = "";
         if (req.head.content_length) |len| {
@@ -142,6 +155,7 @@ pub const Server = struct {
             .path = path,
             .query = query,
             .body = body,
+            .headers = header_list.items,
         }, arena) catch |e| {
             std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.head.method), path, @errorName(e) });
             req.respond("{\"code\":500,\"msg\":\"internal error\"}", .{
