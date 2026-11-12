@@ -70,6 +70,14 @@ pub const url = @import("net/url.zig");
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
+/// 定时器（每日 HH:MM 触发点计算）
+pub const threading = struct {
+    pub const timer = @import("threading/timer.zig");
+};
+
+/// 企业微信机器人 Webhook 推送
+pub const wecom = @import("wecom/wecom.zig");
+
 /// 配置：TOML 子集解析 + 文本热加载（版本戳 / 原子写 / 缺失生成）
 pub const config = struct {
     pub const toml = @import("config/toml.zig");
@@ -250,6 +258,8 @@ test {
     _ = @import("config/toml.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
+    _ = @import("threading/timer.zig");
+    _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
 }
