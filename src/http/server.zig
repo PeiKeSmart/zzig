@@ -55,16 +55,39 @@ pub const Server = struct {
     opts: Options = .{},
     active: std.atomic.Value(usize) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
-    /// `run` 里创建的监听口（`stop` 用它打断 accept）
+    /// 监听口生命周期保护（`run` 与 `stop` 都可能看它）
+    listener_guard: std.Io.Mutex = .init,
+    /// `run` 里创建的监听口（仅用于可观测；**不在 `stop` 里关闭**，见下）
     listener: ?*std.Io.net.Server = null,
+    /// 唤醒 accept 用的回连地址（由 `run` 记下）
+    wake_addr: ?std.Io.net.IpAddress = null,
 
     /// 阻塞跑监听循环（调用方决定放主线程还是子线程）。
     /// `host` 必须是 IP 字面量；绑不上会返回错误（调用方决定重试还是 SKIP）。
     pub fn run(self: *Server, host: []const u8, port: u16) !void {
         const address = try std.Io.net.IpAddress.parse(host, port);
         var listener = try address.listen(self.io, .{ .reuse_address = true });
-        defer listener.deinit(self.io);
+
+        // 绑 0.0.0.0/:: 时，回连要落到回环地址，否则唤醒连接打不进来。
+        const wake_host = if (std.mem.eql(u8, host, "0.0.0.0"))
+            "127.0.0.1"
+        else if (std.mem.eql(u8, host, "::"))
+            "::1"
+        else
+            host;
+
+        self.listener_guard.lockUncancelable(self.io);
         self.listener = &listener;
+        self.wake_addr = std.Io.net.IpAddress.parse(wake_host, port) catch null;
+        self.listener_guard.unlock(self.io);
+
+        defer {
+            self.listener_guard.lockUncancelable(self.io);
+            self.listener = null;
+            self.wake_addr = null;
+            self.listener_guard.unlock(self.io);
+            listener.deinit(self.io);
+        }
 
         while (!self.stopped.load(.acquire)) {
             const stream = listener.accept(self.io) catch |e| {
@@ -72,6 +95,11 @@ pub const Server = struct {
                 std.debug.print("[zzig.http] accept 失败：{s}\n", .{@errorName(e)});
                 continue;
             };
+            if (self.stopped.load(.acquire)) {
+                // 这是 `stop()` 的回连唤醒包：直接关掉并退出（不处理业务）
+                stream.close(self.io);
+                return;
+            }
             if (self.active.load(.acquire) >= self.opts.max_connections) {
                 std.debug.print("[zzig.http] 连接数已达上限 {d}，直接关闭新连接\n", .{self.opts.max_connections});
                 stream.close(self.io);
@@ -89,9 +117,20 @@ pub const Server = struct {
     }
 
     /// 让 `run` 退出（幂等）。
+    ///
+    /// **不关闭监听口**：在 Windows 上从另一个线程关闭正在 accept 的 listener，
+    /// 会让 std 内部走到 `netAcceptWindows` 的 `.CANCELLED => unreachable` 直接 panic。
+    /// 改为「回连一次」把阻塞中的 accept 唤醒，由 `run` 发现停止标志后自行收尾。
     pub fn stop(self: *Server) void {
         self.stopped.store(true, .release);
-        if (self.listener) |l| l.deinit(self.io);
+
+        self.listener_guard.lockUncancelable(self.io);
+        const wake = self.wake_addr;
+        self.listener_guard.unlock(self.io);
+
+        var addr = wake orelse return;
+        var stream = addr.connect(self.io, .{ .mode = .stream }) catch return;
+        stream.close(self.io);
     }
 
     fn connMain(self: *Server, stream: std.Io.net.Stream) void {
