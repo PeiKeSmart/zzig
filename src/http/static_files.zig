@@ -55,7 +55,7 @@ pub const RootOptions = struct {
     dir: []const u8,
     /// 单文件大小上限（字节；`null` = 全局默认）
     max_bytes: ?usize = null,
-    /// 超过此大小改为流式发送（字节；`null` = 全局默认）
+    /// 超过此大小改走文件流式（字节；`null` = 全局默认，默认 0 = 全部流式）
     stream_threshold: ?usize = null,
     /// 该根的 `Cache-Control`（`null` = 全局默认）
     cache_control: ?[]const u8 = null,
@@ -73,8 +73,12 @@ pub const StaticFiles = struct {
     cache_control: []const u8 = "no-cache",
     /// 单文件大小上限（默认 1 GB；超过直接不返回，避免误传超大文件）
     max_bytes: usize = 1024 * 1024 * 1024,
-    /// 超过此大小改为流式发送（默认 4 MB；小于它的读入内存，命中缓存更省次数）
-    stream_threshold: usize = 4 * 1024 * 1024,
+    /// 超过此大小改走文件流式发送（默认 0 = **所有磁盘文件都不整读进内存**）。
+    ///
+    /// 内存开销恒定为「8 KB 发送缓冲 + 32 KB 读缓冲」，与文件大小无关；
+    /// Linux 上进一步走 `sendfile` 零拷贝，Windows 回退为 32 KB 读-写循环。
+    /// 若更在意「小文件一次 read 而不是 open+read+write」，可把阈值调高（如 64 KB）。
+    stream_threshold: usize = 0,
 
     /// 以目录为根创建（默认约定 `wwwroot`）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !StaticFiles {
@@ -155,7 +159,9 @@ pub const StaticFiles = struct {
         self.max_bytes = value;
     }
 
-    /// 设置流式发送阈值（默认 4 MB；小于它的读入内存）。
+    /// 设置文件流式阈值（默认 0 = 所有磁盘文件都走流式，内存恒定）。
+    ///
+    /// 调高它可让小于阈值的文件一次读完（更少 syscall），代价是每请求占用与文件同等大小的内存。
     pub fn setStreamThreshold(self: *StaticFiles, value: usize) void {
         self.stream_threshold = value;
     }
@@ -520,6 +526,24 @@ fn fnv1a64(data: []const u8) u64 {
 const testing = std.testing;
 const compat = @import("../compat.zig");
 
+/// 取响应正文（磁盘文件现在是文件流，需要从句柄读出来校对）。
+fn responseBody(io: std.Io, arena: std.mem.Allocator, response: router.Response) ![]const u8 {
+    const file_body = response.file orelse return response.body;
+    defer file_body.file.close(io);
+
+    const size: usize = @intCast(file_body.length);
+    const out = try arena.alloc(u8, size);
+    var buffer: [4096]u8 = undefined;
+    var reader = file_body.file.reader(io, &buffer);
+    var got: usize = 0;
+    while (got < size) {
+        const n = try reader.interface.readSliceShort(out[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    return out[0..got];
+}
+
 fn makeTempDir(name: []const u8) ![]const u8 {
     const io = compat.currentIo();
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}-{d}", .{ name, compat.nanoTimestamp() });
@@ -553,11 +577,11 @@ test "static：目录根 + index.html + ETag 304" {
 
     const home = (try files.serve(arena, "/", null)).?;
     try testing.expectEqual(std.http.Status.ok, home.status);
-    try testing.expectEqualStrings("<h1>home</h1>", home.body);
+    try testing.expectEqualStrings("<h1>home</h1>", try responseBody(io, arena, home));
     try testing.expectEqualStrings("text/html; charset=utf-8", home.content_type);
 
     const css = (try files.serve(arena, "/app.css", null)).?;
-    try testing.expectEqualStrings("body{}", css.body);
+    try testing.expectEqualStrings("body{}", try responseBody(io, arena, css));
 
     // ETag 命中 → 304 空体
     var etag: []const u8 = "";
@@ -660,14 +684,14 @@ test "static：额外静态根（前缀隔离 + 最长前缀优先）" {
     try files.addRoot("/downloads/admin", dl_admin_dir);
 
     const site = (try files.serve(arena, "/app.js", null)).?;
-    try testing.expectEqualStrings("site-app", site.body);
+    try testing.expectEqualStrings("site-app", try responseBody(io, arena, site));
 
     const download = (try files.serve(arena, "/downloads/a.txt", null)).?;
-    try testing.expectEqualStrings("download-a", download.body);
+    try testing.expectEqualStrings("download-a", try responseBody(io, arena, download));
 
     // 最长前缀优先
     const admin = (try files.serve(arena, "/downloads/admin/a.txt", null)).?;
-    try testing.expectEqualStrings("admin-a", admin.body);
+    try testing.expectEqualStrings("admin-a", try responseBody(io, arena, admin));
 
     // 根目录不能越前缀取到下载目录的文件
     try testing.expect((try files.serve(arena, "/a.txt", null)) == null);
@@ -704,7 +728,7 @@ test "static：根级 max_bytes 与 Cache-Control 覆盖" {
         .cache_control = "public, max-age=60",
     });
     const ok = (try files.serve(arena, "/dl2/big.bin", null)).?;
-    try testing.expectEqualStrings("0123456789", ok.body);
+    try testing.expectEqualStrings("0123456789", try responseBody(io, arena, ok));
 
     var cache: ?[]const u8 = null;
     for (ok.headers) |header| {

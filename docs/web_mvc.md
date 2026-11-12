@@ -209,6 +209,7 @@ try app.registerComponent("Stats", null, Stats.render);
 - SPA 回退：`spaFallback(true)` + `spaExcludes(&.{"/api"})`，只回退**无扩展名**的路径，
   避免缺失的 `.js/.css` 被返回成 HTML；
 - 缓存头：默认 `Cache-Control: no-cache`，带哈希指纹的产物可 `setCacheControl("public, max-age=31536000, immutable")`。
+- 磁盘文件默认走文件流式（内存恒定、不整读），详见 6.1。
 
 ### 6.1 目录配置（改默认目录 / 追加目录）
 
@@ -248,14 +249,21 @@ try app.addStaticRootOptions(.{ .url_prefix = "/pkg", .dir = "data/pkg", .max_by
 | `url_prefix` | URL 前缀（`""` = 站点根） | `""` |
 | `dir` | 磁盘目录（相对项目目录或绝对路径） | 必填 |
 | `max_bytes` | 该根允许发送的单文件上限 | 全局 `1 GB` |
-| `stream_threshold` | 超过该大小改为**流式发送**（不整读进内存） | 全局 `4 MB` |
+| `stream_threshold` | 超过该大小改走**文件流式**；`0` = 全部流式 | 全局 `0` |
 | `cache_control` | 该根的 `Cache-Control` | 全局 `no-cache` |
 
 全局调整：`app.statics.setMaxBytes(...)`、`app.statics.setStreamThreshold(...)`、`app.statics.setCacheControl(...)`。
 
-**大文件下载**：文件大小超过 `stream_threshold` 时不再读入内存——`Response.file` 携带文件句柄与长度，
-`http/server` 用 `respondStreaming` + `content-length` 直接发送（`HEAD` 只发头），句柄由服务端关闭。
-因此把备份包/安装包目录挂成 `/downloads` 不需要额外配置；上限与阈值可按根单独放大。
+**内存口径（默认全流式）**：磁盘静态文件默认**一律不进请求内存**——只开文件句柄，
+每请求固定「8 KB 发送缓冲 + 32 KB 读缓冲」，与文件大小无关；
+Linux（有 libc）优先走 `sendfile` **零拷贝**（内核直接 file→socket），`Unimplemented` 的平台（如 Windows）
+回退为 32 KB 读-写循环。需要「小文件一次 read 搞定」时再把阈值调高（如 `64 * 1024`）：
+
+```zig
+app.statics.setStreamThreshold(64 * 1024);   // 64 KB 以下整读（换取更少 syscall）
+```
+
+**下载场景**：把备份包/安装包目录挂成 `/downloads` 不需要额外配置；上限与阈值可按根单独调。
 
 **优先级**：嵌入资源 → 磁盘根（**最长 URL 前缀优先**，`""` 主根兜底）→ SPA 回退。
 不同根之间互不可见（`/downloads` 根里的文件不能通过 `/a.txt` 访问）。

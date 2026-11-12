@@ -237,14 +237,30 @@ pub const Server = struct {
                 return;
             }
 
+            // 优先零拷贝（Linux sendfile 走内核 file→socket，不经过用户态内存）；
+            // `Unimplemented`（如 Windows）回退到 32 KB 缓冲的读-写循环。
             var read_buf: [32 * 1024]u8 = undefined;
+            var file_reader = file_body.file.reader(self.io, &read_buf);
             var remaining = file_body.length;
+            var zero_copy = true;
             while (remaining > 0) {
+                if (zero_copy) {
+                    const n = bw.writer.sendFile(&file_reader, .limited64(remaining)) catch |e| switch (e) {
+                        error.Unimplemented => {
+                            zero_copy = false;
+                            continue;
+                        },
+                        error.EndOfStream => break,
+                        else => return e,
+                    };
+                    if (n == 0) break;
+                    remaining -= n;
+                    continue;
+                }
+
                 const want: usize = @intCast(@min(remaining, read_buf.len));
-                const n = file_body.file.readStreaming(self.io, &.{read_buf[0..want]}) catch |e| switch (e) {
-                    error.EndOfStream => break,
-                    else => return e,
-                };
+                // `readSliceShort` 内部已把 EOF 表示为「返回 0」，只报 ReadFailed
+                const n = try file_reader.interface.readSliceShort(read_buf[0..want]);
                 if (n == 0) break;
                 try bw.writer.writeAll(read_buf[0..n]);
                 remaining -= n;

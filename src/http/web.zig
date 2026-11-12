@@ -258,6 +258,24 @@ fn buildRequest(method: []const u8, path: []const u8) Request {
     return .{ .method = method, .path = path };
 }
 
+/// 取响应正文（磁盘静态文件是文件流，需要从句柄读出来校对）。
+fn responseBody(io: std.Io, arena: std.mem.Allocator, response: Response) ![]const u8 {
+    const file_body = response.file orelse return response.body;
+    defer file_body.file.close(io);
+
+    const size: usize = @intCast(file_body.length);
+    const out = try arena.alloc(u8, size);
+    var buffer: [4096]u8 = undefined;
+    var reader = file_body.file.reader(io, &buffer);
+    var got: usize = 0;
+    while (got < size) {
+        const n = try reader.interface.readSliceShort(out[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    return out[0..got];
+}
+
 test "web：路由优先、静态兜底、404" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -473,10 +491,10 @@ test "web：wwwroot 可改 + 额外静态根 + 流式文件桥接" {
     defer app.deinit();
 
     const css = try app.dispatch(arena, buildRequest("GET", "/app.css"));
-    try testing.expectEqualStrings("site-css", css.body);
+    try testing.expectEqualStrings("site-css", try responseBody(io, arena, css));
 
     const download = try app.dispatch(arena, buildRequest("GET", "/downloads/a.txt"));
-    try testing.expectEqualStrings("download-a", download.body);
+    try testing.expectEqualStrings("download-a", try responseBody(io, arena, download));
 
     // 大文件阈值调到 1 字节：改为流式，经 serverHandler 传给服务端并由服务端关闭
     app.statics.setStreamThreshold(1);
