@@ -189,6 +189,8 @@ pub const db = struct {
     pub const mysql = @import("db/mysql.zig");
     /// PostgreSQL 驱动（协议 3.0，纯 wire protocol，不依赖 libpq）
     pub const postgres = @import("db/postgres.zig");
+    /// SQL Server 驱动（TDS 7.4，纯 wire protocol，不依赖 ODBC / sqlncli）
+    pub const tds = @import("db/tds.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -199,8 +201,8 @@ pub const sqlite = db.sqlite;
 pub const mysql = db.mysql;
 /// 便捷别名：`zzig.postgres` == `zzig.db.postgres`
 pub const postgres = db.postgres;
-
-// 模块内部测试入口：`zig test` 只收集「根文件直接 import 到」的文件的 test 块，
+/// 便捷别名：`zzig.tds` == `zzig.db.tds`
+pub const tds = db.tds;
 // 跨模块 import（test.zig → zzig 模块）不会收集。build.zig 里 `zzig-module-tests`
 // 以本文件为根，靠这里把它们拉进来，否则驱动单测形同虚设。
 test {
@@ -211,6 +213,8 @@ test {
     _ = @import("db/mysql_loopback_test.zig");
     _ = @import("db/postgres.zig");
     _ = @import("db/postgres_loopback_test.zig");
+    _ = @import("db/tds.zig");
+    _ = @import("db/tds_loopback_test.zig");
     _ = @import("http/server.zig");
     _ = @import("crypto/rsa.zig");
     _ = @import("number/decimal.zig");
