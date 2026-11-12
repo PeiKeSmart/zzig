@@ -251,6 +251,7 @@ try app.addStaticRootOptions(.{ .url_prefix = "/pkg", .dir = "data/pkg", .max_by
 | `max_bytes` | 该根允许发送的单文件上限 | 全局 `1 GB` |
 | `stream_threshold` | 超过该大小改走**文件流式**；`0` = 全部流式 | 全局 `0` |
 | `cache_control` | 该根的 `Cache-Control` | 全局 `no-cache` |
+| `serve_unknown_types` | 该根是否允许**未知扩展名**（下载目录常用） | 全局 `false` |
 
 全局调整：`app.statics.setMaxBytes(...)`、`app.statics.setStreamThreshold(...)`、`app.statics.setCacheControl(...)`。
 
@@ -267,6 +268,34 @@ app.statics.setStreamThreshold(64 * 1024);   // 64 KB 以下整读（换取更�
 
 **优先级**：嵌入资源 → 磁盘根（**最长 URL 前缀优先**，`""` 主根兜底）→ SPA 回退。
 不同根之间互不可见（`/downloads` 根里的文件不能通过 `/a.txt` 访问）。
+
+### 6.2 扩展名策略（对齐 ASP.NET Core）
+
+磁盘静态文件**默认只下发 MIME 表已知的扩展名**（对齐 `StaticFileOptions.ServeUnknownFileTypes = false`）：
+`.bak` / `.db` / 无扩展名这类“非常规文件”返回 404，避免任意文件被猜到 URL 直接下载。
+嵌入资源不受此限（注册时已明确指定 `Content-Type`）。
+
+三种放开方式：
+
+```zig
+// ① 只放开指定格式（等价 ASP.NET 自定义 ContentTypeProvider）
+try app.statics.setMimeType("apk", "application/vnd.android.package-archive");
+
+// ② 全站放开未知类型（按 octet-stream 下发）
+app.statics.serveUnknownFileTypes(true);
+
+// ③ 只让下载目录放开，主站仍严格
+var app = try zzig.web.App.init(allocator, io, .{
+    .wwwroot = "wwwroot",
+    .static_roots = &.{
+        .{ .url_prefix = "/downloads", .dir = "data/downloads", .serve_unknown_types = true },
+    },
+});
+```
+
+已知类型表含：`html/htm/css/js/mjs/json/map/txt/md/csv/xml`、`svg/png/jpg/jpeg/gif/webp/avif/ico`、
+`woff/woff2/ttf/otf/eot`、`wasm/pdf/zip/mp3/wav/mp4/webm`、`webmanifest/manifest`。
+其余扩展名走上面的放开口径；命中白名单失败时日志会打印具体路径与放开方式。
 
 ## 7. 与 `http/server.zig` 的桥接
 

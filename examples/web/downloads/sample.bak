@@ -1,0 +1,9 @@
+zzig Web 示例 · 非常规文件
+
+这个文件是 .bak（不在默认 MIME 白名单里），放在 examples/web/downloads 下，
+该静态根显式放开了未知扩展名：
+
+    .{ .url_prefix = "/downloads", .dir = "examples/web/downloads", .serve_unknown_types = true }
+
+访问：http://127.0.0.1:8080/downloads/sample.bak
+（同样的 .bak 若放在 wwwroot 下默认返回 404，需 setMimeType 或 serveUnknownFileTypes）

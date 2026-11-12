@@ -45,6 +45,8 @@ const Root = struct {
     stream_threshold: ?usize = null,
     /// 缓存头（覆盖全局；`null` = 用全局）
     cache_control: ?[]const u8 = null,
+    /// 是否允许未知扩展名（覆盖全局；`null` = 用全局）
+    serve_unknown_types: ?bool = null,
 };
 
 /// 静态根配置（供 `addRootOptions` / `App.Options.static_roots` 使用）。
@@ -59,6 +61,8 @@ pub const RootOptions = struct {
     stream_threshold: ?usize = null,
     /// 该根的 `Cache-Control`（`null` = 全局默认）
     cache_control: ?[]const u8 = null,
+    /// 该根是否允许未知扩展名（`null` = 全局默认；下载目录可设 `true`）
+    serve_unknown_types: ?bool = null,
 };
 
 /// 静态文件服务。
@@ -79,6 +83,14 @@ pub const StaticFiles = struct {
     /// Linux 上进一步走 `sendfile` 零拷贝，Windows 回退为 32 KB 读-写循环。
     /// 若更在意「小文件一次 read 而不是 open+read+write」，可把阈值调高（如 64 KB）。
     stream_threshold: usize = 0,
+    /// 是否允许下发**未知扩展名**文件（默认 `false`，对齐 ASP.NET Core `ServeUnknownFileTypes`）。
+    ///
+    /// 默认只服务 MIME 表已知的类型；`.bak`/`.db`/无扩展名这类“非常规文件”返回 404，
+    /// 需用 [`StaticFiles.setMimeType`] 只放开指定格式，或 [`StaticFiles.serveUnknownFileTypes`]
+    /// 全放开（下载目录）。**嵌入资源不受此限制**（注册即明确指定了 Content-Type）。
+    serve_unknown_types: bool = false,
+    /// 扩展名 → `Content-Type` 覆盖表（键：小写、不含点）
+    mime_overrides: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// 以目录为根创建（默认约定 `wwwroot`）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !StaticFiles {
@@ -105,6 +117,13 @@ pub const StaticFiles = struct {
 
         for (self.spa_excludes.items) |prefix| self.allocator.free(prefix);
         self.spa_excludes.deinit(self.allocator);
+
+        var overrides = self.mime_overrides.iterator();
+        while (overrides.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.mime_overrides.deinit(self.allocator);
     }
 
     /// 追加磁盘根（`url_prefix` 为空或 `/admin` 形式）。
@@ -129,6 +148,7 @@ pub const StaticFiles = struct {
             .max_bytes = options.max_bytes,
             .stream_threshold = options.stream_threshold,
             .cache_control = cache_control,
+            .serve_unknown_types = options.serve_unknown_types,
         });
     }
 
@@ -164,6 +184,55 @@ pub const StaticFiles = struct {
     /// 调高它可让小于阈值的文件一次读完（更少 syscall），代价是每请求占用与文件同等大小的内存。
     pub fn setStreamThreshold(self: *StaticFiles, value: usize) void {
         self.stream_threshold = value;
+    }
+
+    /// 设置是否允许下发**未知扩展名**文件（默认 `false`）。
+    ///
+    /// 对齐 ASP.NET Core `StaticFileOptions.ServeUnknownFileTypes = false`：
+    /// 默认只服务 MIME 表已知的类型；`.bak`/`.db`/无扩展名这类“非常规文件”返回 404。
+    /// 只放开指定格式请用 [`StaticFiles.setMimeType`]；下载目录需全放开时用本方法。
+    pub fn serveUnknownFileTypes(self: *StaticFiles, enable: bool) void {
+        self.serve_unknown_types = enable;
+    }
+
+    /// 注册/覆盖扩展名的 `Content-Type`（`ext` 可带点、大小写不敏感）。
+    ///
+    /// 这是“只放开非常规格式”的入口（等价 ASP.NET 自定义 `ContentTypeProvider`）：
+    /// ```zig
+    /// try app.statics.setMimeType("apk", "application/vnd.android.package-archive");
+    /// ```
+    pub fn setMimeType(self: *StaticFiles, ext: []const u8, content_type: []const u8) !void {
+        const raw = std.mem.trimStart(u8, ext, ".");
+        if (raw.len == 0) return error.InvalidExtension;
+
+        const key = try self.allocator.alloc(u8, raw.len);
+        errdefer self.allocator.free(key);
+        for (raw, 0..) |c, index| key[index] = std.ascii.toLower(c);
+
+        const value = try self.allocator.dupe(u8, content_type);
+        errdefer self.allocator.free(value);
+
+        if (self.mime_overrides.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        try self.mime_overrides.put(self.allocator, key, value);
+    }
+
+    /// 扩展名 → `Content-Type`（覆盖表 → 已知表 → 是否放开未知）。
+    ///
+    /// 未知且未放开时返回 `null`（调用方按“不服务”处理，即 404）。
+    fn contentTypeFor(self: *const StaticFiles, root: Root, relative: []const u8) ?[]const u8 {
+        var buffer: [32]u8 = undefined;
+        const ext = extensionOf(relative, &buffer) orelse "";
+        if (ext.len > 0) {
+            if (self.mime_overrides.get(ext)) |content_type| return content_type;
+        }
+        if (knownMime(ext)) |content_type| return content_type;
+        if (root.serve_unknown_types orelse self.serve_unknown_types) {
+            return "application/octet-stream";
+        }
+        return null;
     }
 
     /// 启用 SPA 深链接回退（`MapFallbackToFile("index.html")` 等价）。
@@ -362,7 +431,14 @@ pub const StaticFiles = struct {
 
         const cache_control = root.cache_control orelse self.cache_control;
         const etag = try std.fmt.allocPrint(arena, "W/\"{x}-{x}\"", .{ stat.size, stat.mtime.toMilliseconds() });
-        const content_type = mimeType(rel);
+        // 扩展名不在白名单：不下发（对齐 ASP.NET Core 默认行为）
+        const content_type = self.contentTypeFor(root, rel) orelse {
+            std.debug.print(
+                "[zzig.static] 扩展名不在服务白名单，未下发：{s}（可用 setMimeType 或 serveUnknownFileTypes(true) 放开）\n",
+                .{full},
+            );
+            return null;
+        };
         if (etagMatches(if_none_match, etag)) {
             return try buildResponse(arena, .not_modified, content_type, "", etag, cache_control);
         }
@@ -392,9 +468,16 @@ pub const StaticFiles = struct {
     }
 
     /// 按扩展名推断 `Content-Type`（未知按 `application/octet-stream`）。
+    ///
+    /// 注意：这是**纯查询**（总是返回值）；磁盘下发是否允许未知扩展名由
+    /// [`StaticFiles.serveUnknownFileTypes`] / [`StaticFiles.setMimeType`] 决定。
     pub fn mimeType(path: []const u8) []const u8 {
         const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "application/octet-stream";
-        const ext = path[dot + 1 ..];
+        return knownMime(path[dot + 1 ..]) orelse "application/octet-stream";
+    }
+
+    /// 已知扩展名 → `Content-Type`（未知返回 `null`；大小写不敏感）。
+    fn knownMime(ext: []const u8) ?[]const u8 {
         const table = .{
             .{ "html", "text/html; charset=utf-8" },
             .{ "htm", "text/html; charset=utf-8" },
@@ -427,11 +510,13 @@ pub const StaticFiles = struct {
             .{ "wav", "audio/wav" },
             .{ "mp4", "video/mp4" },
             .{ "webm", "video/webm" },
+            .{ "webmanifest", "application/manifest+json" },
+            .{ "manifest", "application/manifest+json" },
         };
         inline for (table) |entry| {
             if (std.ascii.eqlIgnoreCase(ext, entry[0])) return entry[1];
         }
-        return "application/octet-stream";
+        return null;
     }
 };
 
@@ -439,6 +524,15 @@ fn normalizePrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8
     const trimmed = std.mem.trim(u8, prefix, "/");
     if (trimmed.len == 0) return allocator.dupe(u8, "");
     return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
+}
+
+/// 取扩展名并小写化到 `buffer`（无扩展名或超长时返回 `null` = 未知）。
+fn extensionOf(path: []const u8, buffer: []u8) ?[]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return null;
+    const raw = path[dot + 1 ..];
+    if (raw.len == 0 or raw.len > buffer.len) return null;
+    for (raw, 0..) |c, index| buffer[index] = std.ascii.toLower(c);
+    return buffer[0..raw.len];
 }
 
 fn normalizeEmbeddedKey(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -542,6 +636,57 @@ fn responseBody(io: std.Io, arena: std.mem.Allocator, response: router.Response)
         got += n;
     }
     return out[0..got];
+}
+
+test "static：未知扩展名默认拒绝（可按格式/按根放开）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const site_dir = try makeTempDir("static-ext-site");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, site_dir) catch {};
+        testing.allocator.free(site_dir);
+    }
+    const dl_dir = try makeTempDir("static-ext-dl");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dl_dir) catch {};
+        testing.allocator.free(dl_dir);
+    }
+
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/app.js", .{site_dir}), "js");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/data.bak", .{site_dir}), "secret");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/README", .{site_dir}), "no-ext");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/data.bak", .{dl_dir}), "download-backup");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/pkg.7z", .{dl_dir}), "archive-7z");
+
+    var files = try StaticFiles.init(testing.allocator, io, site_dir);
+    defer files.deinit();
+
+    // 已知类型正常；未知 / 无扩展名默认 404
+    try testing.expect((try files.serve(arena, "/app.js", null)) != null);
+    try testing.expect((try files.serve(arena, "/data.bak", null)) == null);
+    try testing.expect((try files.serve(arena, "/README", null)) == null);
+
+    // 只放开指定格式（等价 ASP.NET 自定义 ContentTypeProvider）
+    try files.setMimeType("bak", "application/x-test-backup");
+    const mapped = (try files.serve(arena, "/data.bak", null)).?;
+    try testing.expectEqualStrings("application/x-test-backup", mapped.content_type);
+    try testing.expectEqualStrings("secret", try responseBody(io, arena, mapped));
+
+    // 全部放开：未知扩展名按 octet-stream 下发
+    files.serveUnknownFileTypes(true);
+    const open = (try files.serve(arena, "/README", null)).?;
+    try testing.expectEqualStrings("application/octet-stream", open.content_type);
+    files.serveUnknownFileTypes(false);
+
+    // 按根放开：下载目录允许未知类型，主站仍严格
+    try files.addRootOptions(.{ .url_prefix = "/downloads", .dir = dl_dir, .serve_unknown_types = true });
+    const archive = (try files.serve(arena, "/downloads/pkg.7z", null)).?;
+    try testing.expectEqualStrings("archive-7z", try responseBody(io, arena, archive));
+    // 同一个未知扩展名在主站根上仍然被拒
+    try testing.expect((try files.serve(arena, "/README", null)) == null);
 }
 
 fn makeTempDir(name: []const u8) ![]const u8 {
@@ -708,7 +853,7 @@ test "static：根级 max_bytes 与 Cache-Control 覆盖" {
         std.Io.Dir.cwd().deleteTree(io, dir) catch {};
         testing.allocator.free(dir);
     }
-    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/big.bin", .{dir}), "0123456789");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/big.zip", .{dir}), "0123456789");
 
     var files = try StaticFiles.init(testing.allocator, io, "not-exists-wwwroot");
     defer files.deinit();
@@ -720,14 +865,14 @@ test "static：根级 max_bytes 与 Cache-Control 覆盖" {
     });
 
     // 超过根级上限：不返回
-    try testing.expect((try files.serve(arena, "/dl/big.bin", null)) == null);
+    try testing.expect((try files.serve(arena, "/dl/big.zip", null)) == null);
 
     try files.addRootOptions(.{
         .url_prefix = "/dl2",
         .dir = dir,
         .cache_control = "public, max-age=60",
     });
-    const ok = (try files.serve(arena, "/dl2/big.bin", null)).?;
+    const ok = (try files.serve(arena, "/dl2/big.zip", null)).?;
     try testing.expectEqualStrings("0123456789", try responseBody(io, arena, ok));
 
     var cache: ?[]const u8 = null;

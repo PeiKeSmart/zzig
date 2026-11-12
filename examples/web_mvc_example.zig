@@ -102,8 +102,13 @@ pub fn main() !void {
     // 区域静态资源：Areas/Admin/wwwroot → /admin
     try app.addArea("Admin");
 
-    // 额外静态根：下载目录（也可以换成绝对路径，如 "D:\\downloads"）
-    try app.addStaticRoot("/downloads", "examples/web/downloads");
+    // 额外静态根：下载目录（也可以换成绝对路径，如 "D:\\downloads"）；
+    // `.serve_unknown_types = true` 让下载目录能下发 .bak 这类非常规文件。
+    try app.addStaticRootOptions(.{
+        .url_prefix = "/downloads",
+        .dir = "examples/web/downloads",
+        .serve_unknown_types = true,
+    });
 
     // 组件式调用（模板里 `@await Component.InvokeAsync("Stats", Model)`）
     try app.registerComponent("Stats", null, Stats.render);
