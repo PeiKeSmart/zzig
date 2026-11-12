@@ -190,8 +190,9 @@ fn writeTable(
     try src.appendSlice(alloc, src_dir_norm);
     try src.appendSlice(alloc, "\";\n\n");
     try src.appendSlice(alloc,
-        \\/// 单条资源：`path` 是相对 dist 的路径，`data` 已编译期嵌入。
-        \\pub const Entry = struct { path: []const u8, data: []const u8 };
+        \\/// 单条资源：`path` 是相对 dist 的路径，`data` 已编译期嵌入；
+        \\/// `data_gz` 是构建期生成的 gzip 变体（空 = 该文件不压缩）。
+        \\pub const Entry = struct { path: []const u8, data: []const u8, data_gz: []const u8 = "" };
         \\
         \\
     );
@@ -200,24 +201,105 @@ fn writeTable(
     try src.appendSlice(alloc, " = [_]Entry{\n");
 
     for (items) |it| {
-        // 1) 复制文件：`<out_dir>/<rel>`
+        // 1) 读源文件
+        const bytes = try readFileAlloc(io, alloc, it.abs, 16 * 1024 * 1024);
+        defer alloc.free(bytes);
+
+        // 2) 复制到生成目录（@embedFile 不能跨包路径，必须与生成的 .zig 同目录）
         const dst_rel = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ out_dir, it.rel });
         defer alloc.free(dst_rel);
         try ensureParent(io, dst_rel);
-        try copyFile(io, alloc, it.abs, dst_rel);
+        try writeFile(io, dst_rel, bytes);
 
-        // 2) 表里用相对路径
+        // 3) 可压缩类型且在构建期压一次（运行时零 CPU）；压不小就不用
+        var gz_rel: []const u8 = "";
+        if (shouldCompress(it.rel) and bytes.len >= compress_min_size) {
+            const gz_bytes = try gzipCompress(alloc, bytes);
+            defer alloc.free(gz_bytes);
+            if (gz_bytes.len < bytes.len) {
+                gz_rel = try std.fmt.allocPrint(alloc, "{s}.gz", .{it.rel});
+                const gz_dst = try std.fmt.allocPrint(alloc, "{s}/{s}.gz", .{ out_dir, it.rel });
+                defer alloc.free(gz_dst);
+                try writeFile(io, gz_dst, gz_bytes);
+            }
+        }
+        defer if (gz_rel.len > 0) alloc.free(gz_rel);
+
+        // 4) 表项
         try src.appendSlice(alloc, "    .{ .path = \"");
         try src.appendSlice(alloc, it.rel);
         try src.appendSlice(alloc, "\", .data = @embedFile(\"");
         const rel_norm = try escForString(alloc, it.rel);
         defer alloc.free(rel_norm);
         try src.appendSlice(alloc, rel_norm);
-        try src.appendSlice(alloc, "\") },\n");
+        try src.appendSlice(alloc, "\")");
+        if (gz_rel.len > 0) {
+            const gz_norm = try escForString(alloc, gz_rel);
+            defer alloc.free(gz_norm);
+            try src.appendSlice(alloc, ", .data_gz = @embedFile(\"");
+            try src.appendSlice(alloc, gz_norm);
+            try src.appendSlice(alloc, "\")");
+        }
+        try src.appendSlice(alloc, " },\n");
     }
     try src.appendSlice(alloc, "};\n");
 
     try writeFile(io, out_path, src.items);
+}
+
+/// 小于该体积不压缩（对齐 DH.RustBase 的 `gzip_min_size = 256`：小报文压完反而变大）。
+const compress_min_size: usize = 256;
+
+/// 文本类才压；图片/字体/zip 等本身已压缩，再压是浪费构建时间。
+fn shouldCompress(rel: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, rel, '.') orelse return false;
+    const ext = rel[dot + 1 ..];
+    const compressible = [_][]const u8{
+        "js", "mjs", "css", "html", "htm", "json", "svg", "xml", "txt", "map", "webmanifest",
+    };
+    for (compressible) |e| {
+        if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    }
+    return false;
+}
+
+/// 构建期 gzip（`std.compress.flate`，零外部依赖）。
+fn gzipCompress(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    // Compress.init 断言 output.buffer.len > 8，必须预分配输出缓冲
+    var aw = try std.Io.Writer.Allocating.initCapacity(alloc, 64 * 1024);
+    errdefer aw.deinit();
+
+    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(window);
+
+    // Compress 结构体约 224K，放堆上避免大栈帧
+    const comp = try alloc.create(std.compress.flate.Compress);
+    defer alloc.destroy(comp);
+    comp.* = try std.compress.flate.Compress.init(&aw.writer, window, .gzip, .default);
+    try comp.writer.writeAll(input);
+    try comp.finish();
+
+    return aw.toOwnedSlice();
+}
+
+/// 读整个文件（构建期用，带上限）。
+fn readFileAlloc(io: std.Io, alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    if (len > max_bytes) return error.FileTooBig;
+    const buf = try alloc.alloc(u8, @intCast(len));
+    errdefer alloc.free(buf);
+    var read: usize = 0;
+    while (read < buf.len) {
+        const n = f.readStreaming(io, &.{buf[read..]}) catch |e| switch (e) {
+            error.EndOfStream => 0,
+            else => return e,
+        };
+        if (n == 0) break;
+        read += n;
+    }
+    return buf[0..read];
 }
 
 /// 转义为双引号字符串内容。

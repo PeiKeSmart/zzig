@@ -176,5 +176,19 @@ content-type: text/javascript; charset=utf-8   # 按原始扩展名推断，不�
 
 不带 gzip、或同名 `.gz` 不存在 → 自动回退原文件（不加任何编码头）。
 
-**未做（重要）**：`embedAssets`（编译期嵌入，单 exe 形态）**暂不支持 `.gz` 变体** —— 生产单 exe 部署时
-静态资源仍是未压缩下发。要补需要 `spa_gen` 在构建期生成 `.gz` 并让 `Embedded` 带 gzip 变体，见决策记录。
+**两种部署形态都支持压缩**（不打包进二进制同样生效）：
+
+| 形态 | 压缩从哪来 | 运行时开销 |
+|---|---|---|
+| 磁盘目录（`wwwroot` / 独立静态根） | 同名 `.gz` 文件（构建期生成，`gzip -k` 或 Vite 插件） | **零**（原样流式下发） |
+| 编译期嵌入单 exe（`embedAssets`） | `zzig-spa-gen` 在**构建期**用 `std.compress.flate` 生成 `.gz` 并嵌入 | **零**（下发已压好的字节） |
+
+自动行为（两种形态一致）：
+
+- 只压文本类（`js/mjs/css/html/json/svg/xml/txt/map/webmanifest`）；
+- 小于 **256 字节**不压（对齐 DH.RustBase：小报文压完反而变大）；
+- 压完不比原文件小就放弃（磁盘形态直接不发 `.gz`，嵌入形态表里 `data_gz` 留空）；
+- 带 gzip 与不带 gzip 的 **ETag 不同**（`…-gz` 后缀），避免缓存把压缩字节当明文复用；
+- 客户端不带 `Accept-Encoding: gzip`、或没有压缩变体 → 自动回退原文件，不加任何编码头。
+
+**仍未做**：动态响应（JSON/HTML）的运行时 gzip —— DH.RustBase 有，zzig 暂无。

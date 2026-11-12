@@ -32,6 +32,9 @@ const Embedded = struct {
     data: []const u8,
     content_type: []const u8,
     etag: []const u8,
+    /// 构建期生成的 gzip 变体（空 = 无预压缩）
+    data_gzip: []const u8 = "",
+    etag_gzip: []const u8 = "",
 };
 
 const Root = struct {
@@ -112,6 +115,7 @@ pub const StaticFiles = struct {
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.etag);
+            if (entry.value_ptr.etag_gzip.len > 0) self.allocator.free(entry.value_ptr.etag_gzip);
         }
         self.embedded.deinit(self.allocator);
 
@@ -249,20 +253,42 @@ pub const StaticFiles = struct {
 
     /// 注册单个嵌入资源（与磁盘叠加，**优先命中**）。
     pub fn embed(self: *StaticFiles, path: []const u8, data: []const u8, content_type: []const u8) !void {
+        return self.embedWithGzip(path, data, content_type, "");
+    }
+
+    /// 嵌入资源（含构建期生成的 gzip 变体；`data_gzip` 为空表示无预压缩）。
+    ///
+    /// 两种部署形态都支持压缩：磁盘目录靠同名 `.gz` 文件，单 exe 靠构建期嵌入的 gzip 字节。
+    pub fn embedWithGzip(
+        self: *StaticFiles,
+        path: []const u8,
+        data: []const u8,
+        content_type: []const u8,
+        data_gzip: []const u8,
+    ) !void {
         const key = try normalizeEmbeddedKey(self.allocator, path);
         errdefer self.allocator.free(key);
 
         const etag = try std.fmt.allocPrint(self.allocator, "\"{x}-{x}\"", .{ data.len, fnv1a64(data) });
         errdefer self.allocator.free(etag);
 
+        var etag_gz: []const u8 = "";
+        if (data_gzip.len > 0) {
+            etag_gz = try std.fmt.allocPrint(self.allocator, "\"{x}-{x}-gz\"", .{ data_gzip.len, fnv1a64(data_gzip) });
+        }
+        errdefer if (etag_gz.len > 0) self.allocator.free(etag_gz);
+
         if (self.embedded.fetchRemove(key)) |old| {
             self.allocator.free(old.key);
             self.allocator.free(old.value.etag);
+            if (old.value.etag_gzip.len > 0) self.allocator.free(old.value.etag_gzip);
         }
         try self.embedded.put(self.allocator, key, .{
             .data = data,
             .content_type = content_type,
             .etag = etag,
+            .data_gzip = data_gzip,
+            .etag_gzip = etag_gz,
         });
     }
 
@@ -273,11 +299,15 @@ pub const StaticFiles = struct {
 
     /// 把「编译期生成的资源表」批量嵌入（前端 dist → 单 exe）。
     ///
-    /// `files` 的每个元素只需有 `.path` 与 `.data`（见 `build/spa_gen.zig` 生成的表）：
+    /// `files` 的每个元素需有 `.path` 与 `.data`（见 `build/spa_gen.zig` 生成的表），
+    /// 可选带 `.data_gz`（构建期生成的 gzip 变体）。
     /// 内容类型按扩展名自动推断（与磁盘下发同一张 MIME 表）。
     /// 嵌入资源**不受**「未知扩展名默认拒绝」策略限制 —— 走到这里说明开发者已明确要提供它们。
     pub fn embedAssets(self: *StaticFiles, files: anytype) !void {
-        for (files) |f| try self.embed(f.path, f.data, mimeType(f.path));
+        for (files) |f| {
+            const gz: []const u8 = if (@hasField(@TypeOf(f), "data_gz")) f.data_gz else "";
+            try self.embedWithGzip(f.path, f.data, mimeType(f.path), gz);
+        }
     }
 
     /// 已注册嵌入资源数量（`0` = 纯磁盘模式）。
@@ -335,11 +365,11 @@ pub const StaticFiles = struct {
         const decoded = try router.percentDecode(arena, if (raw_path.len == 0) "/" else raw_path, false);
         if (!isSafePath(decoded)) return null;
 
-        if (try self.serveEmbedded(arena, decoded, if_none_match)) |response| return response;
+        if (try self.serveEmbedded(arena, decoded, if_none_match, accept_gzip)) |response| return response;
         if (try self.serveDisk(arena, decoded, if_none_match, accept_gzip)) |response| return response;
 
         if (self.spa and isSpaCandidate(decoded) and !self.isSpaExcluded(decoded)) {
-            if (try self.serveEmbedded(arena, "/", if_none_match)) |response| return response;
+            if (try self.serveEmbedded(arena, "/", if_none_match, accept_gzip)) |response| return response;
             if (try self.serveDisk(arena, "/", if_none_match, accept_gzip)) |response| return response;
         }
         return null;
@@ -362,11 +392,12 @@ pub const StaticFiles = struct {
         arena: std.mem.Allocator,
         path: []const u8,
         if_none_match: ?[]const u8,
+        accept_gzip: bool,
     ) !?router.Response {
         if (self.embedded.count() == 0) return null;
 
         const key = std.mem.trim(u8, path, "/");
-        if (try self.embeddedResponse(arena, key, if_none_match)) |response| return response;
+        if (try self.embeddedResponse(arena, key, if_none_match, accept_gzip)) |response| return response;
 
         // 目录请求：逐个默认文档
         if (path.len == 0 or path[path.len - 1] == '/') {
@@ -375,7 +406,7 @@ pub const StaticFiles = struct {
                     try arena.dupe(u8, doc)
                 else
                     try std.fmt.allocPrint(arena, "{s}/{s}", .{ key, doc });
-                if (try self.embeddedResponse(arena, full, if_none_match)) |response| return response;
+                if (try self.embeddedResponse(arena, full, if_none_match, accept_gzip)) |response| return response;
             }
         }
         return null;
@@ -386,12 +417,20 @@ pub const StaticFiles = struct {
         arena: std.mem.Allocator,
         key: []const u8,
         if_none_match: ?[]const u8,
+        accept_gzip: bool,
     ) !?router.Response {
         const asset = self.embedded.get(key) orelse return null;
-        if (etagMatches(if_none_match, asset.etag)) {
-            return try buildResponse(arena, .not_modified, asset.content_type, "", asset.etag, self.cache_control, &.{});
+
+        // 单 exe 形态的压缩：用构建期嵌入的 gzip 变体（零运行时 CPU）
+        const use_gzip = accept_gzip and asset.data_gzip.len > 0;
+        const body = if (use_gzip) asset.data_gzip else asset.data;
+        const etag = if (use_gzip) asset.etag_gzip else asset.etag;
+        const extra: []const std.http.Header = if (use_gzip) &gzip_headers else &.{};
+
+        if (etagMatches(if_none_match, etag)) {
+            return try buildResponse(arena, .not_modified, asset.content_type, "", etag, self.cache_control, extra);
         }
-        return try buildResponse(arena, .ok, asset.content_type, asset.data, asset.etag, self.cache_control, &.{});
+        return try buildResponse(arena, .ok, asset.content_type, body, etag, self.cache_control, extra);
     }
 
     fn serveDisk(
@@ -1039,4 +1078,58 @@ test "static：预压缩 .gz 优先下发（按 Accept-Encoding 协商并加 Var
     for (no_gz.headers) |h| {
         try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "content-encoding"));
     }
+}
+test "static：嵌入资源也能按 Accept-Encoding 下发构建期 gzip（单 exe 形态）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("static-embed-gzip");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+
+    var files = try StaticFiles.init(testing.allocator, io, dir);
+    defer files.deinit();
+    try files.embedWithGzip("app.js", "plain-js", "text/javascript; charset=utf-8", "GZIP-js");
+
+    // ① 接受 gzip → 下发嵌入的 gzip 字节 + 头
+    const gz = (try files.serveRequest(arena, .{
+        .method = "GET",
+        .path = "/app.js",
+        .query = "",
+        .headers = &.{.{ .name = "accept-encoding", .value = "gzip, deflate, br" }},
+    })).?;
+    try testing.expectEqualStrings("GZIP-js", gz.body);
+    var saw_encoding = false;
+    for (gz.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding") and std.ascii.eqlIgnoreCase(h.value, "gzip")) saw_encoding = true;
+    }
+    try testing.expect(saw_encoding);
+
+    // ② 不接受 gzip → 原字节，无编码头
+    const plain = (try files.serveRequest(arena, .{
+        .method = "GET",
+        .path = "/app.js",
+        .query = "",
+        .headers = &.{},
+    })).?;
+    try testing.expectEqualStrings("plain-js", plain.body);
+    for (plain.headers) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "content-encoding"));
+    }
+
+    // ③ 两种表示 ETag 必须不同（否则缓存会把 gzip 字节当成明文复用）
+    var etag_plain: []const u8 = "";
+    var etag_gz: []const u8 = "";
+    for (plain.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "etag")) etag_plain = h.value;
+    }
+    for (gz.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "etag")) etag_gz = h.value;
+    }
+    try testing.expect(etag_plain.len > 0 and etag_gz.len > 0);
+    try testing.expect(!std.mem.eql(u8, etag_plain, etag_gz));
 }
