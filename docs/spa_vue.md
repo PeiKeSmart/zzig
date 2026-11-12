@@ -151,7 +151,7 @@ zig build -Doptimize=ReleaseFast
 
 | | DH.RustBase | zzig |
 |---|---|---|
-| 动态响应 gzip | ✅ 响应级（默认开，≥256 字节，类型白名单，加 `Vary`） | ❌ 未做 |
+| 动态响应 gzip | ✅ 响应级（默认开，≥256 字节，类型白名单，加 `Vary`） | ✅ 响应级（`finalize_http_response`，同一口径） |
 | 静态文件 | ❌ **明确不压**（`resp.file.is_some()` 直接返回，怕整读把省下的内存吐回去） | ✅ **预压缩 `.gz` 优先**（流式发送，不整读、不耗 CPU） |
 
 为什么 zzig 选预压缩：静态资源本来就全流式发送，运行时压缩必须整读（等于放弃流式的内存优势）；
@@ -191,4 +191,4 @@ content-type: text/javascript; charset=utf-8   # 按原始扩展名推断，不�
 - 带 gzip 与不带 gzip 的 **ETag 不同**（`…-gz` 后缀），避免缓存把压缩字节当明文复用；
 - 客户端不带 `Accept-Encoding: gzip`、或没有压缩变体 → 自动回退原文件，不加任何编码头。
 
-**仍未做**：动态响应（JSON/HTML）的运行时 gzip —— DH.RustBase 有，zzig 暂无。
+**动态响应 gzip（已对齐 DH.RustBase）**：`Web.Options.gzip`（默认开）+ `gzip_min_size`（默认 256 字节）；只压可压缩类型（text/*、JSON、JS、XML、SVG 等），`file`/`content_length`/空 body/已带 `content-encoding` 一律跳过，压完不比原文小就退回原文，并加 `Vary: Accept-Encoding`。
