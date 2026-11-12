@@ -294,7 +294,10 @@ pub const StaticFiles = struct {
         if (!std.ascii.eqlIgnoreCase(req.method, "GET") and !std.ascii.eqlIgnoreCase(req.method, "HEAD")) {
             return null;
         }
-        const response = try self.serve(arena, req.path, req.header("if-none-match"));
+        // 内容协商：客户端接受 gzip 时优先下发预压缩的 `.gz`
+        const ae = req.header("accept-encoding") orelse "";
+        const accept_gzip = containsIgnoreCase(ae, "gzip");
+        const response = try self.serveInternal(arena, req.path, req.header("if-none-match"), accept_gzip);
         if (response) |resp| {
             if (std.ascii.eqlIgnoreCase(req.method, "HEAD")) {
                 return .{
@@ -318,15 +321,26 @@ pub const StaticFiles = struct {
         raw_path: []const u8,
         if_none_match: ?[]const u8,
     ) !?router.Response {
+        return self.serveInternal(arena, raw_path, if_none_match, false);
+    }
+
+    /// `accept_gzip` 为真时，磁盘根优先下发同名 `.gz`（预压缩产物，零运行时 CPU）。
+    fn serveInternal(
+        self: *const StaticFiles,
+        arena: std.mem.Allocator,
+        raw_path: []const u8,
+        if_none_match: ?[]const u8,
+        accept_gzip: bool,
+    ) !?router.Response {
         const decoded = try router.percentDecode(arena, if (raw_path.len == 0) "/" else raw_path, false);
         if (!isSafePath(decoded)) return null;
 
         if (try self.serveEmbedded(arena, decoded, if_none_match)) |response| return response;
-        if (try self.serveDisk(arena, decoded, if_none_match)) |response| return response;
+        if (try self.serveDisk(arena, decoded, if_none_match, accept_gzip)) |response| return response;
 
         if (self.spa and isSpaCandidate(decoded) and !self.isSpaExcluded(decoded)) {
             if (try self.serveEmbedded(arena, "/", if_none_match)) |response| return response;
-            if (try self.serveDisk(arena, "/", if_none_match)) |response| return response;
+            if (try self.serveDisk(arena, "/", if_none_match, accept_gzip)) |response| return response;
         }
         return null;
     }
@@ -375,9 +389,9 @@ pub const StaticFiles = struct {
     ) !?router.Response {
         const asset = self.embedded.get(key) orelse return null;
         if (etagMatches(if_none_match, asset.etag)) {
-            return try buildResponse(arena, .not_modified, asset.content_type, "", asset.etag, self.cache_control);
+            return try buildResponse(arena, .not_modified, asset.content_type, "", asset.etag, self.cache_control, &.{});
         }
-        return try buildResponse(arena, .ok, asset.content_type, asset.data, asset.etag, self.cache_control);
+        return try buildResponse(arena, .ok, asset.content_type, asset.data, asset.etag, self.cache_control, &.{});
     }
 
     fn serveDisk(
@@ -385,6 +399,7 @@ pub const StaticFiles = struct {
         arena: std.mem.Allocator,
         path: []const u8,
         if_none_match: ?[]const u8,
+        accept_gzip: bool,
     ) !?router.Response {
         // 最长前缀优先：根 "" 永远匹配，其余按前缀长度从长到短尝试
         var best: ?Root = null;
@@ -396,7 +411,7 @@ pub const StaticFiles = struct {
 
         const rel = std.mem.trimStart(u8, path[root.url_prefix.len..], "/");
         if (rel.len > 0) {
-            if (try self.diskResponse(arena, root, rel, if_none_match)) |response| return response;
+            if (try self.diskWithPrecompressed(arena, root, rel, if_none_match, accept_gzip)) |response| return response;
         }
 
         if (rel.len == 0 or path[path.len - 1] == '/') {
@@ -405,10 +420,29 @@ pub const StaticFiles = struct {
                     try arena.dupe(u8, doc)
                 else
                     try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, doc });
-                if (try self.diskResponse(arena, root, full, if_none_match)) |response| return response;
+                if (try self.diskWithPrecompressed(arena, root, full, if_none_match, accept_gzip)) |response| return response;
             }
         }
         return null;
+    }
+
+    /// 先试 `.gz`（若客户端接受 gzip），再回退原文件。
+    fn diskWithPrecompressed(
+        self: *const StaticFiles,
+        arena: std.mem.Allocator,
+        root: Root,
+        rel: []const u8,
+        if_none_match: ?[]const u8,
+        accept_gzip: bool,
+    ) !?router.Response {
+        if (accept_gzip) {
+            const gz = try std.fmt.allocPrint(arena, "{s}.gz", .{rel});
+            if (try self.diskResponse(arena, root, rel, if_none_match, .{
+                .file_rel = gz,
+                .extra_headers = &gzip_headers,
+            })) |response| return response;
+        }
+        return self.diskResponse(arena, root, rel, if_none_match, .{});
     }
 
     fn diskResponse(
@@ -417,10 +451,13 @@ pub const StaticFiles = struct {
         root: Root,
         rel: []const u8,
         if_none_match: ?[]const u8,
+        opts: DiskOpts,
     ) !?router.Response {
         if (!isSafePath(rel)) return null;
 
-        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root.dir, rel });
+        // 预压缩：实际打开 `.gz`，但 Content-Type 仍按原始路径推断
+        const file_rel = opts.file_rel orelse rel;
+        const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root.dir, file_rel });
         const stat = fsio.statFile(self.io, full) catch |e| {
             if (e != error.FileNotFound) {
                 std.debug.print("[zzig.static] 读取文件信息失败：{s}（{s}）\n", .{ full, @errorName(e) });
@@ -449,7 +486,7 @@ pub const StaticFiles = struct {
             return null;
         };
         if (etagMatches(if_none_match, etag)) {
-            return try buildResponse(arena, .not_modified, content_type, "", etag, cache_control);
+            return try buildResponse(arena, .not_modified, content_type, "", etag, cache_control, opts.extra_headers);
         }
 
         // 大文件流式发送（不整读进内存）；小文件仍然一次读完（少一次打开/循环）
@@ -459,7 +496,7 @@ pub const StaticFiles = struct {
                 std.debug.print("[zzig.static] 打开文件失败：{s}（{s}）\n", .{ full, @errorName(e) });
                 return null;
             };
-            const headers = try buildStaticHeaders(arena, etag, cache_control);
+            const headers = try buildStaticHeaders(arena, etag, cache_control, opts.extra_headers);
             return .{
                 .status = .ok,
                 .content_type = content_type,
@@ -473,7 +510,7 @@ pub const StaticFiles = struct {
             std.debug.print("[zzig.static] 读取文件失败：{s}（{s}）\n", .{ full, @errorName(e) });
             return null;
         };
-        return try buildResponse(arena, .ok, content_type, body, etag, cache_control);
+        return try buildResponse(arena, .ok, content_type, body, etag, cache_control, opts.extra_headers);
     }
 
     /// 按扩展名推断 `Content-Type`（未知按 `application/octet-stream`）。
@@ -596,24 +633,51 @@ fn buildResponse(
     body: []const u8,
     etag: []const u8,
     cache_control: []const u8,
+    extra: []const std.http.Header,
 ) !router.Response {
     return .{
         .status = status,
         .content_type = content_type,
         .body = body,
-        .headers = try buildStaticHeaders(arena, etag, cache_control),
+        .headers = try buildStaticHeaders(arena, etag, cache_control, extra),
     };
 }
+
+/// 预压缩响应的附加头（`Content-Encoding` 与内容协商语义的 `Vary`）。
+const gzip_headers = [_]std.http.Header{
+    .{ .name = "content-encoding", .value = "gzip" },
+    .{ .name = "vary", .value = "accept-encoding" },
+};
+
+/// 大小写不敏感的子串查找（`Accept-Encoding: GZip, deflate` 这类头值）。
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// 磁盘响应的可选调整（预压缩用）。
+const DiskOpts = struct {
+    /// 实际打开的文件相对路径（默认 = rel；预压缩时是 `rel + ".gz"`）
+    file_rel: ?[]const u8 = null,
+    /// 附加响应头
+    extra_headers: []const std.http.Header = &.{},
+};
 
 /// 静态资源统一响应头（`ETag` + `Cache-Control`）。
 fn buildStaticHeaders(
     arena: std.mem.Allocator,
     etag: []const u8,
     cache_control: []const u8,
-) ![]const std.http.Header {
-    const headers = try arena.alloc(std.http.Header, 2);
+    extra: []const std.http.Header,
+) ![]const std.http.Header {    const headers = try arena.alloc(std.http.Header, 2 + extra.len);
     headers[0] = .{ .name = "etag", .value = etag };
     headers[1] = .{ .name = "cache-control", .value = cache_control };
+    @memcpy(headers[2..], extra);
     return headers;
 }
 
@@ -913,4 +977,66 @@ test "static：大文件走流式（不整读进内存）" {
     try testing.expectEqualStrings("", response.body);
     try testing.expectEqual(@as(u64, 10), response.file.?.length);
     response.file.?.file.close(io);
+}
+
+test "static：预压缩 .gz 优先下发（按 Accept-Encoding 协商并加 Vary）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("static-precompressed");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/app.js", .{dir}), "plain-js");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/app.js.gz", .{dir}), "GZIP-js");
+    try fsio.writeFile(io, try std.fmt.allocPrint(arena, "{s}/only.css", .{dir}), "plain-css");
+
+    var files = try StaticFiles.init(testing.allocator, io, dir);
+    defer files.deinit();
+
+    // ① 客户端接受 gzip → 下发 .gz，带 Content-Encoding + Vary
+    const gz = (try files.serveRequest(arena, .{
+        .method = "GET",
+        .path = "/app.js",
+        .query = "",
+        .headers = &.{.{ .name = "accept-encoding", .value = "GZip, deflate" }},
+    })).?;
+    try testing.expectEqualStrings("GZIP-js", try responseBody(io, arena, gz));
+    // Content-Type 必须按原始扩展名（.js）推断，而不是 .gz
+    try testing.expectEqualStrings("text/javascript; charset=utf-8", gz.content_type);
+    var saw_encoding = false;
+    var saw_vary = false;
+    for (gz.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding") and std.ascii.eqlIgnoreCase(h.value, "gzip")) saw_encoding = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "vary") and std.ascii.eqlIgnoreCase(h.value, "accept-encoding")) saw_vary = true;
+    }
+    try testing.expect(saw_encoding);
+    try testing.expect(saw_vary);
+
+    // ② 不接受 gzip → 下发原文件，且没有 Content-Encoding
+    const plain = (try files.serveRequest(arena, .{
+        .method = "GET",
+        .path = "/app.js",
+        .query = "",
+        .headers = &.{},
+    })).?;
+    try testing.expectEqualStrings("plain-js", try responseBody(io, arena, plain));
+    for (plain.headers) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "content-encoding"));
+    }
+
+    // ③ 没有同名 .gz → 回退原文件（不报错、不加头）
+    const no_gz = (try files.serveRequest(arena, .{
+        .method = "GET",
+        .path = "/only.css",
+        .query = "",
+        .headers = &.{.{ .name = "accept-encoding", .value = "gzip" }},
+    })).?;
+    try testing.expectEqualStrings("plain-css", try responseBody(io, arena, no_gz));
+    for (no_gz.headers) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "content-encoding"));
+    }
 }

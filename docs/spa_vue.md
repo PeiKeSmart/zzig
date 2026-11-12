@@ -144,3 +144,37 @@ zig build -Doptimize=ReleaseFast
 - 压缩产物（`gzip`/`brotli` 预压缩文件优先下发）；
 - 资源清单（`manifest.json`）解析与长缓存头（`immutable`）；
 - `Service Worker` / PWA 相关约定。
+
+## 7. 传输压缩（预压缩优先，零运行时 CPU）
+
+口径与 DH.RustBase 不同，有意为之：
+
+| | DH.RustBase | zzig |
+|---|---|---|
+| 动态响应 gzip | ✅ 响应级（默认开，≥256 字节，类型白名单，加 `Vary`） | ❌ 未做 |
+| 静态文件 | ❌ **明确不压**（`resp.file.is_some()` 直接返回，怕整读把省下的内存吐回去） | ✅ **预压缩 `.gz` 优先**（流式发送，不整读、不耗 CPU） |
+
+为什么 zzig 选预压缩：静态资源本来就全流式发送，运行时压缩必须整读（等于放弃流式的内存优势）；
+而 Vite 产物适合构建期压一次、运行时原样下发。
+
+**启用方式（磁盘根）**：把 `.gz` 和原文件放同一目录即可，服务端按 `Accept-Encoding` 协商自动优先下发：
+
+```bash
+# 构建期批量生成（任选）
+npx vite-plugin-compression        # 或在 vite.config.ts 里配置
+# 或
+for f in dist/**/*.{js,css,svg,json}; do gzip -9 -k "$f"; done
+```
+
+请求带 `Accept-Encoding: gzip` → 下发 `app.js.gz`，并带：
+
+```
+content-encoding: gzip
+vary: accept-encoding
+content-type: text/javascript; charset=utf-8   # 按原始扩展名推断，不是 .gz
+```
+
+不带 gzip、或同名 `.gz` 不存在 → 自动回退原文件（不加任何编码头）。
+
+**未做（重要）**：`embedAssets`（编译期嵌入，单 exe 形态）**暂不支持 `.gz` 变体** —— 生产单 exe 部署时
+静态资源仍是未压缩下发。要补需要 `spa_gen` 在构建期生成 `.gz` 并让 `Embedded` 带 gzip 变体，见决策记录。
