@@ -58,6 +58,26 @@ pub const profiler = struct {
 /// Zig 版本兼容辅助
 pub const compat = @import("compat.zig");
 
+/// 显式 io 文件工具（多线程/服务端场景，不走进程级 currentIo）
+pub const fsio = @import("file/fsio.zig");
+
+/// 路径安全与 glob 匹配（排除规则通用）
+pub const glob = @import("file/glob.zig");
+
+/// URL 查询串编解码
+pub const url = @import("net/url.zig");
+
+/// 哈希小工具（SHA-256 十六进制、常量时间比较）
+pub const hash = @import("crypto/hash_util.zig");
+
+/// 配置：TOML 子集解析 + 文本热加载（版本戳 / 原子写 / 缺失生成）
+pub const config = struct {
+    pub const toml = @import("config/toml.zig");
+    pub const FileText = @import("config/file.zig").FileText;
+    pub const FileOptions = @import("config/file.zig").Options;
+    pub const getStamp = @import("config/file.zig").getStamp;
+};
+
 /// 动态队列（自动扩容的 SPSC 队列）
 pub const logs = struct {
     pub const DynamicQueue = @import("logs/dynamic_queue.zig").DynamicQueue;
@@ -67,6 +87,12 @@ pub const logs = struct {
     pub const RotationManager = @import("logs/rotation_manager.zig").RotationManager;
     pub const AdvancedRotationConfig = @import("logs/rotation_manager.zig").AdvancedRotationConfig;
     pub const RotationStrategy = @import("logs/rotation_manager.zig").RotationStrategy;
+
+    /// DH.RustBase 风格文本日志（按天文件 + 行格式 + 控制台着色）
+    pub const TextFileLog = @import("logs/text_file_log.zig").TextFileLog;
+    pub const TextLogOptions = @import("logs/text_file_log.zig").Options;
+    pub const formatLine = @import("logs/text_file_log.zig").formatLine;
+    pub const parseLevel = @import("logs/text_file_log.zig").parseLevel;
 };
 
 /// JSON 解析器（JSMN-like，流式解析，紧凑格式，SIMD 优化）
@@ -217,6 +243,13 @@ test {
     _ = @import("db/tds_loopback_test.zig");
     _ = @import("http/server.zig");
     _ = @import("crypto/rsa.zig");
+    _ = @import("crypto/hash_util.zig");
+    _ = @import("file/glob.zig");
+    _ = @import("file/fsio.zig");
+    _ = @import("net/url.zig");
+    _ = @import("config/toml.zig");
+    _ = @import("config/file.zig");
+    _ = @import("logs/text_file_log.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
 }
