@@ -36,6 +36,18 @@ pub const Buf = struct {
         return self.alloc.toOwnedSlice();
     }
 
+    /// 追加零填充的非负整数（`2024` 宽 4 → `2024`；`7` 宽 2 → `07`）。
+    ///
+    /// **不要用 `{d:0>4}`**：Zig 0.17 的格式说明在补零时会把整数当带符号数渲染，
+    /// 结果多一个前导 `+`（实测 `2024` → `+2024`）。日期/编号拼装一律走这里。
+    pub fn addZeroPadded(self: *Buf, value: anytype, width: usize) !void {
+        var num_buf: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&num_buf, "{d}", .{value});
+        var pad: usize = if (text.len < width) width - text.len else 0;
+        while (pad > 0) : (pad -= 1) try self.addByte('0');
+        try self.add(text);
+    }
+
     /// 已写入内容的切片（不转移所有权）。
     pub fn slice(self: *Buf) []const u8 {
         return self.alloc.written();
@@ -49,4 +61,17 @@ test "Buf 基本拼接" {
     try b.fmt("{d}", .{42});
     try b.add(" FROM t");
     try std.testing.expectEqualStrings("SELECT 42 FROM t", b.slice());
+}
+
+test "addZeroPadded：不产生多余符号位（{d:0>4} 的坑）" {
+    var b = Buf.init(std.testing.allocator);
+    defer b.deinit();
+    try b.addZeroPadded(@as(i32, 2024), 4);
+    try b.addByte('-');
+    try b.addZeroPadded(@as(u8, 7), 2);
+    try b.addByte('-');
+    try b.addZeroPadded(@as(u8, 0), 2);
+    try b.addByte('-');
+    try b.addZeroPadded(@as(i32, 123456), 3); // 超宽不截断
+    try std.testing.expectEqualStrings("2024-07-00-123456", b.slice());
 }
