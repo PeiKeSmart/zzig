@@ -23,22 +23,31 @@ const colorCode = levels.colorCode;
 const currentThreadId = levels.currentThreadId;
 
 /// 当前行格式（默认对齐 DH.NCore：`Time ThreadId Kind Name Message`）
-var line_format: LineFormat = .ncore;
+///
+/// **原子存**：热加载线程可能随时改写，日志线程同时读取，普通全局变量属数据竞争。
+var line_format_store = std.atomic.Value(u8).init(@intFromEnum(LineFormat.ncore));
 
 /// 设置日志行格式。
 pub fn setLineFormat(f: LineFormat) void {
-    line_format = f;
+    line_format_store.store(@intFromEnum(f), .release);
 }
 
 /// 取当前行格式。
 pub fn getLineFormat() LineFormat {
-    return line_format;
+    return @enumFromInt(line_format_store.load(.acquire));
 }
 
 // ============ 输出目标（控制台 / 文件，可同时开）============
 
 /// 控制台输出开关（默认开）
-var console_enabled: bool = true;
+///
+/// **原子存**：热加载线程按 `LogConsole` 改写，worker 线程同时读取。
+var console_enabled_store = std.atomic.Value(bool).init(true);
+
+/// 非原子镜像：仅用于“热加载中”的块状引用，保持代码可读（读取请用 [`consoleEnabled`]）
+fn consoleEnabledRaw() bool {
+    return console_enabled_store.load(.acquire);
+}
 
 /// 文件输出（为 null 表示只写控制台）。按天滚动 + 大小拆分 + 备份清理由 `TextFileLog` 负责。
 var file_sink: ?text_log.TextFileLog = null;
@@ -49,12 +58,12 @@ var file_mutex: compat.Mutex = .{};
 
 /// 打开/关闭控制台输出。
 pub fn setConsole(on: bool) void {
-    console_enabled = on;
+    console_enabled_store.store(on, .release);
 }
 
 /// 是否启用控制台输出。
 pub fn consoleEnabled() bool {
-    return console_enabled;
+    return console_enabled_store.load(.acquire);
 }
 
 // ============ 异步写入（业务线程零 IO）============
@@ -234,7 +243,7 @@ fn emitBatch(items: []const PendingLine) void {
     }
     file_mutex.unlock();
 
-    if (!console_enabled) return;
+    if (!consoleEnabledRaw()) return;
 
     // ---------- 控制台：同样拼成一块（含颜色），一次写出 ----------
     var out: std.Io.Writer.Allocating = .init(queue_alloc);
@@ -267,14 +276,14 @@ pub fn useFile(io: std.Io, gpa: std.mem.Allocator, opts: text_log.Options) !void
     // **头与数据必须同源**：`Options.line_format` 决定文件头 `#Fields`，
     // 若不同步到全局行格式，就会出现「表头写着 Level 列、正文却没有」这种自相矛盾的日志。
     // 直接调用 `useFile` 而没走 `applyConfig` 时，这里保证两者一致。
-    if (parseLineFormat(opts.line_format)) |f| line_format = f;
+    if (parseLineFormat(opts.line_format)) |f| setLineFormat(f);
 
     const owned_dir = try gpa.dupe(u8, opts.dir);
     errdefer gpa.free(owned_dir);
 
     var o = opts;
     o.dir = owned_dir;
-    const new_sink = try text_log.TextFileLog.init(io, gpa, global_level, o);
+    const new_sink = try text_log.TextFileLog.init(io, gpa, getLevel(), o);
 
     file_mutex.lock();
     const old_sink = file_sink;
@@ -453,24 +462,26 @@ const ConfigSource = struct {
 var config_source: ?ConfigSource = null;
 /// 坏配置只备份一次，避免每次 reload 都堆一个新 `.bad` 文件
 var bad_config_backed: bool = false;
+/// 配置重载/关闭的互斥：`reloadNow()` 与热加载线程可能并发
+var reload_mutex: compat.Mutex = .{};
 
 /// 应用一份配置（不涉及文件），顺序：级别 → 行格式 → 控制台 → 队列 → 文件。
 ///
 /// 任何一项值非法都**保持原值并告警**，不会因为一个字段配错就整体回退。
 pub fn applyConfig(io: std.Io, gpa: std.mem.Allocator, cfg: Config) !void {
     if (Level.parse(cfg.LogLevel)) |lv| {
-        global_level = lv;
+        setLevel(lv);
     } else {
-        err("日志配置 LogLevel=\"{s}\" 非法（应为 All/Debug/Info/Warn/Error/Fatal/Off），保持 {s}", .{ cfg.LogLevel, global_level.asStr() });
+        err("日志配置 LogLevel=\"{s}\" 非法（应为 All/Debug/Info/Warn/Error/Fatal/Off），保持 {s}", .{ cfg.LogLevel, getLevel().asStr() });
     }
 
     if (parseLineFormat(cfg.LogLineFormat)) |f| {
-        line_format = f;
+        setLineFormat(f);
     } else {
         err("日志配置 LogLineFormat=\"{s}\" 无法识别，保持当前行格式", .{cfg.LogLineFormat});
     }
 
-    console_enabled = cfg.LogConsole;
+    setConsole(cfg.LogConsole);
 
     if (pending == null) {
         _ = startAsync(cfg.LogAsyncQueue) catch |e| {
@@ -621,6 +632,10 @@ pub fn loadConfigFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !voi
 /// 解析失败时**保留当前生效配置**，并把坏文件备份成 `<名>.bad.<时间戳>`。
 pub fn reloadIfChanged(io: std.Io) !bool {
     _ = io;
+    // 允许 `reloadNow()` 与热加载线程并发调用：配置源、arena、自愈写入都不能重入
+    reload_mutex.lock();
+    defer reload_mutex.unlock();
+
     if (config_source == null) return false;
     const src = &config_source.?;
 
@@ -659,6 +674,8 @@ pub fn reloadIfChanged(io: std.Io) !bool {
 
 /// 关闭配置来源（不再热加载）。
 pub fn closeConfigSource() void {
+    reload_mutex.lock();
+    defer reload_mutex.unlock();
     if (config_source) |*src| {
         src.file.deinit();
         config_source = null;
@@ -803,7 +820,9 @@ pub fn getTimeOffset() i64 {
 }
 
 /// 全局日志级别（对齐 DH.NCore：默认 `Info`，只输出 `>=` 该级别的日志）
-var global_level: Level = .info;
+///
+/// **原子存**：热加载线程会改写，而 `enabled()` 在所有业务线程上被高频调用。
+var global_level_store = std.atomic.Value(u8).init(@intFromEnum(Level.info));
 
 /// 线程安全互斥锁
 var log_mutex: compat.Mutex = .{};
@@ -838,26 +857,26 @@ pub fn isThreadSafe() bool {
 
 /// 设置全局日志级别
 pub fn setLevel(level: Level) void {
-    global_level = level;
+    global_level_store.store(@intFromEnum(level), .release);
 }
 
 /// 取当前全局日志级别
 pub fn getLevel() Level {
-    return global_level;
+    return @enumFromInt(global_level_store.load(.acquire));
 }
 
 /// 当前设置下该级别是否会真正输出。
 pub fn enabled(level: Level) bool {
-    return @backingInt(level) >= @backingInt(global_level);
+    return @backingInt(level) >= global_level_store.load(.acquire);
 }
 
 /// 读环境变量 `ZZIG_LOG` 并应用级别（对应 DH.NCore / DH.RustBase 的 `RUST_LOG` 习惯）。
 ///
 /// 不存在或值非法时保持当前级别；返回最终生效的级别。
 pub fn applyEnv(environ_map: *const std.process.Environ.Map) Level {
-    const raw = environ_map.get("ZZIG_LOG") orelse return global_level;
-    if (Level.parse(raw)) |lv| global_level = lv;
-    return global_level;
+    const raw = environ_map.get("ZZIG_LOG") orelse return getLevel();
+    if (Level.parse(raw)) |lv| setLevel(lv);
+    return getLevel();
 }
 
 /// 按线程号取日志行颜色（对齐 DH.NCore `ConsoleLog`）：
@@ -1026,7 +1045,7 @@ fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
 /// `ncore` / `ncore_level` 走 DH.NCore 的 `Time ThreadId Kind Name [Level]` 形状；
 /// `legacy` 保留 zzig 早期的 `[完整时间戳] [LEVEL] ` 形状。
 fn buildPrefix(buf: *[96]u8, level: Level, thread_id: u64) []const u8 {
-    switch (line_format) {
+    switch (getLineFormat()) {
         .ncore => {
             var clock_buf: [16]u8 = undefined;
             return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} ", .{
@@ -1139,7 +1158,7 @@ fn emitText(level: Level, thread_id: u64, text: []const u8) void {
     if (file_sink) |*sink| sink.writeRawLine(level, text);
     file_mutex.unlock();
 
-    if (!console_enabled) return;
+    if (!consoleEnabledRaw()) return;
     const code = colorCode(level, thread_id);
 
     if (builtin.os.tag != .windows) {

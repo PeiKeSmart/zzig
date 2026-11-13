@@ -459,3 +459,74 @@ test "pool：不该用时不用 —— 长任务标注后 Kind=N / Name=L（对�
     try testing.expect(probe.name_ok);
     try testing.expect(!probe.pool_worker_flag);
 }
+
+// ---------------------------------------------------------------------------
+// 高并发压测（8 个提交线程 + 8 个 worker，规模有界，避免拖死机器）
+// ---------------------------------------------------------------------------
+
+const Burst = struct {
+    pool: *Pool,
+    probe: *Probe,
+    count: u32,
+    accepted: u32 = 0,
+    rejected: u32 = 0,
+};
+
+fn submitBurst(b: *Burst) void {
+    var done: u32 = 0;
+    while (done < b.count) {
+        if (b.pool.submit(probeTask, b.probe)) |_| {
+            done += 1;
+            b.accepted += 1;
+        } else |_| {
+            // 队列满：退让一下再试（压测看吞吐，不把 QueueFull 当失败）
+            b.rejected += 1;
+            compat.sleep(100 * std.time.ns_per_us);
+        }
+    }
+}
+
+test "pool：高并发压测 —— 8 线程并发 submit 8000 任务，全部执行且不越上限" {
+    const pool = try Pool.create(std.testing.io, testing.allocator, .{
+        .min_workers = 2,
+        .max_workers = 8,
+        .idle_timeout_ms = 0,
+        .queue_capacity = 16384,
+    });
+    defer pool.destroy();
+
+    var probe = Probe{};
+    const submitter_count = 8;
+    const total: u32 = 8000;
+    const per = total / submitter_count;
+
+    var bursts: [submitter_count]Burst = undefined;
+    var threads: [submitter_count]std.Thread = undefined;
+    for (&bursts, 0..) |*b, i| {
+        b.* = .{ .pool = pool, .probe = &probe, .count = per };
+        threads[i] = try std.Thread.spawn(.{}, submitBurst, .{b});
+    }
+    for (threads) |t| t.join();
+
+    // 汇总：提交成功数与实际执行数必须一致（不能丢任务），且 worker 不越上限
+    var accepted: u32 = 0;
+    var rejected: u32 = 0;
+    for (&bursts) |b| {
+        accepted += b.accepted;
+        rejected += b.rejected;
+    }
+    try testing.expectEqual(total, accepted);
+    try testing.expect(waitUntil(&probe.ran, total, 15000));
+    try testing.expectEqual(total, probe.ran.load(.acquire));
+    try testing.expect(pool.workerCount() <= pool.maxWorkers());
+
+    const s = pool.stats();
+    try testing.expectEqual(@as(u64, total), s.submitted);
+    try testing.expectEqual(@as(u64, total), s.completed);
+    try testing.expect(s.spawned <= pool.maxWorkers() + rejected);
+
+    std.debug.print(
+        "\n[pool 压测] 提交线程={d} 任务={d} 执行={d} 队列满重试={d} worker={d}(上限 {d}) 累计创建={d}\n",
+        .{ submitter_count, total, probe.ran.load(.acquire), rejected, pool.workerCount(), pool.maxWorkers(), s.spawned },
+    );
+}
