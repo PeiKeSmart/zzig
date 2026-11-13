@@ -25,16 +25,16 @@ const currentThreadId = levels.currentThreadId;
 /// 当前行格式（默认对齐 DH.NCore：`Time ThreadId Kind Name Message`）
 ///
 /// **原子存**：热加载线程可能随时改写，日志线程同时读取，普通全局变量属数据竞争。
-var line_format_store = std.atomic.Value(u8).init(@intFromEnum(LineFormat.ncore));
+var line_format_store = std.atomic.Value(u8).init(@backingInt(LineFormat.ncore));
 
 /// 设置日志行格式。
 pub fn setLineFormat(f: LineFormat) void {
-    line_format_store.store(@intFromEnum(f), .release);
+    line_format_store.store(@backingInt(f), .release);
 }
 
 /// 取当前行格式。
 pub fn getLineFormat() LineFormat {
-    return @enumFromInt(line_format_store.load(.acquire));
+    return @fromBackingInt(@intCast(line_format_store.load(.acquire)));
 }
 
 // ============ 输出目标（控制台 / 文件，可同时开）============
@@ -822,7 +822,7 @@ pub fn getTimeOffset() i64 {
 /// 全局日志级别（对齐 DH.NCore：默认 `Info`，只输出 `>=` 该级别的日志）
 ///
 /// **原子存**：热加载线程会改写，而 `enabled()` 在所有业务线程上被高频调用。
-var global_level_store = std.atomic.Value(u8).init(@intFromEnum(Level.info));
+var global_level_store = std.atomic.Value(u8).init(@backingInt(Level.info));
 
 /// 线程安全互斥锁
 var log_mutex: compat.Mutex = .{};
@@ -857,12 +857,12 @@ pub fn isThreadSafe() bool {
 
 /// 设置全局日志级别
 pub fn setLevel(level: Level) void {
-    global_level_store.store(@intFromEnum(level), .release);
+    global_level_store.store(@backingInt(level), .release);
 }
 
 /// 取当前全局日志级别
 pub fn getLevel() Level {
-    return @enumFromInt(global_level_store.load(.acquire));
+    return @fromBackingInt(@intCast(global_level_store.load(.acquire)));
 }
 
 /// 当前设置下该级别是否会真正输出。

@@ -128,9 +128,12 @@ pub const url = @import("net/url.zig");
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
-/// 线程相关：定时器、弹性线程池
+/// 线程相关：定时器、弹性线程池、Cron
 pub const threading = struct {
     pub const timer = @import("threading/timer.zig");
+    /// 轻量级 Cron 表达式（秒 分 时 日 月 周，周支持 #n / #Ln）
+    pub const cron = @import("threading/cron.zig");
+    pub const Cron = cron.Cron;
     /// 弹性线程池：**短任务**才走池；长连接/流式请用独立线程 + `markAsLongTask()`
     pub const pool = @import("threading/pool.zig");
     pub const Pool = pool.Pool;
@@ -336,6 +339,7 @@ test {
     _ = @import("logs/text_file_log.zig");
     _ = @import("threading/pool.zig");
     _ = @import("threading/timer.zig");
+    _ = @import("threading/cron.zig");
     _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
