@@ -301,6 +301,10 @@ pub const db = struct {
     pub const postgres = @import("db/postgres.zig");
     /// SQL Server 驱动（TDS 7.4，纯 wire protocol，不依赖 ODBC / sqlncli）
     pub const tds = @import("db/tds.zig");
+    /// TDengine 驱动（REST `/rest/sql`，不依赖 libtaos）
+    pub const tdengine = @import("db/tdengine.zig");
+    /// InfluxDB 驱动（HTTP：Line Protocol 写入 + Flux/InfluxQL 查询）
+    pub const influxdb = @import("db/influxdb.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -313,6 +317,13 @@ pub const mysql = db.mysql;
 pub const postgres = db.postgres;
 /// 便捷别名：`zzig.tds` == `zzig.db.tds`
 pub const tds = db.tds;
+/// 便捷别名：`zzig.tdengine` == `zzig.db.tdengine`
+pub const tdengine = db.tdengine;
+/// 便捷别名：`zzig.influxdb` == `zzig.db.influxdb`
+pub const influxdb = db.influxdb;
+
+/// ZIP 归档（store / deflate 两种方法；写多条目 + 读回）
+pub const zip = @import("archive/zip.zig");
 // 跨模块 import（test.zig → zzig 模块）不会收集。build.zig 里 `zzig-module-tests`
 // 以本文件为根，靠这里把它们拉进来，否则驱动单测形同虚设。
 test {
@@ -329,6 +340,10 @@ test {
     _ = @import("db/postgres_loopback_test.zig");
     _ = @import("db/tds.zig");
     _ = @import("db/tds_loopback_test.zig");
+    _ = @import("db/tdengine.zig");
+    _ = @import("db/influxdb.zig");
+    _ = @import("db/http_loopback_test.zig");
+    _ = @import("archive/zip.zig");
     _ = @import("http/server.zig");
     _ = @import("http/value.zig");
     _ = @import("http/router.zig");
