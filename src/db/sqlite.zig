@@ -35,6 +35,7 @@ pub const sqlite_done: c_int = 101;
 const sqlite_transient: ?*const anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
 const sqlite_open_readwrite: c_int = 0x00000002;
+const sqlite_open_readonly: c_int = 0x00000001;
 const sqlite_open_create: c_int = 0x00000004;
 const sqlite_open_fullmutex: c_int = 0x00010000;
 
@@ -185,7 +186,31 @@ pub const Db = struct {
     err_buf: [512]u8 = undefined,
     err_len: usize = 0,
 
+    /// 打开连接时的并发相关设置（对应 SQLite 的 `PRAGMA`）。
+    ///
+    /// **默认全部不设置**（即 SQLite 原生：`journal_mode=delete` + `synchronous=full`）。
+    /// 实测（Pek.ZCode `zig build bench`，Windows，单行一事务）：`WAL+NORMAL` 写吞吐约
+    /// **慢 2×**（~170 µs/行 vs ~65 µs/行），且「写中并发读」两种档位都没被阻塞。
+    /// 所以 WAL 不做默认值，而由调用方按场景显式选：
+    /// - 长写事务（批量导入）同时要求别人一直能读 → `JournalMode=WAL;Synchronous=NORMAL`
+    /// - 网络盘（SMB/NFS）**不要**用 WAL（共享内存文件不可靠）
+    pub const Options = struct {
+        journal_mode: ?[]const u8 = null,
+        synchronous: ?[]const u8 = null,
+        busy_timeout_ms: u32 = 5000,
+        /// `PRAGMA cache_size`：负数是 KB（-64000 = 64MB），正数是页数；`null` 用库默认
+        cache_size: ?i32 = null,
+        /// 只读打开（`?mode=ro` 语义）：防止误写
+        read_only: bool = false,
+    };
+
     pub fn open(lib: *Lib, path: []const u8) !Db {
+        return openWithOptions(lib, path, .{});
+    }
+
+    /// 带并发选项打开。任何一条 PRAGMA 失败都**不**中断打开（PRAGMA 是优化项，
+    /// 例如某些构建不支持 WAL、或内存库忽略它），但会把错误留在 `lastError()`。
+    pub fn openWithOptions(lib: *Lib, path: []const u8, opts: Options) !Db {
         var path_buf: [1024]u8 = undefined;
         if (path.len >= path_buf.len) return error.PathTooLong;
         @memcpy(path_buf[0..path.len], path);
@@ -193,15 +218,38 @@ pub const Db = struct {
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
         var handle: ?*anyopaque = null;
-        const rc = lib.open_v2(path_z, &handle, sqlite_open_readwrite | sqlite_open_create | sqlite_open_fullmutex, null);
+        var flags = sqlite_open_readwrite | sqlite_open_create | sqlite_open_fullmutex;
+        if (opts.read_only) flags = sqlite_open_readonly | sqlite_open_fullmutex;
+        const rc = lib.open_v2(path_z, &handle, flags, null);
         if (rc != sqlite_ok) {
             if (handle) |h| _ = lib.close_v2(h);
             return error.Sqlite;
         }
         const db = Db{ .lib = lib, .handle = handle };
-        _ = lib.busy_timeout(handle, 5000);
+        _ = lib.busy_timeout(handle, @intCast(opts.busy_timeout_ms));
+
         // 外键约束按 XCode 默认行为（不强制开启）——保持与 C#/Rust 一致
-        return db;
+        var db_mut = db;
+        db_mut.applyPragma("journal_mode", opts.journal_mode);
+        db_mut.applyPragma("synchronous", opts.synchronous);
+        if (opts.cache_size) |n| {
+            var buf: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{n}) catch null;
+            if (text) |t| db_mut.applyPragma("cache_size", t);
+        }
+        return db_mut;
+    }
+
+    /// 尽力执行一条 `PRAGMA x = y`（失败只记录，不抛）。
+    fn applyPragma(self: *Db, name: []const u8, value: ?[]const u8) void {
+        const v = value orelse return;
+        if (v.len == 0) return;
+        var buf: [96]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "PRAGMA {s}={s}", .{ name, v }) catch return;
+        _ = self.exec(std.heap.page_allocator, sql) catch {
+            // 留痕：某些构建/文件系统不支持 WAL，属可降级项
+            std.debug.print("[sqlite] PRAGMA {s} 未生效（{s}），继续使用默认行为\n", .{ sql, self.lastError() });
+        };
     }
 
     pub fn close(self: *Db) void {
