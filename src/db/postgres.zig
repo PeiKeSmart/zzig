@@ -89,6 +89,7 @@ const MSG_PARSE: u8 = 'P';
 const MSG_BIND: u8 = 'B';
 const MSG_DESCRIBE: u8 = 'D';
 const MSG_EXECUTE: u8 = 'E';
+const MSG_CLOSE: u8 = 'C';
 const MSG_SYNC: u8 = 'S';
 const MSG_TERMINATE: u8 = 'X';
 const MSG_PASSWORD: u8 = 'p';
@@ -107,6 +108,8 @@ const BE_PARSE_COMPLETE: u8 = '1';
 const BE_BIND_COMPLETE: u8 = '2';
 const BE_NO_DATA: u8 = 'n';
 const BE_EMPTY_QUERY: u8 = 'I';
+/// `Describe(statement)` 会先回参数描述（'t'）再回 RowDescription（'T'）
+const BE_PARAMETER_DESCRIPTION: u8 = 't';
 
 /// 鉴权子类型。
 const AUTH_OK: u32 = 0;
@@ -133,6 +136,13 @@ pub const Conn = struct {
     err_code: u32 = 0,
     sql_state: [5]u8 = .{ '0', '0', '0', '0', '0' },
     closed: bool = false,
+    /// 命名预处理语句缓存（按 SQL 文本；连接私有）
+    stmt_cache: std.ArrayListUnmanaged(StmtEntry) = .empty,
+    /// 上限，`0` = 关闭复用（同进程 A/B 对比用）
+    stmt_cache_limit: usize = 32,
+    stmt_seq: u32 = 0,
+    stmt_hits: usize = 0,
+    stmt_misses: usize = 0,
 
     pub fn lastError(self: *const Conn) []const u8 {
         return self.err_buf[0..self.err_len];
@@ -192,6 +202,9 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Conn) void {
+        // 先逐条 Close 再 TERMINATE（都要在连接还活着时做）
+        self.clearStmtCache();
+        self.stmt_cache.deinit(self.gpa);
         self.closeQuietly();
         self.rx.deinit(self.gpa);
         self.tx.deinit(self.gpa);
@@ -475,7 +488,14 @@ pub const Conn = struct {
                 },
                 BE_EMPTY_QUERY => {},
                 BE_NOTICE => {},
-                BE_ERROR => return self.failFromError(msg.payload),
+                BE_ERROR => {
+                    const err = self.failFromError(msg.payload);
+                    // **必须把 ReadyForQuery 读掉**：PG 在 ErrorResponse 之后一定会补一条
+                    // ReadyForQuery；不消费它，下一条语句就读到残留消息 → 协议错位
+                    // （实测：错一次之后整条连接上所有查询都失败）。
+                    try self.drainUntilReady();
+                    return err;
+                },
                 BE_READY => break,
                 // 简单查询下不应出现扩展协议消息；忽略以保持向前兼容
                 BE_PARSE_COMPLETE, BE_BIND_COMPLETE, BE_NO_DATA => {},
@@ -489,18 +509,65 @@ pub const Conn = struct {
         return .{ .ok = .{ .affected_rows = affected, .tag = tag_buf } };
     }
 
+    /// 扩展查询（带参）。**带预处理语句复用**：同一 SQL 第二次起只发 `Bind + Execute + Sync`，
+    /// 省掉 `Parse`（服务端解析 + 规划）与 `Describe`（列描述）。
+    ///
+    /// 为什么值得做：MySQL 侧同款复用实测 1.64×；PG 每次 `Parse` 都要服务端重新解析与规划，
+    /// 而 ORM 热路径恰恰是「同一条带参 SQL 反复执行」（点查 / 单行更新）。
+    /// 预处理语句是**连接私有**的，所以缓存挂在 `Conn` 上、重连自然失效。
     fn queryExtended(self: *Conn, arena: std.mem.Allocator, sql: []const u8, params: []const Value) !Result {
-        // Parse
-        self.tx.clearRetainingCapacity();
-        try self.appendCString(&self.tx, ""); // 无名语句
-        try self.appendCString(&self.tx, sql);
-        try self.appendI16(&self.tx, 0); // 让服务端推断参数类型
-        try self.writeMsg(MSG_PARSE, self.tx.items);
+        if (self.lookupStmt(sql)) |entry| {
+            self.stmt_hits += 1;
+            return self.runExtended(arena, sql, params, entry) catch |e| {
+                // 缓存语句可能因 DDL / `SET` 等失效（PG 报 0A000 `cached plan must not change
+                // result type`、26000 `prepared statement ... does not exist`）。
+                // 丢掉它并按「首次」路径重试一次；连接已断则不重试。
+                if (self.closed) return e;
+                std.debug.print(
+                    "[zzig.postgres] 预处理语句失效，丢弃后重试一次（原因 {s}；{s}）\n",
+                    .{ @errorName(e), self.lastError() },
+                );
+                self.dropStmt(entry.name);
+                return self.runExtended(arena, sql, params, null);
+            };
+        }
+        self.stmt_misses += 1;
+        return self.runExtended(arena, sql, params, null);
+    }
 
-        // Bind（全部 text 格式；NULL 用 -1 长度）
+    /// 真正发协议：`cached == null` 时额外发 `Parse` + `Describe(statement)`。
+    fn runExtended(
+        self: *Conn,
+        arena: std.mem.Allocator,
+        sql: []const u8,
+        params: []const Value,
+        cached: ?*const StmtEntry,
+    ) !Result {
+        var name_buf: [32]u8 = undefined;
+        const stmt_name: []const u8 = if (cached) |e| e.name else blk: {
+            const n = self.stmt_seq;
+            self.stmt_seq +%= 1;
+            break :blk std.fmt.bufPrint(&name_buf, "zcode_p{d}", .{n}) catch return error.Protocol;
+        };
+
+        // 首次：Parse（`0` = 让服务端推断参数类型）+ Describe statement（拿列名，空结果也有结构）
+        if (cached == null) {
+            self.tx.clearRetainingCapacity();
+            try self.appendCString(&self.tx, stmt_name);
+            try self.appendCString(&self.tx, sql);
+            try self.appendI16(&self.tx, 0);
+            try self.writeMsg(MSG_PARSE, self.tx.items);
+
+            self.tx.clearRetainingCapacity();
+            try self.tx.append(self.gpa, 'S'); // Describe 目标：语句（不是 portal）
+            try self.appendCString(&self.tx, stmt_name);
+            try self.writeMsg(MSG_DESCRIBE, self.tx.items);
+        }
+
+        // Bind（无名 portal；全部 text 格式；NULL 用 -1 长度）
         self.tx.clearRetainingCapacity();
         try self.appendCString(&self.tx, ""); // 无名 portal
-        try self.appendCString(&self.tx, ""); // 无名语句
+        try self.appendCString(&self.tx, stmt_name); // 目标语句（首次为刚 Parse 的命名语句）
         try self.appendI16(&self.tx, 0); // 参数格式：全 text
         try self.appendI16(&self.tx, @intCast(params.len));
         var val_buf: [512]u8 = undefined;
@@ -516,12 +583,6 @@ pub const Conn = struct {
         try self.appendI16(&self.tx, 0); // 结果格式：全 text
         try self.writeMsg(MSG_BIND, self.tx.items);
 
-        // Describe portal（拿到列名，空结果时也知道结构）
-        self.tx.clearRetainingCapacity();
-        try self.tx.append(self.gpa, 'P');
-        try self.appendCString(&self.tx, "");
-        try self.writeMsg(MSG_DESCRIBE, self.tx.items);
-
         // Execute + Sync
         self.tx.clearRetainingCapacity();
         try self.appendCString(&self.tx, "");
@@ -530,14 +591,17 @@ pub const Conn = struct {
         try self.writeMsg(MSG_SYNC, &.{});
 
         var rows: std.ArrayList(Row) = .empty;
-        var row_names: []const []const u8 = &.{};
+        // 命中缓存时列名直接复用（省掉 Describe 的往返内容）；首次则从 RowDescription 取
+        var row_names: []const []const u8 = if (cached) |e| e.columns else &.{};
         var affected: u64 = 0;
         var tag_buf: []const u8 = "";
 
         while (true) {
             const msg = try self.readMessage();
             switch (msg.tag) {
-                BE_ROW_DESCRIPTION => row_names = try parseRowDescription(arena, msg.payload),
+                BE_ROW_DESCRIPTION => {
+                    if (cached == null) row_names = try parseRowDescription(arena, msg.payload);
+                },
                 BE_DATA_ROW => {
                     const row = try parseDataRow(arena, msg.payload, row_names);
                     try rows.append(arena, row);
@@ -548,18 +612,148 @@ pub const Conn = struct {
                     affected = parseAffected(tag);
                     self.last_affected_rows = affected;
                 },
-                BE_PARSE_COMPLETE, BE_BIND_COMPLETE, BE_NO_DATA => {},
+                // `Describe(statement)` 会先回一条 ParameterDescription（'t'）再回 RowDescription
+                BE_PARSE_COMPLETE, BE_BIND_COMPLETE, BE_NO_DATA, BE_PARAMETER_DESCRIPTION => {},
                 BE_NOTICE => {},
-                BE_ERROR => return self.failFromError(msg.payload),
+                BE_ERROR => {
+                    const err = self.failFromError(msg.payload);
+                    // 同 `querySimple`：错误后必须消费到 ReadyForQuery，否则连接错位。
+                    try self.drainUntilReady();
+                    return err;
+                },
                 BE_READY => break,
                 else => {},
             }
+        }
+
+        // 首次执行**成功**后才入缓存（失败的错误路径已在上面 return）
+        if (cached == null) {
+            self.putStmt(sql, stmt_name, row_names) catch |e| {
+                std.debug.print(
+                    "[zzig.postgres] 预处理语句入缓存失败（不影响本次结果）：{s}\n",
+                    .{@errorName(e)},
+                );
+            };
         }
 
         if (rows.items.len > 0) {
             return .{ .rows = .{ .rows = try rows.toOwnedSlice(arena) } };
         }
         return .{ .ok = .{ .affected_rows = affected, .tag = tag_buf } };
+    }
+
+    // ── 预处理语句缓存 ──────────────────────────────────────────────────────
+
+    /// 一条命名预处理语句。字符串统一在自带 arena 里，释放只需一次 `deinit`。
+    ///
+    /// `arena` 用**堆指针**而不是内联值：`ArrayList` 扩容会按字节移动元素，
+    /// 内联 Arena 一旦被移动，之前取出的 `allocator()`（其 ptr 指向 `&state`）就悬垂。
+    const StmtEntry = struct {
+        arena: *std.heap.ArenaAllocator,
+        sql: []const u8 = "",
+        name: []const u8 = "",
+        /// 列名（首次执行时从 RowDescription 拷一份；无结果集的语句为空）
+        columns: []const []const u8 = &.{},
+    };
+
+    fn lookupStmt(self: *Conn, sql: []const u8) ?*const StmtEntry {
+        if (self.stmt_cache_limit == 0) return null;
+        for (self.stmt_cache.items) |*e| {
+            if (std.mem.eql(u8, e.sql, sql)) return e;
+        }
+        return null;
+    }
+
+    fn putStmt(self: *Conn, sql: []const u8, name: []const u8, columns: []const []const u8) !void {
+        if (self.stmt_cache_limit == 0) return;
+        while (self.stmt_cache.items.len >= self.stmt_cache_limit) self.evictOldest();
+
+        const arena = try self.gpa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer {
+            arena.deinit();
+            self.gpa.destroy(arena);
+        }
+        const a = arena.allocator();
+
+        var entry = StmtEntry{ .arena = arena };
+        entry.sql = try a.dupe(u8, sql);
+        entry.name = try a.dupe(u8, name);
+        if (columns.len > 0) {
+            const cols = try a.alloc([]const u8, columns.len);
+            for (columns, 0..) |c, i| cols[i] = try a.dupe(u8, c);
+            entry.columns = cols;
+        }
+        try self.stmt_cache.append(self.gpa, entry);
+    }
+
+    /// 淘汰最旧一条（FIFO；热点语句很快稳定，LRU 的收益不值得复杂度），
+    /// 并从服务端 `Close` 掉，避免命名语句在会话里无限累积。
+    fn evictOldest(self: *Conn) void {
+        if (self.stmt_cache.items.len == 0) return;
+        const entry = self.stmt_cache.orderedRemove(0);
+        self.closeStmtQuietly(entry.name);
+        entry.arena.deinit();
+        self.gpa.destroy(entry.arena);
+    }
+
+    /// 按名字丢弃一条（给「失效重试」用）。
+    fn dropStmt(self: *Conn, name: []const u8) void {
+        for (self.stmt_cache.items, 0..) |e, i| {
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            const entry = self.stmt_cache.orderedRemove(i);
+            self.closeStmtQuietly(entry.name);
+            entry.arena.deinit();
+            self.gpa.destroy(entry.arena);
+            return;
+        }
+    }
+
+    /// 服务端 `Close(statement)` + `Sync`；失败只标记连接状态，不让调用方失败。
+    fn closeStmtQuietly(self: *Conn, name: []const u8) void {
+        if (self.closed) return;
+        self.tx.clearRetainingCapacity();
+        self.tx.append(self.gpa, 'S') catch return;
+        self.appendCString(&self.tx, name) catch return;
+        self.writeMsg(MSG_CLOSE, self.tx.items) catch return;
+        self.writeMsg(MSG_SYNC, &.{}) catch return;
+        self.drainUntilReady() catch {
+            self.closed = true;
+        };
+    }
+
+    /// 清空缓存（逐条向服务端 `Close`）。
+    pub fn clearStmtCache(self: *Conn) void {
+        while (self.stmt_cache.items.len > 0) self.evictOldest();
+    }
+
+    /// `0` = 关闭复用（用于同进程 A/B 对比）。
+    pub fn setStmtCacheLimit(self: *Conn, limit: usize) void {
+        if (limit == 0) self.clearStmtCache();
+        self.stmt_cache_limit = limit;
+    }
+
+    pub fn stmtCacheStats(self: *const Conn) struct { hits: usize, misses: usize, size: usize } {
+        return .{ .hits = self.stmt_hits, .misses = self.stmt_misses, .size = self.stmt_cache.items.len };
+    }
+
+    /// 读到 `ReadyForQuery` 为止（错误后的协议状态清理）。
+    ///
+    /// 注意：`failFromError` 已把错误文本/状态码拷进自己的缓冲，所以这里可以放心继续读包
+    /// （`readMessage` 会复用 `rx`）。连接已断时标记 `closed`，避免后续调用继续往坏连接写。
+    fn drainUntilReady(self: *Conn) !void {
+        while (true) {
+            const msg = self.readMessage() catch |e| {
+                self.closed = true;
+                return e;
+            };
+            switch (msg.tag) {
+                BE_READY => return,
+                // 可能有多条错误（同一批次里多条语句），继续读到 Ready 为准
+                BE_ERROR => {},
+                else => {},
+            }
+        }
     }
 
     /// CommandComplete 的末位数字即影响行数：`INSERT 0 3` / `UPDATE 2` / `DELETE 5` / `SELECT 7`。
