@@ -355,9 +355,14 @@ const fsio = @import("../file/fsio.zig");
 /// 能共用同一份配置文件、同一套含义。
 pub const Config = struct {
     /// 只输出 >= 该级别的日志。`All/Debug/Info/Warn/Error/Fatal/Off`，默认 Info
+    ///
+    /// **「要不要输出」由它决定，「输出到哪」由 `LogPath` / `LogConsole` 决定**。
     LogLevel: []const u8 = "Info",
-    /// 日志目录；留空表示只写控制台（不落文件）
-    LogPath: []const u8 = "",
+    /// 日志目录，默认 `Log`（按 DH 约定）。
+    ///
+    /// 默认**控制台 + 文件同时输出**；只想控制台就把这里留空 `""`。
+    /// 相对路径基于进程工作目录；目录不存在会自动创建。
+    LogPath: []const u8 = "Log",
     /// 单文件上限（字节），超限拆分为 `_2`、`_3`…；0 表示不限制
     LogFileMaxBytes: u64 = 10 * 1024 * 1024,
     /// 保留份数，超出后删除最旧；0 表示不限制
@@ -383,7 +388,7 @@ const config_template_layout =
     \\#        默认 Info；排障时临时改 Debug 即可看到逐条明细（一条日志都没删）
     \\LogLevel = "{s}"
     \\
-    \\# 日志目录。留空 = 只输出到控制台，不落文件
+    \\# 日志目录。默认 Log（按 DH 约定）；留空 = 只输出到控制台，不落文件
     \\# 相对路径基于进程工作目录；目录不存在会自动创建
     \\LogPath = "{s}"
     \\
@@ -768,7 +773,7 @@ fn reloadLoop(interval_ms: usize) void {
 /// }
 /// ```
 ///
-/// - `config_path` 为 null 时用内置默认值（只输出控制台、Info 级别）；
+/// - `config_path` 为 null 时用内置默认值（**控制台 + 文件**，目录 `Log`，`Info` 级别）；
 /// - 配置文件缺失会**自动按模板生成**（带注释）；
 /// - 配置读取失败不致命：退回默认值并记一条 error（服务照常启动，不至于因为一个日志配置打不开）。
 pub fn init(io: std.Io, gpa: std.mem.Allocator, config_path: ?[]const u8) !void {

@@ -1,6 +1,7 @@
 # Zig 编译缓存（通配符：`--cache-dir .zig-cache-xxx` 这类临时目录也要忽略）
 .zig-cache*/
 zig-cache*/
+.zig-global-cache*/
 
 # Zig 构建输出（文档、可执行文件、库文件等）
 zig-out*/
