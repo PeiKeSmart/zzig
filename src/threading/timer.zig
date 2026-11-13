@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const compat = @import("../compat.zig");
 const level = @import("../logs/level.zig");
 const cron_mod = @import("cron.zig");
+const pool_mod = @import("pool.zig");
 
 pub const Cron = cron_mod.Cron;
 
@@ -109,6 +110,21 @@ test "timer: 解析与下一次触发" {
 
 pub const TimerCallback = *const fn (ctx: ?*anyopaque) void;
 
+/// 链路追踪钩子（对齐 DH.NCore `TimerX.Tracer` 的 `NewSpan` 语义）。
+///
+/// 用法：把自研打点 / OpenTelemetry / 你家的 APM 包在这两个回调里。
+/// `begin` 返回的 `span` 会原样传给 `end`（可为 null）。
+///
+/// 注意：`TimerCallback` 返回 `void`（Zig 回调不携带错误），
+/// 因此 `end` 的 `failed` 目前恒为 `false` —— 要标错得由业务在回调里自行记录。
+pub const Tracer = struct {
+    ctx: ?*anyopaque = null,
+    /// 回调执行前调用，返回一个可选的 span 句柄
+    begin: *const fn (ctx: ?*anyopaque, name: []const u8) ?*anyopaque,
+    /// 回调执行后调用（`elapsed_us` 为微秒）
+    end: *const fn (ctx: ?*anyopaque, span: ?*anyopaque, elapsed_us: i64, failed: bool) void,
+};
+
 /// 触发方式
 pub const Kind = enum {
     /// 周期（`period_ms > 0`）
@@ -136,16 +152,32 @@ pub const Timer = struct {
     /// Cron 表达式
     crons: []const Cron = &.{},
 
+    /// 是否异步执行（对齐 TimerX 的 `Async`）：
+    ///
+    /// - `false`（默认）：在调度线程内联执行 —— 与 TimerX 的 `Async=false` 一致，
+    ///   但**慢回调会阻塞其它所有定时器**；
+    /// - `true`：提交到 `Scheduler` 绑定的弹性线程池（`setPool`）；
+    ///   池未绑定或提交失败（队列满）时**回退内联**，绝不丢这一轮触发。
+    async: bool = false,
+
     /// 回调执行中 → 不可重入
     calling: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 累计执行次数
     timers: u64 = 0,
     /// 平均耗时（毫秒）：`cost = cost==0 ? ms : (cost+ms)/2`（同 TimerX）
+    ///
+    /// **精度限制**：耗时用开机滴答测量（Windows 为 `GetTickCount64`），
+    /// 粒度约 1~15.6ms（取决于系统时钟中断）。短于一个滴答的回调可能被计为 0ms，
+    /// 因此 `max_cost_ms` 告警只适合拓粗粒度异常，不适合当微基准。
     cost_ms: i64 = 0,
     /// 已从调度器移除
     removed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 所属调度器（`add` 时设置）
     sched: ?*Scheduler = null,
+    /// 链路追踪钩子（null = 不追踪）
+    tracer: ?Tracer = null,
+    /// 追踪名（空则用 `"timer"`）
+    tracer_name: []const u8 = "",
 
     /// 周期定时器：`due_ms` 之后首次触发，之后每 `period_ms` 一次。
     pub fn period(cb: TimerCallback, ctx: ?*anyopaque, due_ms: i64, period_ms: i64) !Timer {
@@ -231,6 +263,8 @@ pub const Timer = struct {
 pub const Scheduler = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
+    /// 调度器名。`"Default"` 的调度线程名对齐 DH.NCore 为 `T`，其它名字直接用名字。
+    name: []const u8 = "Default",
 
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
@@ -240,17 +274,32 @@ pub const Scheduler = struct {
     thread: ?std.Thread = null,
     /// 单次执行超过它就告警（对齐 `MaxCost`，默认 500ms）
     max_cost_ms: i64 = default_max_cost_ms,
+    /// `Timer.async = true` 时使用的线程池（由调用方创建与销毁）
+    pool: ?*pool_mod.Pool = null,
 
     pub fn start(io: std.Io, gpa: std.mem.Allocator) !*Scheduler {
+        return startNamed(io, gpa, "Default");
+    }
+
+    /// 创建**命名**调度器（多调度器分组的基本单位）。
+    ///
+    /// 分组的意义：某组的慢回调（即使已用 `async`）不该与其它组的高频定时器
+    /// 抢同一条调度线程。每组一条调度线程，互不干扰。
+    ///
+    /// 需要“同名复用”请用 [`createNamed`]。
+    pub fn startNamed(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !*Scheduler {
         const self = try gpa.create(Scheduler);
         errdefer gpa.destroy(self);
-        self.* = .{ .io = io, .alloc = gpa };
+        self.* = .{ .io = io, .alloc = gpa, .name = name };
         self.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, loop, .{self});
         return self;
     }
 
     /// 停止调度线程并释放（不会等待正在执行的回调）。
     pub fn deinit(self: *Scheduler) void {
+        // 先摘注册表，避免 `shutdownAll()` 拿到野指针
+        unregisterFromRegistry(self);
+
         const gpa = self.alloc;
         const io = self.io;
         self.stopping.store(true, .release);
@@ -307,9 +356,67 @@ pub const Scheduler = struct {
         return self.timers.items.len;
     }
 
+    /// 绑定线程池后，`Timer.async = true` 的回调会在线程池里执行。
+    ///
+    /// **生命周期顺序（重要）**：池必须比 `Scheduler` **先销毁**（或至少先停止），
+    /// 否则池线程可能正在执行回调并访问已释放的 `Scheduler`（use-after-free）。
+    pub fn setPool(self: *Scheduler, pool: ?*pool_mod.Pool) void {
+        self.pool = pool;
+    }
+
+    /// 内联执行一次触发（同步路径与异步回退共用）。
+    fn runInline(self: *Scheduler, t: *Timer) void {
+        const t0 = nowTickMs(self.io);
+
+        // 链路追踪：begin → 回调 → end（对应 TimerX 的 `Tracer.NewSpan`）
+        var span: ?*anyopaque = null;
+        const trace_name = if (t.tracer_name.len > 0) t.tracer_name else "timer";
+        if (t.tracer) |tr| span = tr.begin(tr.ctx, trace_name);
+
+        t.callback(t.ctx);
+
+        const cost = nowTickMs(self.io) - t0;
+        if (t.tracer) |tr| tr.end(tr.ctx, span, cost * 1000, false);
+
+        self.finishRun(t, cost);
+    }
+
+    /// 执行完毕：记耗时/次数 → 算下一次 → 必要时移除。
+    ///
+    /// 会在**线程池线程**上被调用，所以对 `next_*` 的读写在 mutex 内，
+    /// 与调度线程的 `dueTick` 读取互斥。
+    fn finishRun(self: *Scheduler, t: *Timer, cost: i64) void {
+        var drop = false;
+        self.mutex.lockUncancelable(self.io);
+        t.cost_ms = if (t.cost_ms == 0) cost else @divTrunc(t.cost_ms + cost, 2);
+        t.timers +%= 1;
+        const after_tick = nowTickMs(self.io);
+        const after_unix = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        drop = !Timer.scheduleNext(t, after_tick, after_unix);
+        self.mutex.unlock(self.io);
+
+        if (cost > self.max_cost_ms) {
+            std.debug.print(
+                "[zzig.timer] 定时任务耗时过长 {d}ms（阈值 {d}ms，累计 {d} 次）\n",
+                .{ cost, self.max_cost_ms, t.timers },
+            );
+        }
+        if (drop) self.remove(t);
+        t.calling.store(false, .release);
+
+        // **必须唤醒调度线程**：异步回调完成后，调度线程可能正因该定时器
+        // “due 但 calling”而无所事事地长睡 60s（同步路径下不可能出现，异步路径下每轮都会）。
+        std.Io.Condition.signal(&self.cond, self.io);
+    }
+
     fn loop(self: *Scheduler) void {
-        // 对齐 TimerScheduler：默认调度器（Default）的调度线程名就是 `T`
-        level.setThreadName("T");
+        // 对齐 TimerScheduler：默认调度器（Default）的调度线程名就是 `T`，
+        // 其余分组直接用分组名（排查时能一眼看出哪个调度器在跑）。
+        if (self.name.len == 0 or std.mem.eql(u8, self.name, "Default")) {
+            level.setThreadName("T");
+        } else {
+            level.setThreadName(self.name);
+        }
 
         var due: [64]*Timer = undefined;
 
@@ -325,10 +432,14 @@ pub const Scheduler = struct {
                 const deadline = t.dueTick(now_tick, now_unix_ms);
                 const delta = deadline - now_tick;
                 if (delta <= 0) {
-                    // 已在执行中的（不可重入）跳过，不再累积
+                    // 已在执行中的（不可重入）跳过，不再累积。
+                    // 注意：这里也要把 wait_ms 降下来 —— 否则“due 但 calling”会让本轮
+                    // 退化成 60s 长睡（异步回调完成后靠 `finishRun` 的 signal 唤醒）。
                     if (!t.calling.load(.acquire) and due_n < due.len) {
                         due[due_n] = t;
                         due_n += 1;
+                    } else {
+                        wait_ms = @min(wait_ms, 1);
                     }
                 } else if (delta < wait_ms) {
                     wait_ms = delta;
@@ -351,36 +462,125 @@ pub const Scheduler = struct {
             self.mutex.unlock(self.io);
 
             // 标记后**立即解锁**再执行回调：回调里可以增删定时器，不会自锁
-            for (due[0..due_n]) |t| t.calling.store(true, .release);
-
             for (due[0..due_n]) |t| {
+                t.calling.store(true, .release);
                 if (t.removed.load(.acquire)) {
                     t.calling.store(false, .release);
                     continue;
                 }
-                const t0 = nowTickMs(self.io);
-                t.callback(t.ctx);
-                const cost = nowTickMs(self.io) - t0;
 
-                t.cost_ms = if (t.cost_ms == 0) cost else @divTrunc(t.cost_ms + cost, 2);
-                t.timers += 1;
-                if (cost > self.max_cost_ms) {
-                    std.debug.print(
-                        "[zzig.timer] 定时任务耗时过长 {d}ms（阈值 {d}ms，累计 {d} 次）\n",
-                        .{ cost, self.max_cost_ms, t.timers },
-                    );
+                // Async：交给池，慢回调不会阻塞调度线程（对齐 TimerX 的 Async）。
+                // 池未绑定 / 队列满 → 回退内联，绝不丢这一轮触发。
+                if (t.async) {
+                    if (self.pool) |pool| {
+                        pool.submit(runTimerAsync, t) catch self.runInline(t);
+                        continue;
+                    }
                 }
-
-                const after_tick = nowTickMs(self.io);
-                const after_unix = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
-                if (!Timer.scheduleNext(t, after_tick, after_unix)) {
-                    self.remove(t);
-                }
-                t.calling.store(false, .release);
+                self.runInline(t);
             }
         }
     }
 };
+
+/// 池任务入口：`ctx` 就是 `*Timer`。
+fn runTimerAsync(ctx: *anyopaque) void {
+    const t: *Timer = @ptrCast(@alignCast(ctx));
+    const sched = t.sched orelse {
+        t.calling.store(false, .release);
+        return;
+    };
+    sched.runInline(t);
+}
+
+// ===========================================================================
+// 多调度器分组（对齐 DH.NCore `TimerScheduler.Create(name)`）
+// ===========================================================================
+//
+// 注册表固定用 `page_allocator`：它不依赖调用方 allocator（避免与业务 allocator
+// 的生命周期纠缠），名字由注册表 dupe 持有并在 `shutdownAll()` 里统一释放。
+
+var registry_mutex: compat.Mutex = .{};
+var registry: std.ArrayListUnmanaged(*Scheduler) = .empty;
+
+/// 按名字创建或复用调度器（同名返回同一实例）。
+pub fn createNamed(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !*Scheduler {
+    registry_mutex.lock();
+    for (registry.items) |s| {
+        if (std.mem.eql(u8, s.name, name)) {
+            registry_mutex.unlock();
+            return s;
+        }
+    }
+    registry_mutex.unlock();
+
+    const owned_name = try std.heap.page_allocator.dupe(u8, name);
+    errdefer std.heap.page_allocator.free(owned_name);
+
+    const sched = try Scheduler.startNamed(io, gpa, owned_name);
+
+    registry_mutex.lock();
+    // 并发下可能别人先建了同名：若已存在则以先建的为准，销毁自己刚建的
+    for (registry.items) |s| {
+        if (std.mem.eql(u8, s.name, name)) {
+            registry_mutex.unlock();
+            sched.deinit();
+            std.heap.page_allocator.free(owned_name);
+            return s;
+        }
+    }
+    registry.append(std.heap.page_allocator, sched) catch {
+        registry_mutex.unlock();
+        sched.deinit();
+        return error.OutOfMemory;
+    };
+    registry_mutex.unlock();
+    return sched;
+}
+
+/// 取已存在的命名调度器（不存在返回 null）。
+pub fn get(name: []const u8) ?*Scheduler {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    for (registry.items) |s| {
+        if (std.mem.eql(u8, s.name, name)) return s;
+    }
+    return null;
+}
+
+/// 已注册的调度器数量（可观测）。
+pub fn schedulerCount() usize {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    return registry.items.len;
+}
+
+fn unregisterFromRegistry(sched: *Scheduler) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    for (registry.items, 0..) |s, i| {
+        if (s == sched) {
+            _ = registry.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// 销毁所有已注册的调度器（进程退出前调用）。
+pub fn shutdownAll() void {
+    registry_mutex.lock();
+    const items = registry;
+    registry = .empty;
+    registry_mutex.unlock();
+
+    for (items.items) |s| {
+        // `deinit` 会释放 Scheduler 自身，名字要在之前抓住
+        const name_ptr: []const u8 = s.name;
+        s.deinit();
+        std.heap.page_allocator.free(@constCast(name_ptr));
+    }
+    std.heap.page_allocator.free(items.items);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -458,4 +658,111 @@ test "timer：Cron 定时器能算出未来触发点（不早于当前）" {
     try timer_testing.expect(Timer.scheduleNext(&t, 0, now_unix_ms));
     try timer_testing.expect(t.next_unix_ms > now_unix_ms);
     try timer_testing.expect(t.next_unix_ms - now_unix_ms <= 2000);
+}
+
+const AsyncProbe = struct {
+    runs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    saw_pool_worker: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn onTickAsync(ctx: ?*anyopaque) void {
+    const p: *AsyncProbe = @ptrCast(@alignCast(ctx.?));
+    if (level.isPoolWorker()) _ = p.saw_pool_worker.fetchAdd(1, .acq_rel);
+    _ = p.runs.fetchAdd(1, .acq_rel);
+}
+
+test "timer：Async 回调跑在线程池里（不占调度线程）" { // 注意销毁顺序（LIFO）：先 remove → 再 pool.destroy（join 掉 worker）→ 最后 sched.deinit，
+    // 否则池线程可能访问已释放的 Scheduler。
+    const sched = try Scheduler.start(timer_testing.io, timer_testing.allocator);
+    defer sched.deinit();
+
+    const pool = try pool_mod.Pool.create(timer_testing.io, timer_testing.allocator, .{
+        .min_workers = 1,
+        .max_workers = 2,
+        .idle_timeout_ms = 0,
+        .queue_capacity = 64,
+    });
+    defer pool.destroy();
+    sched.setPool(pool);
+
+    var p = AsyncProbe{};
+    var t = try Timer.period(onTickAsync, &p, 10, 20);
+    t.async = true;
+    try sched.add(&t);
+    defer sched.remove(&t);
+
+    var waited: u32 = 0;
+    while (waited < 3000) : (waited += 1) {
+        if (p.runs.load(.acquire) >= 2) break;
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try timer_testing.expect(p.runs.load(.acquire) >= 2);
+    // 至少有一次确实跑在池 worker 上（Kind=Y 的来源），而不是调度线程
+    try timer_testing.expect(p.saw_pool_worker.load(.acquire) >= 1);
+}
+
+const TraceProbe = struct {
+    begins: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    ends: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    last_us: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+};
+
+fn trBegin(ctx: ?*anyopaque, name: []const u8) ?*anyopaque {
+    _ = name;
+    const p: *TraceProbe = @ptrCast(@alignCast(ctx.?));
+    _ = p.begins.fetchAdd(1, .acq_rel);
+    return p;
+}
+
+fn trEnd(ctx: ?*anyopaque, span: ?*anyopaque, elapsed_us: i64, failed: bool) void {
+    _ = ctx;
+    _ = failed;
+    const p: *TraceProbe = @ptrCast(@alignCast(span.?));
+    p.last_us.store(elapsed_us, .release);
+    _ = p.ends.fetchAdd(1, .acq_rel);
+}
+
+const SlowProbe = struct {
+    runs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn onTickSlow(ctx: ?*anyopaque) void {
+    const p: *SlowProbe = @ptrCast(@alignCast(ctx.?));
+    // 睡 30ms：远大于时钟粒度（1~15.6ms），耗时统计才有意义
+    compat.sleep(30 * std.time.ns_per_ms);
+    _ = p.runs.fetchAdd(1, .acq_rel);
+}
+
+test "timer：Tracer 在每次触发前后各调一次" {
+    const sched = try Scheduler.start(timer_testing.io, timer_testing.allocator);
+    defer sched.deinit();
+
+    var c = SlowProbe{};
+    var tp = TraceProbe{};
+    var t = try Timer.period(onTickSlow, &c, 10, 100);
+    t.tracer = .{ .ctx = &tp, .begin = trBegin, .end = trEnd };
+    t.tracer_name = "test:tick";
+    try sched.add(&t);
+    defer sched.remove(&t);
+
+    var waited: u32 = 0;
+    while (waited < 3000) : (waited += 1) {
+        if (tp.ends.load(.acquire) >= 1) break;
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try timer_testing.expect(tp.begins.load(.acquire) >= 1);
+    try timer_testing.expect(tp.ends.load(.acquire) >= 1);
+    // 回调里睡 30ms；时钟粒度 ≤ 15.6ms，所以至少能测到 15ms
+    try timer_testing.expect(tp.last_us.load(.acquire) >= 15_000);
+}
+
+test "timer：多调度器分组（同名复用 + 计数 + get）" {
+    const s1 = try createNamed(timer_testing.io, timer_testing.allocator, "zzig-test-group");
+    const s2 = try createNamed(timer_testing.io, timer_testing.allocator, "zzig-test-group");
+    defer shutdownAll();
+
+    try timer_testing.expectEqual(s1, s2);
+    try timer_testing.expectEqual(@as(usize, 1), schedulerCount());
+    try timer_testing.expect(get("zzig-test-group") == s1);
+    try timer_testing.expect(get("not-exist") == null);
 }

@@ -131,6 +131,13 @@ pub const hash = @import("crypto/hash_util.zig");
 /// 线程相关：定时器、弹性线程池、Cron
 pub const threading = struct {
     pub const timer = @import("threading/timer.zig");
+    /// 定时器调度器（多分组）：`start` / `startNamed` / `createNamed` / `get` / `shutdownAll`
+    pub const Scheduler = timer.Scheduler;
+    pub const Timer = timer.Timer;
+    pub const TimerTracer = timer.Tracer;
+    pub const createScheduler = timer.createNamed;
+    pub const getScheduler = timer.get;
+    pub const shutdownSchedulers = timer.shutdownAll;
     /// 轻量级 Cron 表达式（秒 分 时 日 月 周，周支持 #n / #Ln）
     pub const cron = @import("threading/cron.zig");
     pub const Cron = cron.Cron;
