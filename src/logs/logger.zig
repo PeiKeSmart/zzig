@@ -2,33 +2,107 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("../compat.zig");
 
-/// 日志级别
-pub const Level = enum {
-    debug,
-    info,
-    warn,
-    err,
+/// 日志级别。
+///
+/// **对齐 DH.NCore `LogLevel`**（`All/Debug/Info/Warn/Error/Fatal/Off`）：
+/// - 判断恒为「输出 `>=` 配置级别」，所以 `all` 放行一切、`off` 关闭一切；
+/// - `error` 是 Zig 关键字，枚举成员写作 `err`，但 `asStr()` 输出 `ERROR`（与 C# 一致）。
+pub const Level = enum(u8) {
+    all = 0,
+    debug = 1,
+    info = 2,
+    warn = 3,
+    err = 4,
+    fatal = 5,
+    off = 6,
 
-    /// 获取日志级别的颜色代码
-    fn color(self: Level) []const u8 {
+    /// 级别的规范名称（大写），对齐 DH.NCore `LogLevel::as_str()`。
+    pub fn asStr(self: Level) []const u8 {
         return switch (self) {
-            .debug => "\x1b[36m", // 青色
-            .info => "\x1b[32m", // 绿色
-            .warn => "\x1b[33m", // 黄色
-            .err => "\x1b[31m", // 红色
-        };
-    }
-
-    /// 获取日志级别的标签
-    fn label(self: Level) []const u8 {
-        return switch (self) {
+            .all => "ALL",
             .debug => "DEBUG",
             .info => "INFO",
             .warn => "WARN",
             .err => "ERROR",
+            .fatal => "FATAL",
+            .off => "OFF",
         };
     }
+
+    /// 级别的 C# 枚举名（PascalCase）。
+    ///
+    /// DH.NCore 的 `LogLineFormat` 含 `Level` 时输出的是 `[{Level}]`，
+    /// 而 `Level` 是 `LogLevel` 枚举，`ToString()` 结果就是 PascalCase（`[Info]`），
+    /// 与大写的 `asStr()` 不同 —— 两者不能混用。
+    pub fn pascalName(self: Level) []const u8 {
+        return switch (self) {
+            .all => "All",
+            .debug => "Debug",
+            .info => "Info",
+            .warn => "Warn",
+            .err => "Error",
+            .fatal => "Fatal",
+            .off => "Off",
+        };
+    }
+
+    /// 解析级别名（不区分大小写），对齐 DH.NCore `LogLevel::parse`。
+    ///
+    /// 额外容忍常见别名：`trace`→debug、`warning`→warn、`error`→err、`none`/`silent`→off。
+    /// 非法值返回 `null`（调用方保持原级别）。
+    pub fn parse(name: []const u8) ?Level {
+        const eq = std.ascii.eqlIgnoreCase;
+        const t = std.mem.trim(u8, name, " \t\r\n");
+        if (eq(t, "all")) return .all;
+        if (eq(t, "debug") or eq(t, "trace")) return .debug;
+        if (eq(t, "info")) return .info;
+        if (eq(t, "warn") or eq(t, "warning")) return .warn;
+        if (eq(t, "err") or eq(t, "error")) return .err;
+        if (eq(t, "fatal")) return .fatal;
+        if (eq(t, "off") or eq(t, "none") or eq(t, "silent")) return .off;
+        return null;
+    }
+
+    /// 获取日志级别的标签
+    fn label(self: Level) []const u8 {
+        return self.asStr();
+    }
 };
+
+/// 日志行格式（对齐 DH.NCore `Setting.LogLineFormat`）。
+///
+/// DH.NCore 默认 `Time|ThreadId|Kind|Name|Message`，并说明「还支持 Level」——
+/// 两种都在这里提供；`legacy` 保留 zzig 早期格式，供已依赖旧输出的项目按需切回。
+pub const LineFormat = enum {
+    /// `HH:MM:SS.mmm ThreadId Kind Name Message`（对齐 DH.NCore 默认值）
+    ncore,
+    /// `HH:MM:SS.mmm ThreadId Kind Name Level Message`（DH.NCore 的含 Level 变体）
+    ncore_level,
+    /// `[YYYY-MM-DD HH:MM:SS.nnnnnnnnn] [LEVEL] message`（zzig 旧格式）
+    legacy,
+};
+
+/// 当前行格式（默认对齐 DH.NCore）
+var line_format: LineFormat = .ncore;
+
+/// 设置日志行格式。
+pub fn setLineFormat(f: LineFormat) void {
+    line_format = f;
+}
+
+/// 取当前行格式。
+pub fn getLineFormat() LineFormat {
+    return line_format;
+}
+
+/// 线程类别标识（对齐 DH.NCore 的 Kind 列）。
+///
+/// C# 侧由 `XTrace` 按场景置位（Y=线程池 / W=网页 / N=普通 / T=定时 / P / L）；
+/// Zig 侧暂不区分运行场景，统一 `N`（普通），保持列数与前缀形状稳定。
+const kind_normal = "N";
+
+/// Kit/Name 列占位：Zig 无「线程名」运行时 API，用 `-` 占位使 5 列结构稳定可解析。
+const name_placeholder = "-";
 
 // ============ 时间偏移支持 ============
 
@@ -47,8 +121,8 @@ pub fn getTimeOffset() i64 {
     return time_offset_ms;
 }
 
-/// 全局日志级别，可通过环境变量或配置调整
-var global_level: Level = .debug;
+/// 全局日志级别（对齐 DH.NCore：默认 `Info`，只输出 `>=` 该级别的日志）
+var global_level: Level = .info;
 
 /// 线程安全互斥锁
 var log_mutex: compat.Mutex = .{};
@@ -84,6 +158,68 @@ pub fn isThreadSafe() bool {
 /// 设置全局日志级别
 pub fn setLevel(level: Level) void {
     global_level = level;
+}
+
+/// 取当前全局日志级别
+pub fn getLevel() Level {
+    return global_level;
+}
+
+/// 当前设置下该级别是否会真正输出。
+pub fn enabled(level: Level) bool {
+    return @backingInt(level) >= @backingInt(global_level);
+}
+
+/// 读环境变量 `ZZIG_LOG` 并应用级别（对应 DH.NCore / DH.RustBase 的 `RUST_LOG` 习惯）。
+///
+/// 不存在或值非法时保持当前级别；返回最终生效的级别。
+pub fn applyEnv(environ_map: *const std.process.Environ.Map) Level {
+    const raw = environ_map.get("ZZIG_LOG") orelse return global_level;
+    if (Level.parse(raw)) |lv| global_level = lv;
+    return global_level;
+}
+
+/// 按线程号取日志行颜色（对齐 DH.NCore `ConsoleLog`）：
+/// 警告黄、错误/严重错误红，其余级别按线程号取自 10 色调色板，1 号线程灰白。
+///
+/// 返回**不含** `\x1b[` 前缀与 `m` 后缀的色号，由调用方拼接（保持 fmt 为 comptime 字面量）。
+fn colorCode(level: Level, thread_id: u32) []const u8 {
+    return switch (level) {
+        .warn => "33",
+        .err, .fatal => "31",
+        else => if (thread_id == 1) "37" else palette[thread_id % palette.len],
+    };
+}
+
+/// 调色板（顺序对齐 DH.NCore `ConsoleLog.colors`，以 ANSI 亮色/标准色近似）
+const palette = [10][]const u8{ "92", "96", "95", "97", "93", "32", "36", "35", "31", "33" };
+
+/// 当前线程 id（用作 `ThreadId` 列；取模 100 保证两位宽度）
+fn currentThreadId() u32 {
+    return @intCast(std.Thread.getCurrentId() % 100);
+}
+
+/// 将时间戳格式化为 `HH:MM:SS.mmm`（对齐 DH.NCore 行首 `Time` 列，不含日期：日期已在文件名里）。
+///
+/// buf 至少 16 字节；返回写入的切片。
+fn formatClock(buf: *[16]u8) []u8 {
+    const nanos: i128 = compat.nanoTimestamp();
+    const offset_nanos: i128 = @as(i128, time_offset_ms) * std.time.ns_per_ms;
+    const adjusted_nanos: i128 = nanos + offset_nanos;
+
+    const timestamp: i64 = @intCast(@divFloor(adjusted_nanos, std.time.ns_per_s));
+    const nano_part: u32 = @intCast(@mod(adjusted_nanos, std.time.ns_per_s));
+    const millis: u32 = nano_part / std.time.ns_per_ms;
+
+    const local_offset: i64 = getLocalTimezoneOffset();
+    const seconds_since_epoch: i64 = timestamp + local_offset;
+    const seconds_today = @mod(seconds_since_epoch, 86400);
+
+    const hour: u32 = @intCast(@divFloor(seconds_today, 3600));
+    const minute: u32 = @intCast(@divFloor(@mod(seconds_today, 3600), 60));
+    const second: u32 = @intCast(@mod(seconds_today, 60));
+
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ hour, minute, second, millis }) catch buf[0..12];
 }
 
 /// 将时间戳格式化到调用者提供的栈缓冲区（零堆分配）
@@ -222,10 +358,37 @@ fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
     _ = compat.windows.writeConsoleW(h.?, utf16, &written);
 }
 
+/// 生成日志行前缀（不含消息）。
+///
+/// `ncore` / `ncore_level` 走 DH.NCore 的 `Time ThreadId Kind Name [Level]` 形状；
+/// `legacy` 保留 zzig 早期的 `[完整时间戳] [LEVEL] ` 形状。
+fn buildPrefix(buf: *[96]u8, level: Level, thread_id: u32) []const u8 {
+    switch (line_format) {
+        .ncore => {
+            var clock_buf: [16]u8 = undefined;
+            return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} ", .{
+                formatClock(&clock_buf), thread_id, kind_normal, name_placeholder,
+            }) catch buf[0..0];
+        },
+        .ncore_level => {
+            var clock_buf: [16]u8 = undefined;
+            return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} [{s}] ", .{
+                formatClock(&clock_buf), thread_id, kind_normal, name_placeholder, level.pascalName(),
+            }) catch buf[0..0];
+        },
+        .legacy => {
+            var ts_buf: [32]u8 = undefined;
+            return std.fmt.bufPrint(buf, "[{s}] [{s}] ", .{
+                formatTimestamp(&ts_buf), level.asStr(),
+            }) catch buf[0..0];
+        },
+    }
+}
+
 /// 通用日志打印函数
 fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
-    // 级别过滤
-    if (@intFromEnum(level) < @intFromEnum(global_level)) {
+    // 级别过滤（对齐 DH.NCore：只输出 >= 配置级别）
+    if (!enabled(level)) {
         return;
     }
 
@@ -235,19 +398,17 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
         defer log_mutex.unlock();
     }
 
-    // 时间戳写入栈内存，无堆分配
-    var ts_buf: [32]u8 = undefined;
-    const timestamp = formatTimestamp(&ts_buf);
+    const thread_id = currentThreadId();
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = buildPrefix(&prefix_buf, level, thread_id);
+    const color_code = colorCode(level, thread_id);
 
-    const color_code = level.color();
-    const reset_code = "\x1b[0m";
-    const level_label = level.label();
-
-    // 非 Windows：直接两次写 stderr，零堆分配（无 arena、无 allocPrint）
+    // 非 Windows：直接写 stderr，零堆分配（无 arena、无 allocPrint）
     // log_mutex（已在上方持有）保证同一进程内日志行不交错
     if (builtin.os.tag != .windows) {
-        std.debug.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code });
-        std.debug.print(fmt ++ "\n", args);
+        std.debug.print("\x1b[{s}m", .{color_code});
+        std.debug.print("{s}", .{prefix});
+        std.debug.print(fmt ++ "\n" ++ "\x1b[0m", args);
         return;
     }
 
@@ -261,9 +422,10 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
     var writer_allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
     const writer = &writer_allocating.writer;
 
-    writer.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code }) catch return;
+    writer.print("\x1b[{s}m", .{color_code}) catch return;
+    writer.writeAll(prefix) catch return;
     writer.print(fmt, args) catch return;
-    writer.writeAll("\n") catch return;
+    writer.writeAll("\n\x1b[0m") catch return;
 
     buffer = writer_allocating.toArrayList();
     printUtf8(allocator, buffer.items);
@@ -289,6 +451,11 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     log(.err, fmt, args);
 }
 
+/// 严重错误级别日志（对齐 DH.NCore `Fatal`：进程级不可恢复错误）
+pub fn fatal(comptime fmt: []const u8, args: anytype) void {
+    log(.fatal, fmt, args);
+}
+
 /// 强制输出日志（忽略全局日志级别,用于启动信息等关键日志）
 pub fn always(comptime fmt: []const u8, args: anytype) void {
     // 线程安全保护
@@ -301,21 +468,20 @@ pub fn always(comptime fmt: []const u8, args: anytype) void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // 时间戳写入栈内存，无堆分配
-    var ts_buf: [32]u8 = undefined;
-    const timestamp = formatTimestamp(&ts_buf);
-
-    const color_code = "\x1b[32m"; // 绿色
-    const reset_code = "\x1b[0m";
-    const level_label = "INFO";
+    // 固定按 info 级别出前缀与配色（`always` 的语义是「不受级别过滤」）
+    const thread_id = currentThreadId();
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = buildPrefix(&prefix_buf, .info, thread_id);
+    const color_code = colorCode(.info, thread_id);
 
     var buffer: std.ArrayList(u8) = .empty;
     var writer_allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
     const writer = &writer_allocating.writer;
 
-    writer.print("{s}[{s}] {s}{s}{s} ", .{ color_code, timestamp, color_code, level_label, reset_code }) catch return;
+    writer.print("\x1b[{s}m", .{color_code}) catch return;
+    writer.writeAll(prefix) catch return;
     writer.print(fmt, args) catch return;
-    writer.writeAll("\n") catch return;
+    writer.writeAll("\n\x1b[0m") catch return;
 
     buffer = writer_allocating.toArrayList();
     printUtf8(allocator, buffer.items);
@@ -335,4 +501,87 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 
     const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
     printUtf8(allocator, message);
+}
+
+// ============ 对齐 DH.NCore 的规则测试 ============
+
+const testing = std.testing;
+
+test "logger：默认级别为 info（对齐 DH.NCore 默认 LogLevel=Info）" {
+    const saved = getLevel();
+    defer setLevel(saved);
+    setLevel(.info);
+    try testing.expect(enabled(.info));
+    try testing.expect(enabled(.warn));
+    try testing.expect(enabled(.err));
+    try testing.expect(enabled(.fatal));
+    try testing.expect(!enabled(.debug)); // 明细默认看不到
+    try testing.expect(!enabled(.all));
+}
+
+test "logger：7 级对齐 All/Debug/Info/Warn/Error/Fatal/Off 且门槛为 >=" {
+    // 枚举顺序必须与 DH.NCore 一致（all < debug < info < warn < error < fatal < off）
+    try testing.expect(@backingInt(Level.all) < @backingInt(Level.debug));
+    try testing.expect(@backingInt(Level.debug) < @backingInt(Level.info));
+    try testing.expect(@backingInt(Level.info) < @backingInt(Level.warn));
+    try testing.expect(@backingInt(Level.warn) < @backingInt(Level.err));
+    try testing.expect(@backingInt(Level.err) < @backingInt(Level.fatal));
+    try testing.expect(@backingInt(Level.fatal) < @backingInt(Level.off));
+
+    const saved = getLevel();
+    defer setLevel(saved);
+
+    setLevel(.all);
+    try testing.expect(enabled(.debug));
+    setLevel(.off);
+    try testing.expect(!enabled(.fatal)); // off 关掉一切
+}
+
+test "logger：asStr 与 parse 对齐 C# LogLevel（含大小写与别名）" {
+    try testing.expectEqualStrings("INFO", Level.info.asStr());
+    try testing.expectEqualStrings("ERROR", Level.err.asStr());
+    try testing.expectEqualStrings("FATAL", Level.fatal.asStr());
+    try testing.expectEqualStrings("OFF", Level.off.asStr());
+
+    try testing.expectEqual(Level.debug, Level.parse("DEBUG").?);
+    try testing.expectEqual(Level.debug, Level.parse(" trace ").?);
+    try testing.expectEqual(Level.warn, Level.parse("Warning").?);
+    try testing.expectEqual(Level.err, Level.parse("error").?);
+    try testing.expectEqual(Level.fatal, Level.parse("FATAL").?);
+    try testing.expectEqual(Level.off, Level.parse("none").?);
+    try testing.expectEqual(@as(?Level, null), Level.parse("乱写"));
+}
+
+test "logger：行格式默认为 NCore，可切换" {
+    const saved = getLineFormat();
+    defer setLineFormat(saved);
+    try testing.expectEqual(LineFormat.ncore, getLineFormat());
+    setLineFormat(.legacy);
+    try testing.expectEqual(LineFormat.legacy, getLineFormat());
+}
+
+test "logger：applyEnv 读 ZZIG_LOG（不存在保持、非法保持）" {
+    const saved = getLevel();
+    defer setLevel(saved);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    setLevel(.info);
+    try testing.expectEqual(Level.info, applyEnv(&env));
+
+    try env.put("ZZIG_LOG", " warn ");
+    try testing.expectEqual(Level.warn, applyEnv(&env));
+
+    try env.put("ZZIG_LOG", "乱写");
+    try testing.expectEqual(Level.warn, applyEnv(&env));
+}
+
+test "logger：clock 前缀形状为 HH:MM:SS.mmm" {
+    var buf: [16]u8 = undefined;
+    const s = formatClock(&buf);
+    try testing.expectEqual(@as(usize, 12), s.len);
+    try testing.expectEqual(@as(u8, ':'), s[2]);
+    try testing.expectEqual(@as(u8, ':'), s[5]);
+    try testing.expectEqual(@as(u8, '.'), s[8]);
 }
