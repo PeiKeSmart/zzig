@@ -57,6 +57,11 @@ pub const FileText = struct {
                 break :blk try gpa.dupe(u8, template);
             };
         } else if (opts.create_on_missing) {
+            // 父目录可能还不存在（首次运行 `Config/` 尚未创建）：先建目录再原子写，
+            // 否则 Windows 上 createFile 直接报 FileNotFound，配置生成功能形同虚设。
+            if (std.fs.path.dirname(path)) |dir| {
+                if (dir.len > 0) fsio.makePath(io, dir) catch {};
+            }
             try fsio.writeFileAtomic(io, gpa, path, template);
             self.text = try gpa.dupe(u8, template);
             self.stamp = getStamp(io, path);

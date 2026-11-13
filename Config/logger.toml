@@ -1,0 +1,27 @@
+# zzig 日志配置（字段名与含义对齐 DH.NCore Setting，C# / Rust / Zig 三端共用）
+#
+# 级别：All / Debug / Info / Warn / Error / Fatal / Off
+#        也接受别名：trace→Debug、warning→Warn、error→Error、none|silent→Off
+#        默认 Info；排障时临时改 Debug 即可看到逐条明细（一条日志都没删）
+LogLevel = "Debug"
+
+# 日志目录。留空 = 只输出到控制台，不落文件
+# 相对路径基于进程工作目录；目录不存在会自动创建
+LogPath = "Log"
+
+# 单文件上限（字节）。超过就拆分为 xxx_2.log、xxx_3.log …；0 = 不限制
+LogFileMaxBytes = 1048576
+
+# 保留份数。超出后删除最旧的一份；0 = 不限制
+LogFileBackups = 10
+
+# 行格式。可用列：Time / DateTime / ThreadId / Kind / Name / Message / Level
+# 例：LogLineFormat = "DateTime|ThreadId|Kind|Name|Message|Level"
+LogLineFormat = "Time|ThreadId|Kind|Name|Message|Level"
+
+# 是否输出到控制台。false 时只写文件
+LogConsole = true
+
+# 异步队列容量。队列满时丢弃新日志并计数（`dropped`），不会阻塞业务线程
+LogAsyncQueue = 65536
+

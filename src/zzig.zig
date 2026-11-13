@@ -128,9 +128,14 @@ pub const url = @import("net/url.zig");
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
-/// 定时器（每日 HH:MM 触发点计算）
+/// 线程相关：定时器、弹性线程池
 pub const threading = struct {
     pub const timer = @import("threading/timer.zig");
+    /// 弹性线程池：**短任务**才走池；长连接/流式请用独立线程 + `markAsLongTask()`
+    pub const pool = @import("threading/pool.zig");
+    pub const Pool = pool.Pool;
+    pub const PoolOptions = pool.Options;
+    pub const markAsLongTask = pool.markAsLongTask;
 };
 
 /// 企业微信机器人 Webhook 推送
@@ -146,6 +151,9 @@ pub const config = struct {
 
 /// 动态队列（自动扩容的 SPSC 队列）
 pub const logs = struct {
+    /// 日志级别与行格式的**单一来源**（对齐 DH.NCore `LogLevel` / `Setting.LogLineFormat`）
+    pub const level = @import("logs/level.zig");
+
     pub const DynamicQueue = @import("logs/dynamic_queue.zig").DynamicQueue;
     pub const DynamicQueueConfig = @import("logs/dynamic_queue.zig").DynamicQueueConfig;
 
@@ -298,6 +306,10 @@ pub const tds = db.tds;
 // 跨模块 import（test.zig → zzig 模块）不会收集。build.zig 里 `zzig-module-tests`
 // 以本文件为根，靠这里把它们拉进来，否则驱动单测形同虚设。
 test {
+    // 日志：级别/行格式/文件头（未在此列出的文件，其 test 块不会被收集）
+    _ = @import("logs/level.zig");
+    _ = @import("logs/logger.zig");
+
     _ = @import("db/value.zig");
     _ = @import("db/row.zig");
     _ = @import("db/sqlite.zig");
@@ -322,6 +334,7 @@ test {
     _ = @import("config/toml.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
+    _ = @import("threading/pool.zig");
     _ = @import("threading/timer.zig");
     _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");

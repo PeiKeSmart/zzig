@@ -1,88 +1,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("../compat.zig");
+const levels = @import("level.zig");
+const text_log = @import("text_file_log.zig");
 
-/// 日志级别。
+/// 文件日志实现（按天滚动 + 大小拆分 + 备份清理），供需要直接使用的场景。
+pub const TextFileLog = text_log.TextFileLog;
+
+/// 日志级别（**单一来源**：`logs/level.zig`，对齐 DH.NCore `LogLevel`）。
 ///
-/// **对齐 DH.NCore `LogLevel`**（`All/Debug/Info/Warn/Error/Fatal/Off`）：
-/// - 判断恒为「输出 `>=` 配置级别」，所以 `all` 放行一切、`off` 关闭一切；
-/// - `error` 是 Zig 关键字，枚举成员写作 `err`，但 `asStr()` 输出 `ERROR`（与 C# 一致）。
-pub const Level = enum(u8) {
-    all = 0,
-    debug = 1,
-    info = 2,
-    warn = 3,
-    err = 4,
-    fatal = 5,
-    off = 6,
+/// 定义与配色规则都在 `level.zig`；这里只是转出，供既有调用方沿用 `logger.Level` 路径。
+pub const Level = levels.Level;
+pub const LineFormat = levels.LineFormat;
+pub const parseLineFormat = levels.parseLineFormat;
 
-    /// 级别的规范名称（大写），对齐 DH.NCore `LogLevel::as_str()`。
-    pub fn asStr(self: Level) []const u8 {
-        return switch (self) {
-            .all => "ALL",
-            .debug => "DEBUG",
-            .info => "INFO",
-            .warn => "WARN",
-            .err => "ERROR",
-            .fatal => "FATAL",
-            .off => "OFF",
-        };
-    }
+const kind_normal = levels.kind_normal;
+const kind_worker = levels.kind_worker;
+const currentKind = levels.currentKind;
+const currentThreadName = levels.currentThreadName;
+const name_placeholder = levels.name_placeholder;
+const colorCode = levels.colorCode;
+const currentThreadId = levels.currentThreadId;
 
-    /// 级别的 C# 枚举名（PascalCase）。
-    ///
-    /// DH.NCore 的 `LogLineFormat` 含 `Level` 时输出的是 `[{Level}]`，
-    /// 而 `Level` 是 `LogLevel` 枚举，`ToString()` 结果就是 PascalCase（`[Info]`），
-    /// 与大写的 `asStr()` 不同 —— 两者不能混用。
-    pub fn pascalName(self: Level) []const u8 {
-        return switch (self) {
-            .all => "All",
-            .debug => "Debug",
-            .info => "Info",
-            .warn => "Warn",
-            .err => "Error",
-            .fatal => "Fatal",
-            .off => "Off",
-        };
-    }
-
-    /// 解析级别名（不区分大小写），对齐 DH.NCore `LogLevel::parse`。
-    ///
-    /// 额外容忍常见别名：`trace`→debug、`warning`→warn、`error`→err、`none`/`silent`→off。
-    /// 非法值返回 `null`（调用方保持原级别）。
-    pub fn parse(name: []const u8) ?Level {
-        const eq = std.ascii.eqlIgnoreCase;
-        const t = std.mem.trim(u8, name, " \t\r\n");
-        if (eq(t, "all")) return .all;
-        if (eq(t, "debug") or eq(t, "trace")) return .debug;
-        if (eq(t, "info")) return .info;
-        if (eq(t, "warn") or eq(t, "warning")) return .warn;
-        if (eq(t, "err") or eq(t, "error")) return .err;
-        if (eq(t, "fatal")) return .fatal;
-        if (eq(t, "off") or eq(t, "none") or eq(t, "silent")) return .off;
-        return null;
-    }
-
-    /// 获取日志级别的标签
-    fn label(self: Level) []const u8 {
-        return self.asStr();
-    }
-};
-
-/// 日志行格式（对齐 DH.NCore `Setting.LogLineFormat`）。
-///
-/// DH.NCore 默认 `Time|ThreadId|Kind|Name|Message`，并说明「还支持 Level」——
-/// 两种都在这里提供；`legacy` 保留 zzig 早期格式，供已依赖旧输出的项目按需切回。
-pub const LineFormat = enum {
-    /// `HH:MM:SS.mmm ThreadId Kind Name Message`（对齐 DH.NCore 默认值）
-    ncore,
-    /// `HH:MM:SS.mmm ThreadId Kind Name Level Message`（DH.NCore 的含 Level 变体）
-    ncore_level,
-    /// `[YYYY-MM-DD HH:MM:SS.nnnnnnnnn] [LEVEL] message`（zzig 旧格式）
-    legacy,
-};
-
-/// 当前行格式（默认对齐 DH.NCore）
+/// 当前行格式（默认对齐 DH.NCore：`Time ThreadId Kind Name Message`）
 var line_format: LineFormat = .ncore;
 
 /// 设置日志行格式。
@@ -95,15 +35,756 @@ pub fn getLineFormat() LineFormat {
     return line_format;
 }
 
-/// 线程类别标识（对齐 DH.NCore 的 Kind 列）。
+// ============ 输出目标（控制台 / 文件，可同时开）============
+
+/// 控制台输出开关（默认开）
+var console_enabled: bool = true;
+
+/// 文件输出（为 null 表示只写控制台）。按天滚动 + 大小拆分 + 备份清理由 `TextFileLog` 负责。
+var file_sink: ?text_log.TextFileLog = null;
+
+/// 文件输出的互斥锁：`log()` 可能被多线程并发调用，而 `TextFileLog` 自身只在 `log()` 路径上持锁，
+/// 我们走的是 `writeRawLine`，所以在这里串行化。
+var file_mutex: compat.Mutex = .{};
+
+/// 打开/关闭控制台输出。
+pub fn setConsole(on: bool) void {
+    console_enabled = on;
+}
+
+/// 是否启用控制台输出。
+pub fn consoleEnabled() bool {
+    return console_enabled;
+}
+
+// ============ 异步写入（业务线程零 IO）============
+//
+// 性能设计（对齐 DH.NCore / DH.RustBase 的「队列 + 写线程」模型）：
+// 1. `log()` 只做「格式化 + 入队」，**不碰任何 IO** —— 业务线程不会被磁盘/控制台拖住；
+// 2. 队列无锁（`MPMCQueue`）、容量固定（默认 1024，对齐 DH.NCore `MAX_QUEUE`）；
+// 3. 队列满时**丢弃新日志并计数**，既不让业务线程阻塞，也不让内存无界增长；
+// 4. 写线程一次取批、逐条落盘；空闲时睡 1ms，不空转烧 CPU；
+// 5. 退出前必须 `shutdown()`（或 `flush()`），否则队列里的日志会随进程消失。
+
+const mpmc = @import("mpmc_queue.zig");
+
+/// 一条待写日志：整行已格式化（不含换行），由写线程负责释放 `text`。
+const PendingLine = struct {
+    level: Level,
+    thread_id: u64,
+    text: []u8,
+};
+
+const default_queue_capacity: usize = 65536;
+
+/// 队列（null = 未启用异步，走同步路径）
+var pending: ?*mpmc.MPMCQueue(PendingLine) = null;
+var worker: ?std.Thread = null;
+var worker_stop = std.atomic.Value(bool).init(true);
+var queue_alloc: std.mem.Allocator = std.heap.smp_allocator;
+/// 启动时的队列容量（便于查询/日志）
+var queue_capacity: usize = 0;
+/// 因队列满被丢弃的日志条数（只计数不刷日志，避免形成二次拥塞）
+pub var dropped = std.atomic.Value(u64).init(0);
+
+/// 启用异步写入（**建议在 `main` 开头调用**）。
 ///
-/// C# 侧由 `XTrace` 按场景置位（Y=线程池 / W=网页 / N=普通 / T=定时 / P / L）；
-/// Zig 侧暂不区分运行场景，统一 `N`（普通），保持列数与前缀形状稳定。
-const kind_normal = "N";
+/// - `capacity` 是队列长度上限；满了丢弃新日志并计入 `dropped()`；
+/// - 重复调用是安全的（已启动则只更新容量请求被忽略，返回当前容量）。
+///
+/// 退出前务必 `shutdown()`。
+pub fn startAsync(capacity: usize) !usize {
+    if (pending != null) return queueCapacity();
+    if (!build_options.async_available) return error.AsyncUnsupported;
 
-/// Kit/Name 列占位：Zig 无「线程名」运行时 API，用 `-` 占位使 5 列结构稳定可解析。
-const name_placeholder = "-";
+    const cap = if (capacity == 0) default_queue_capacity else capacity;
+    const q = try queue_alloc.create(mpmc.MPMCQueue(PendingLine));
+    errdefer queue_alloc.destroy(q);
+    q.* = try mpmc.MPMCQueue(PendingLine).init(queue_alloc, cap);
 
+    worker_stop.store(false, .release);
+    const t = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, workerLoop, .{q}) catch |e| {
+        q.deinit(queue_alloc);
+        queue_alloc.destroy(q);
+        return e;
+    };
+    pending = q;
+    worker = t;
+    queue_capacity = cap;
+    return queue_capacity;
+}
+
+/// 当前队列容量（未启用异步时为 0）。
+pub fn queueCapacity() usize {
+    if (pending != null) return queue_capacity;
+    return 0;
+}
+
+/// 队列当前积压条数（用于健康检查/自监控）。
+pub fn queueSize() usize {
+    if (pending) |q| return q.size();
+    return 0;
+}
+
+/// 被丢弃的日志条数（队列满时）。
+pub fn droppedCount() u64 {
+    return dropped.load(.acquire);
+}
+
+/// 把队列里已排队的日志**同步**写完（不停止写线程，可随时调用）。
+///
+/// 用途：关键节点（配置重载前、升级重启前）确保日志落盘。
+pub fn flush() void {
+    if (pending == null) return;
+    // 给写线程一点时间排空；上限约 2 秒，避免异常情况卡死退出流程。
+    var spins: usize = 0;
+    while (queueSize() > 0 and spins < 2000) : (spins += 1) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+}
+
+/// **安全退出**：记录退出日志 → 排空队列 → 停写线程 → 关闭文件。**幂等**。
+///
+/// 每个 Zig 应用都应当在 `main` 里挂上：
+/// ```zig
+/// pub fn main(init: std.process.Init) !void {
+///     defer zzig.Logger.shutdown();
+///     ...
+/// }
+/// ```
+/// 少了这一步，队列中尚未落盘的日志会随进程一起消失（异步日志的固有代价）。
+pub fn shutdown() void {
+    // 先记一条退出日志（会入队，随后被排空写入）
+    if (pending != null) {
+        const left = queueSize();
+        info("进程退出：开始刷写日志（队列积压 {d} 条，累计丢弃 {d} 条）", .{ left, droppedCount() });
+    }
+
+    if (pending) |q| {
+        worker_stop.store(true, .release);
+        if (worker) |t| {
+            t.join();
+            worker = null;
+        }
+        // worker 已退出，理论上队列已空；兜底清掉残留（不丢文本引用）
+        while (q.tryPop()) |item| queue_alloc.free(item.text);
+        q.deinit(queue_alloc);
+        queue_alloc.destroy(q);
+        pending = null;
+    }
+    // 先停热加载线程，再释放配置源：否则线程可能正在 `reloadIfChanged` 里
+    // 使用 `config_source`（停在前、关在后，二者无并发）
+    stopAutoReload();
+    // 配置源也在这里释放：否则 `FileText` 持有的 path/text 会随进程一起泄漏
+    closeConfigSource();
+    closeFile();
+}
+
+/// 写线程：批量取、逐条落盘；无数据时睡 1ms（不空转）。
+/// 写线程：**批量取 + 批量落盘**（对齐 DH.NCore / DH.RustBase 的队列写法）。
+///
+/// 为什么必须批量：逐条写时每条日志至少 1 次控制台系统调用 + 1 次文件写入，
+/// 几万条突发就会把队列撑满导致丢弃。批量后一次取 `batch_*` 条、文件只写一次，
+/// 吞吐差一个数量级。
+const worker_batch: usize = 256;
+
+fn workerLoop(q: *mpmc.MPMCQueue(PendingLine)) void {
+    var idle: usize = 0;
+    var batch_buf: [worker_batch]PendingLine = undefined;
+
+    while (true) {
+        var n: usize = 0;
+        while (n < worker_batch) {
+            const item = q.tryPop() orelse break;
+            batch_buf[n] = item;
+            n += 1;
+        }
+
+        if (n > 0) {
+            emitBatch(batch_buf[0..n]);
+            for (batch_buf[0..n]) |item| queue_alloc.free(item.text);
+            idle = 0;
+            if (worker_stop.load(.acquire) and q.isEmpty()) return;
+            continue;
+        }
+
+        if (worker_stop.load(.acquire) and q.isEmpty()) return;
+        idle += 1;
+        if (idle < 50) {
+            std.Thread.yield() catch {};
+        } else {
+            // 空闲 1ms 后休眠：不空转烧 CPU，但响应仍然及时
+            compat.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+}
+
+/// 批量输出：文件一次写、控制台一次写（各行颜色转义内联，终端会逐行生效）。
+fn emitBatch(items: []const PendingLine) void {
+    // ---------- 文件：拼成一块，一次系统调用 ----------
+    file_mutex.lock();
+    if (file_sink) |*sink| {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(queue_alloc);
+        for (items) |item| {
+            buf.appendSlice(queue_alloc, item.text) catch break;
+            buf.append(queue_alloc, '\n') catch break;
+        }
+        sink.writeRawBlock(buf.items);
+    }
+    file_mutex.unlock();
+
+    if (!console_enabled) return;
+
+    // ---------- 控制台：同样拼成一块（含颜色），一次写出 ----------
+    var out: std.Io.Writer.Allocating = .init(queue_alloc);
+    defer out.deinit();
+    for (items) |item| {
+        out.writer.print("\x1b[{s}m{s}\n\x1b[0m", .{
+            colorCode(item.level, item.thread_id), item.text,
+        }) catch break;
+    }
+
+    if (builtin.os.tag != .windows) {
+        std.debug.print("{s}", .{out.written()});
+        return;
+    }
+    // Windows：批量已在堆上，直接走一次 UTF-16 转换 + WriteConsoleW
+    printUtf8(queue_alloc, out.written());
+}
+
+// ============ 文件输出 ============
+
+/// 打开文件日志（与控制台**同时**输出，除非 `opts.use_console = false`）。
+///
+/// 目录、按天滚动、单文件上限与备份数量都在 `TextFileLog.Options` 里，
+/// 字段含义对齐 DH.NCore `Setting`：`LogPath` / `LogFileMaxBytes` / `LogFileBackups`。
+///
+/// **热加载安全**：先把新 sink 建好，再在 `file_mutex` 内一次性换指针，
+/// 旧的等解锁后再释放 —— 写入方只能在锁内拿到 `file_sink`，
+/// 所以不会出现「一边 closeFile、一边还在写」的 use-after-free。
+pub fn useFile(io: std.Io, gpa: std.mem.Allocator, opts: text_log.Options) !void {
+    // **头与数据必须同源**：`Options.line_format` 决定文件头 `#Fields`，
+    // 若不同步到全局行格式，就会出现「表头写着 Level 列、正文却没有」这种自相矛盾的日志。
+    // 直接调用 `useFile` 而没走 `applyConfig` 时，这里保证两者一致。
+    if (parseLineFormat(opts.line_format)) |f| line_format = f;
+
+    const owned_dir = try gpa.dupe(u8, opts.dir);
+    errdefer gpa.free(owned_dir);
+
+    var o = opts;
+    o.dir = owned_dir;
+    const new_sink = try text_log.TextFileLog.init(io, gpa, global_level, o);
+
+    file_mutex.lock();
+    const old_sink = file_sink;
+    const old_dir = file_dir;
+    const old_gpa = file_gpa;
+    file_sink = new_sink;
+    file_dir = owned_dir;
+    file_gpa = gpa;
+    file_mutex.unlock();
+
+    // 此时已无人能再拿到旧指针，可以安全释放
+    if (old_sink) |sink_copy| {
+        var s = sink_copy;
+        s.deinit();
+    }
+    if (old_dir) |d| {
+        if (old_gpa) |g| g.free(d);
+    }
+}
+
+/// 关闭文件输出并释放资源（幂等、线程安全）。
+pub fn closeFile() void {
+    file_mutex.lock();
+    const old_sink = file_sink;
+    const old_dir = file_dir;
+    const old_gpa = file_gpa;
+    file_sink = null;
+    file_dir = null;
+    file_gpa = null;
+    file_mutex.unlock();
+
+    // 写入方只在锁内取 `file_sink`，所以解锁后释放是安全的
+    if (old_sink) |sink_copy| {
+        var s = sink_copy;
+        s.deinit();
+    }
+    if (old_dir) |d| {
+        if (old_gpa) |g| g.free(d);
+    }
+}
+
+/// 是否已打开文件输出。
+pub fn fileEnabled() bool {
+    file_mutex.lock();
+    defer file_mutex.unlock();
+    return file_sink != null;
+}
+
+var file_dir: ?[]u8 = null;
+var file_gpa: ?std.mem.Allocator = null;
+
+// ============ 配置文件与热加载 ============
+//
+// 目标：**改配置不用改代码、不用重启**。
+// 安全设计（对齐 DH.NCore `Config` 语义）：
+// 1. 读：`FileText.reloadIfChanged` 用 mtime+size 版本戳，未变则零开销返回；
+// 2. 写：`FileText.save` 走 `writeFileAtomic`（临时文件 + rename），不会出现半截文件；
+// 3. 坏文件：解析失败**自动备份**为 `<名>.bad.<时间戳>`，保留现场供排查，
+//    且**继续使用内存中上一份好配置**（绝不让一次手误把服务打成默认值）；
+// 4. 缺文件：按模板自动生成（含注释），运维照着改即可。
+
+const config_file = @import("../config/file.zig");
+const toml_config = @import("../config/toml.zig");
+const fsio = @import("../file/fsio.zig");
+
+/// 日志配置项。
+///
+/// 字段名**按 DH.NCore `Setting` 的 PascalCase 命名**，让 C# / Rust / Zig 三端
+/// 能共用同一份配置文件、同一套含义。
+pub const Config = struct {
+    /// 只输出 >= 该级别的日志。`All/Debug/Info/Warn/Error/Fatal/Off`，默认 Info
+    LogLevel: []const u8 = "Info",
+    /// 日志目录；留空表示只写控制台（不落文件）
+    LogPath: []const u8 = "",
+    /// 单文件上限（字节），超限拆分为 `_2`、`_3`…；0 表示不限制
+    LogFileMaxBytes: u64 = 10 * 1024 * 1024,
+    /// 保留份数，超出后删除最旧；0 表示不限制
+    LogFileBackups: usize = 200,
+    /// 行格式：`Time|ThreadId|Kind|Name|Message`（含 `Level` 则追加级别列）
+    LogLineFormat: []const u8 = "Time|ThreadId|Kind|Name|Message",
+    /// 是否输出到控制台
+    LogConsole: bool = true,
+    /// 异步队列容量（满了丢弃新日志并计数，不会阻塞业务线程）
+    LogAsyncQueue: usize = default_queue_capacity,
+};
+
+/// 配置文件的**唯一布局来源**（注释与顺序都写在这里）。
+///
+/// 两种用途共用同一份文案，避免「模板有注释、重写没注释」这类漂移：
+/// 1. 编译期由 `Config` 的默认值渲染成 [`default_config_template`]（文件缺失时生成）；
+/// 2. 运行期由 [`renderConfigText`] 用**实际生效值**渲染（文件缺注释/缺键时自愈重写）。
+const config_template_layout =
+    \\# zzig 日志配置（字段名与含义对齐 DH.NCore Setting，C# / Rust / Zig 三端共用）
+    \\#
+    \\# 级别：All / Debug / Info / Warn / Error / Fatal / Off
+    \\#        也接受别名：trace→Debug、warning→Warn、error→Error、none|silent→Off
+    \\#        默认 Info；排障时临时改 Debug 即可看到逐条明细（一条日志都没删）
+    \\LogLevel = "{s}"
+    \\
+    \\# 日志目录。留空 = 只输出到控制台，不落文件
+    \\# 相对路径基于进程工作目录；目录不存在会自动创建
+    \\LogPath = "{s}"
+    \\
+    \\# 单文件上限（字节）。超过就拆分为 xxx_2.log、xxx_3.log …；0 = 不限制
+    \\LogFileMaxBytes = {d}
+    \\
+    \\# 保留份数。超出后删除最旧的一份；0 = 不限制
+    \\LogFileBackups = {d}
+    \\
+    \\# 行格式。可用列：Time / DateTime / ThreadId / Kind / Name / Message / Level
+    \\# 例：LogLineFormat = "DateTime|ThreadId|Kind|Name|Message|Level"
+    \\LogLineFormat = "{s}"
+    \\
+    \\# 是否输出到控制台。false 时只写文件
+    \\LogConsole = {}
+    \\
+    \\# 异步队列容量。队列满时丢弃新日志并计数（`dropped`），不会阻塞业务线程
+    \\LogAsyncQueue = {d}
+    \\
+;
+
+/// `Config` 的默认值实例（编译期常量，供模板渲染用）。
+const config_defaults: Config = .{};
+
+/// 把 `Config` 展开成模板所需的参数元组（渲染口径唯一，避免两处参数顺序不一致）。
+fn configTemplateArgs(cfg: Config) struct {
+    []const u8,
+    []const u8,
+    u64,
+    usize,
+    []const u8,
+    bool,
+    usize,
+} {
+    return .{
+        cfg.LogLevel,
+        cfg.LogPath,
+        cfg.LogFileMaxBytes,
+        cfg.LogFileBackups,
+        cfg.LogLineFormat,
+        cfg.LogConsole,
+        cfg.LogAsyncQueue,
+    };
+}
+
+const default_config_template_arr = blk: {
+    @setEvalBranchQuota(20000);
+    var buf: [4096]u8 = undefined;
+    const s = std.fmt.bufPrint(
+        &buf,
+        config_template_layout,
+        configTemplateArgs(config_defaults),
+    ) catch @compileError("日志配置模板渲染失败：布局占位符与 Config 字段不匹配");
+    break :blk s[0..s.len].*;
+};
+
+/// 配置文件缺失时自动生成的内容（**带注释**，运维可直接改）。
+///
+/// 由 [`config_template_layout`] + `Config` 默认值在**编译期**渲染，
+/// 所以不会再出现「模板写着 8192、代码默认 65536」这种漂移
+/// （历史 bug：新生成的配置文件反而把队列改小了 8 倍）。
+pub const default_config_template: []const u8 = &default_config_template_arr;
+
+/// 用**给定值**渲染一份带完整注释的配置文本（自愈重写用）。
+pub fn renderConfigText(gpa: std.mem.Allocator, cfg: Config) ![]u8 {
+    return std.fmt.allocPrint(gpa, config_template_layout, configTemplateArgs(cfg));
+}
+
+/// 配置来源（`loadConfigFile` 成功后非 null，供 `reloadIfChanged` 做增量检测）。
+const ConfigSource = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    file: config_file.FileText,
+};
+
+var config_source: ?ConfigSource = null;
+/// 坏配置只备份一次，避免每次 reload 都堆一个新 `.bad` 文件
+var bad_config_backed: bool = false;
+
+/// 应用一份配置（不涉及文件），顺序：级别 → 行格式 → 控制台 → 队列 → 文件。
+///
+/// 任何一项值非法都**保持原值并告警**，不会因为一个字段配错就整体回退。
+pub fn applyConfig(io: std.Io, gpa: std.mem.Allocator, cfg: Config) !void {
+    if (Level.parse(cfg.LogLevel)) |lv| {
+        global_level = lv;
+    } else {
+        err("日志配置 LogLevel=\"{s}\" 非法（应为 All/Debug/Info/Warn/Error/Fatal/Off），保持 {s}", .{ cfg.LogLevel, global_level.asStr() });
+    }
+
+    if (parseLineFormat(cfg.LogLineFormat)) |f| {
+        line_format = f;
+    } else {
+        err("日志配置 LogLineFormat=\"{s}\" 无法识别，保持当前行格式", .{cfg.LogLineFormat});
+    }
+
+    console_enabled = cfg.LogConsole;
+
+    if (pending == null) {
+        _ = startAsync(cfg.LogAsyncQueue) catch |e| {
+            err("日志异步队列启动失败（{s}），退回同步写入（会阻塞调用线程）", .{@errorName(e)});
+        };
+    }
+
+    if (cfg.LogPath.len == 0) {
+        closeFile();
+    } else {
+        try useFile(io, gpa, .{
+            .dir = cfg.LogPath,
+            .use_console = false, // 控制台由 console_enabled 统一控制，避免重复输出
+            .max_file_bytes = cfg.LogFileMaxBytes,
+            .backups = cfg.LogFileBackups,
+        });
+    }
+}
+
+/// 配置文本审计结果（用于「加载即自愈」）。
+const ConfigAudit = struct {
+    /// 缺少的已知配置项个数
+    missing: usize = 0,
+    /// 文本里是否有注释行（`#`）——没有说明是机器/手写裸键，应补注释
+    has_comment: bool = false,
+    /// 未知键名（属于 `table` 的键切片，仅在本次加载的 arena 生命周期内有效）
+    unknown: std.ArrayListUnmanaged([]const u8) = .empty,
+};
+
+fn isKnownConfigKey(name: []const u8) bool {
+    inline for (@typeInfo(Config).@"struct".field_names) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+/// 审计配置文本：缺了哪些键、有没有注释、多出哪些未知键。
+fn auditConfigText(a: std.mem.Allocator, text: []const u8, table: *toml_config.Table) ConfigAudit {
+    var audit = ConfigAudit{};
+    audit.has_comment = std.mem.indexOfScalar(u8, text, '#') != null;
+
+    // 缺键：按 Config 字段逐个查（decode 会填默认值，但文件本身仍然缺，运维看不到）
+    inline for (@typeInfo(Config).@"struct".field_names) |name| {
+        if (table.get(name) == null) audit.missing += 1;
+    }
+
+    // 未知键：拼错/改名/别的程序的键都要报出来，避免「配了却不生效」
+    var it = table.iterator();
+    while (it.next()) |entry| {
+        if (!isKnownConfigKey(entry.key_ptr.*)) {
+            audit.unknown.append(a, entry.key_ptr.*) catch break;
+        }
+    }
+    return audit;
+}
+
+/// 自愈：备份原文件 → 用**实际生效值** + 完整注释重写（未知键直接丢弃）。
+fn repairConfigFile(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    file: *config_file.FileText,
+    cfg: Config,
+    audit: ConfigAudit,
+) !void {
+    // 先留现场：任何自愈都必须可回退
+    const backup_path = try std.fmt.allocPrint(gpa, "{s}.old", .{file.path});
+    defer gpa.free(backup_path);
+    fsio.writeFileAtomic(io, gpa, backup_path, file.current()) catch |e| {
+        warn("日志配置自愈前备份失败（{s}）：{s}，本次不自愈", .{ backup_path, @errorName(e) });
+        return;
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const head = try renderConfigText(gpa, cfg);
+    defer gpa.free(head);
+    try out.appendSlice(gpa, head);
+
+    try file.save(out.items);
+
+    warn(
+        "日志配置已自愈：{s}（补齐 {d} 个缺省项，清理 {d} 个未知项，补全注释；原文件备份为 {s}）",
+        .{ file.path, audit.missing, audit.unknown.items.len, backup_path },
+    );
+}
+
+/// 从 TOML 配置文件加载并应用；同时记下来源以便 `reloadIfChanged`。
+///
+/// 文件不存在 → 按 `default_config_template` 自动生成（含注释）后加载。
+/// 文件存在但**缺键 / 没有注释 / 有多余键** → 备份为 `<名>.old` 后按模板自愈重写：
+/// 值一律取实际生效值，多余的键直接清理，保证配置文件永远自解释、不缺项。
+pub fn loadConfigFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    closeConfigSource();
+    // 热加载线程要用同一个 Io（`reloadIfChanged` 内部实际用 `config_source.io`，这里仅保持口径一致）
+    reload_io = io;
+
+    var file = try config_file.FileText.open(io, gpa, path, default_config_template, .{});
+    errdefer file.deinit();
+
+    // 配置解析用**专用 arena**：`toml.parse` 的裸键返回的是原文切片（非堆），
+    // 手工 free 会 "free of invalid memory"；arena 一次释放既安全又快。
+    // `applyConfig` 会把需长期保留的字段（如 LogPath）自己 dupe，cfg 用完即可丢。
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const table = toml_config.parse(aa, file.current()) catch |e| {
+        // 首次加载就坏：备份现场后返回错误（调用方决定是否继续用默认值）。
+        // 注意：清理交给上面的 `errdefer file.deinit()`，这里**不能再手动 deinit**，
+        // 否则 errdefer 会二次释放 notes/text/path（曾经的段错误根因）。
+        backupBadConfig(io, gpa, path, file.current(), @errorName(e));
+        return e;
+    };
+
+    const audit = auditConfigText(aa, file.current(), table);
+    if (audit.unknown.items.len > 0) {
+        for (audit.unknown.items) |name| {
+            warn("日志配置出现多余项 \"{s}\"（{s}）—— 拼写错误或已废弃，将随自愈一并清理", .{ name, path });
+        }
+    }
+
+    const cfg = toml_config.decode(Config, aa, table) catch |e| {
+        // 同上：清理由 `errdefer` 负责，避免重复释放
+        backupBadConfig(io, gpa, path, file.current(), @errorName(e));
+        return e;
+    };
+
+    try applyConfig(io, gpa, cfg);
+
+    // 自愈：缺项 / 无注释 / 多余项都修掉（失败只告警，绝不影响已生效的配置）
+    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0) {
+        repairConfigFile(io, gpa, &file, cfg, audit) catch |e| {
+            warn("日志配置自愈失败（{s}），继续使用当前生效配置：{s}", .{ path, @errorName(e) });
+        };
+    }
+
+    config_source = .{ .io = io, .gpa = gpa, .file = file };
+    bad_config_backed = false;
+
+    // 关键：**自动开启热加载**。否则调用方忘了调 `reloadIfChanged`，
+    // 手改配置文件就永远不会生效（这正是「改了配置却像没改」的根因）。
+    startAutoReload(default_reload_interval_ms);
+}
+
+/// 配置文件有变更则重新应用；返回是否真的重载了。
+///
+/// 典型用法：在主循环 / 定时任务里每隔几秒调一次（未变更时只是一次 `stat`，开销极低）。
+/// 解析失败时**保留当前生效配置**，并把坏文件备份成 `<名>.bad.<时间戳>`。
+pub fn reloadIfChanged(io: std.Io) !bool {
+    _ = io;
+    if (config_source == null) return false;
+    const src = &config_source.?;
+
+    const changed = try src.file.reloadIfChanged(.{});
+    if (!changed) return false;
+
+    var arena = std.heap.ArenaAllocator.init(src.gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const table = toml_config.parse(aa, src.file.current()) catch |e| {
+        backupBadConfig(src.io, src.gpa, src.file.path, src.file.current(), @errorName(e));
+        err("日志配置 {s} 解析失败（{s}），继续使用上一份生效配置", .{ src.file.path, @errorName(e) });
+        return false;
+    };
+    const cfg = toml_config.decode(Config, aa, table) catch |e| {
+        backupBadConfig(src.io, src.gpa, src.file.path, src.file.current(), @errorName(e));
+        err("日志配置 {s} 字段解码失败（{s}），继续使用上一份生效配置", .{ src.file.path, @errorName(e) });
+        return false;
+    };
+
+    try applyConfig(src.io, src.gpa, cfg);
+
+    // 热加载同样自愈：外部编辑把键删了/拼错了/注释删了，也一并补齐
+    // （`file.save` 会刷新版本戳，所以不会因为自己这次重写又触发下一轮重载）
+    const audit = auditConfigText(aa, src.file.current(), table);
+    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0) {
+        repairConfigFile(src.io, src.gpa, &src.file, cfg, audit) catch |e| {
+            warn("日志配置自愈失败（{s}），继续使用当前生效配置：{s}", .{ src.file.path, @errorName(e) });
+        };
+    }
+
+    bad_config_backed = false;
+    return true;
+}
+
+/// 关闭配置来源（不再热加载）。
+pub fn closeConfigSource() void {
+    if (config_source) |*src| {
+        src.file.deinit();
+        config_source = null;
+    }
+}
+
+// ============ 自动热加载（手改配置文件即生效，不用重启）============
+//
+// 为什么必须有：配置文件的价值就是「不改代码就能调」。
+// 只提供 `reloadIfChanged` 而没人调用，等于手改配置永远不生效 ——
+// 这与 DH.NCore `Config<T>` 用 `TimerX` 每秒检查一次文件的行为不一致。
+//
+// 线程安全：
+// - `config_source` 只被本线程与 `closeConfigSource` 访问，而 `shutdown` 会**先停线程再关源**；
+// - `file_sink` 的读写/交换/释放全部走 `file_mutex`（见 useFile/closeFile/emitText/emitBatch）。
+
+/// 默认检查间隔：1000ms（未变更时只是一次 `stat`，开销可忽略）
+pub const default_reload_interval_ms: usize = 1000;
+
+var reload_thread: ?std.Thread = null;
+var reload_stop = std.atomic.Value(bool).init(true);
+/// 配置文件所在环境提供的 `Io`（`reloadIfChanged` 内部用 `config_source.io`，这里仅透传）
+var reload_io: std.Io = undefined;
+
+/// 启动自动热加载（已启动则忽略；没有加载过配置文件时不做任何事）。
+pub fn startAutoReload(interval_ms: usize) void {
+    if (reload_thread != null) return;
+    if (config_source == null) return;
+
+    const interval = if (interval_ms == 0) default_reload_interval_ms else interval_ms;
+    reload_stop.store(false, .release);
+    reload_thread = std.Thread.spawn(
+        .{ .stack_size = 128 * 1024 },
+        reloadLoop,
+        .{interval},
+    ) catch |e| {
+        reload_stop.store(true, .release);
+        reload_thread = null;
+        warn(
+            "日志配置热加载线程启动失败（{s}）：手改配置需调用 reloadNow() 或重启才生效",
+            .{@errorName(e)},
+        );
+        return;
+    };
+}
+
+/// 停止自动热加载（幂等）。
+pub fn stopAutoReload() void {
+    reload_stop.store(true, .release);
+    if (reload_thread) |t| {
+        t.join();
+        reload_thread = null;
+    }
+}
+
+/// 立即重载一次配置（返回是否真的变了）。热加载线程未启动时也可手动调。
+pub fn reloadNow() !bool {
+    if (config_source == null) return false;
+    return reloadIfChanged(reload_io);
+}
+
+fn reloadLoop(interval_ms: usize) void {
+    // 对齐 DH.NCore：`TimerScheduler` 名为 Default 时调度线程名就是 `T`，
+    // 于是这些定时回调的日志 `Name` 列会显示 `T`。
+    levels.setThreadName("T");
+
+    // 分片睡眠：既控制检查频率，又让 `stopAutoReload()` 能快速返回（最多 100ms）
+    const slice_ns: u64 = 100 * std.time.ns_per_ms;
+    var elapsed_ms: usize = 0;
+    while (!reload_stop.load(.acquire)) {
+        compat.sleep(slice_ns);
+        elapsed_ms += 100;
+        if (elapsed_ms < interval_ms) continue;
+        elapsed_ms = 0;
+        if (reload_stop.load(.acquire)) return;
+
+        _ = reloadIfChanged(reload_io) catch |e| {
+            warn("日志配置热加载失败（{s}），继续使用当前生效配置", .{@errorName(e)});
+        };
+    }
+}
+
+/// **应用入口**：启用异步日志 → 可选加载配置文件。推荐每个 Zig 应用在 `main` 开头调用。
+///
+/// ```zig
+/// pub fn main(init: std.process.Init) !void {
+///     try zzig.Logger.init(init.io, init.gpa, "Config/logger.toml");
+///     defer zzig.Logger.shutdown(); // 退出前刷写并关文件
+///     zzig.Logger.info("服务启动", .{});
+/// }
+/// ```
+///
+/// - `config_path` 为 null 时用内置默认值（只输出控制台、Info 级别）；
+/// - 配置文件缺失会**自动按模板生成**（带注释）；
+/// - 配置读取失败不致命：退回默认值并记一条 error（服务照常启动，不至于因为一个日志配置打不开）。
+pub fn init(io: std.Io, gpa: std.mem.Allocator, config_path: ?[]const u8) !void {
+    _ = startAsync(default_queue_capacity) catch |e| {
+        // 起不了线程就退化成同步写：功能不变，只是调用线程会等 IO
+        std.debug.print("[zzig.logger] [ERROR] 异步写线程创建失败（{s}），退回同步写入\n", .{@errorName(e)});
+    };
+
+    if (config_path) |p| {
+        loadConfigFile(io, gpa, p) catch |e| {
+            err("加载日志配置 {s} 失败（{s}），使用内置默认配置", .{ p, @errorName(e) });
+            applyConfig(io, gpa, .{}) catch {};
+        };
+    } else {
+        applyConfig(io, gpa, .{}) catch {};
+    }
+}
+
+/// 把坏配置另存为 `<path>.bad.<时间戳>`（只备份一次），保留现场供排查。
+fn backupBadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8, text: []const u8, reason: []const u8) void {
+    if (bad_config_backed) return;
+    bad_config_backed = true;
+
+    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    const dst = std.fmt.allocPrint(gpa, "{s}.bad.{d}", .{ path, ms }) catch return;
+    defer gpa.free(dst);
+
+    fsio.writeFileAtomic(io, gpa, dst, text) catch |e| {
+        err("坏配置备份失败（{s} → {s}）：{s}", .{ path, dst, @errorName(e) });
+        return;
+    };
+    err("日志配置损坏（{s}），已备份为 {s}；当前继续使用上一份生效配置", .{ reason, dst });
+}
 // ============ 时间偏移支持 ============
 
 /// 服务器时间偏移量（毫秒）
@@ -181,24 +862,6 @@ pub fn applyEnv(environ_map: *const std.process.Environ.Map) Level {
 
 /// 按线程号取日志行颜色（对齐 DH.NCore `ConsoleLog`）：
 /// 警告黄、错误/严重错误红，其余级别按线程号取自 10 色调色板，1 号线程灰白。
-///
-/// 返回**不含** `\x1b[` 前缀与 `m` 后缀的色号，由调用方拼接（保持 fmt 为 comptime 字面量）。
-fn colorCode(level: Level, thread_id: u32) []const u8 {
-    return switch (level) {
-        .warn => "33",
-        .err, .fatal => "31",
-        else => if (thread_id == 1) "37" else palette[thread_id % palette.len],
-    };
-}
-
-/// 调色板（顺序对齐 DH.NCore `ConsoleLog.colors`，以 ANSI 亮色/标准色近似）
-const palette = [10][]const u8{ "92", "96", "95", "97", "93", "32", "36", "35", "31", "33" };
-
-/// 当前线程 id（用作 `ThreadId` 列；取模 100 保证两位宽度）
-fn currentThreadId() u32 {
-    return @intCast(std.Thread.getCurrentId() % 100);
-}
-
 /// 将时间戳格式化为 `HH:MM:SS.mmm`（对齐 DH.NCore 行首 `Time` 列，不含日期：日期已在文件名里）。
 ///
 /// buf 至少 16 字节；返回写入的切片。
@@ -362,18 +1025,30 @@ fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
 ///
 /// `ncore` / `ncore_level` 走 DH.NCore 的 `Time ThreadId Kind Name [Level]` 形状；
 /// `legacy` 保留 zzig 早期的 `[完整时间戳] [LEVEL] ` 形状。
-fn buildPrefix(buf: *[96]u8, level: Level, thread_id: u32) []const u8 {
+fn buildPrefix(buf: *[96]u8, level: Level, thread_id: u64) []const u8 {
     switch (line_format) {
         .ncore => {
             var clock_buf: [16]u8 = undefined;
             return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} ", .{
-                formatClock(&clock_buf), thread_id, kind_normal, name_placeholder,
+                formatClock(&clock_buf), thread_id, currentKind(), currentThreadName(),
             }) catch buf[0..0];
         },
         .ncore_level => {
             var clock_buf: [16]u8 = undefined;
             return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} [{s}] ", .{
-                formatClock(&clock_buf), thread_id, kind_normal, name_placeholder, level.pascalName(),
+                formatClock(&clock_buf), thread_id, currentKind(), currentThreadName(), level.pascalName(),
+            }) catch buf[0..0];
+        },
+        .ncore_datetime => {
+            var dt_buf: [32]u8 = undefined;
+            return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} ", .{
+                formatDateTimeMs(&dt_buf), thread_id, currentKind(), currentThreadName(),
+            }) catch buf[0..0];
+        },
+        .ncore_datetime_level => {
+            var dt_buf: [32]u8 = undefined;
+            return std.fmt.bufPrint(buf, "{s} {d:0>2} {s} {s} [{s}] ", .{
+                formatDateTimeMs(&dt_buf), thread_id, currentKind(), currentThreadName(), level.pascalName(),
             }) catch buf[0..0];
         },
         .legacy => {
@@ -385,50 +1060,144 @@ fn buildPrefix(buf: *[96]u8, level: Level, thread_id: u32) []const u8 {
     }
 }
 
+/// `yyyy-MM-dd HH:mm:ss.mmm`（23 字符）。
+///
+/// 用于 `LogLineFormat` 含 `DateTime` 的场景：C# 默认只有时间（日期看文件名），
+/// 但多天日志合并分析、或日志转发到集中收集时，必须带上日期才能定位。
+fn formatDateTimeMs(buf: *[32]u8) []const u8 {
+    const nanos: i128 = compat.nanoTimestamp();
+    const offset_nanos: i128 = @as(i128, time_offset_ms) * std.time.ns_per_ms;
+    const adjusted: i128 = nanos + offset_nanos;
+
+    const timestamp: i64 = @intCast(@divFloor(adjusted, std.time.ns_per_s));
+    const nano_part: u32 = @intCast(@mod(adjusted, std.time.ns_per_s));
+    const millis: u32 = nano_part / std.time.ns_per_ms;
+
+    const local_offset: i64 = getLocalTimezoneOffset();
+    const epoch_secs: i64 = timestamp + local_offset;
+    const days = @divFloor(epoch_secs, 86400);
+    const secs_today = @mod(epoch_secs, 86400);
+
+    const hour: u32 = @intCast(@divFloor(secs_today, 3600));
+    const minute: u32 = @intCast(@divFloor(@mod(secs_today, 3600), 60));
+    const second: u32 = @intCast(@mod(secs_today, 60));
+    const date = epochDaysToDate(days);
+
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+        date.year, date.month, date.day, hour, minute, second, millis,
+    }) catch buf[0..19];
+}
+
+/// 编译期能力开关。
+///
+/// **嵌入式 / 裸机**场景下这些能力可能根本不存在（无堆、无线程、无文件系统），
+/// 所以同步路径做成**纯栈缓冲 + 零堆分配 + 不开线程**：不调 `init()`/`startAsync()`
+/// 就自动是这套模式，开箱即可用于受限环境。
+pub const build_options = struct {
+    /// 单行最大字节数。同步模式用这么大一块栈缓冲，超长部分截断（宁可截断也不能分配）。
+    pub const max_line_bytes: usize = 1024;
+    /// 异步写入是否可用（单线程目标默认关闭：没有线程就不能起写线程）
+    pub const async_available: bool = !@import("builtin").single_threaded;
+};
+
 /// 通用日志打印函数
+/// Windows 控制台输出（**栈缓冲版**，零堆分配；超长自动截断）。
+///
+/// 与 `printUtf8` 的区别：不向调用方要 allocator。同步日志路径必须能在
+/// 无堆环境（嵌入式 / 分配失败）下工作，所以统一走这里。
+fn printUtf8Stack(text: []const u8) void {
+    if (builtin.os.tag != .windows) {
+        std.debug.print("{s}", .{text});
+        return;
+    }
+
+    const w = std.os.windows;
+    const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
+    if (h == null or h == w.INVALID_HANDLE_VALUE) {
+        std.debug.print("{s}", .{text});
+        return;
+    }
+
+    // UTF-16 每码元最多 3 字节 UTF-8 → 2 倍长度足够；再加终止余量
+    var buf: [build_options.max_line_bytes * 2 + 64]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, text) catch {
+        std.debug.print("{s}", .{text});
+        return;
+    };
+
+    var written: w.DWORD = 0;
+    _ = compat.windows.writeConsoleW(h.?, buf[0..n], &written);
+}
+
+/// 输出一行**已格式化**的日志（同步路径，worker 与「未启用异步」时共用）。
+///
+/// 约定：`text` 不含换行；控制台加颜色，**文件不加颜色**（否则日志文件里全是转义字符）。
+fn emitText(level: Level, thread_id: u64, text: []const u8) void {
+    // 文件：按天滚动 + 大小拆分 + 备份清理都交给 TextFileLog
+    // 必须持锁：热加载可能正在换 sink / 关文件
+    file_mutex.lock();
+    if (file_sink) |*sink| sink.writeRawLine(level, text);
+    file_mutex.unlock();
+
+    if (!console_enabled) return;
+    const code = colorCode(level, thread_id);
+
+    if (builtin.os.tag != .windows) {
+        std.debug.print("\x1b[{s}m{s}\n\x1b[0m", .{ code, text });
+        return;
+    }
+
+    // Windows：整行一次 UTF-16 转换再 WriteConsoleW，避免逐段转换产生交错。
+    // 用定长栈缓冲（不开 arena）：日志路径不该在堆上分配。
+    var buf: [build_options.max_line_bytes + 32]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&buf);
+    fw.print("\x1b[{s}m", .{code}) catch {};
+    fw.writeAll(text) catch {};
+    fw.writeAll("\n\x1b[0m") catch {};
+    printUtf8Stack(fw.buffered());
+}
+
 fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
     // 级别过滤（对齐 DH.NCore：只输出 >= 配置级别）
     if (!enabled(level)) {
         return;
     }
 
-    // 线程安全保护
+    const thread_id = currentThreadId();
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = buildPrefix(&prefix_buf, level, thread_id);
+
+    // ---------- 异步路径：业务线程只做格式化 + 入队，绝不做 IO ----------
+    if (pending) |q| {
+        // 先格式化到**栈缓冲**，最后只做一次精确大小的 dupe 入队。
+        // 不用 `Writer.Allocating`：那样每条日志至少 2 次堆分配（增长 + toOwnedSlice），
+        // 实测 5 万条会慢到 9.7us/条，是生产端瓶颈。
+        var tmp: [build_options.max_line_bytes]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&tmp);
+        w.writeAll(prefix) catch return;
+        w.print(fmt, args) catch {}; // 超长截断，不分配
+
+        const owned = queue_alloc.dupe(u8, w.buffered()) catch return;
+        if (!q.tryPush(.{ .level = level, .thread_id = thread_id, .text = owned })) {
+            // 队列满（对端磁盘慢/控制台卡）：丢弃**新**日志而不是阻塞业务线程，
+            // 也不让内存无界增长（对齐 DH.NCore `MAX_QUEUE` 的行为）。
+            queue_alloc.free(owned);
+            _ = dropped.fetchAdd(1, .monotonic);
+        }
+        return;
+    }
+
+    // ---------- 同步路径（默认；嵌入式直接用这条）：定长栈缓冲，零堆分配 ----------
     if (thread_safe_enabled) {
         log_mutex.lock();
         defer log_mutex.unlock();
     }
-
-    const thread_id = currentThreadId();
-    var prefix_buf: [96]u8 = undefined;
-    const prefix = buildPrefix(&prefix_buf, level, thread_id);
-    const color_code = colorCode(level, thread_id);
-
-    // 非 Windows：直接写 stderr，零堆分配（无 arena、无 allocPrint）
-    // log_mutex（已在上方持有）保证同一进程内日志行不交错
-    if (builtin.os.tag != .windows) {
-        std.debug.print("\x1b[{s}m", .{color_code});
-        std.debug.print("{s}", .{prefix});
-        std.debug.print(fmt ++ "\n" ++ "\x1b[0m", args);
-        return;
-    }
-
-    // Windows：需要 UTF-16 转换，使用单个 writer 顺序组装整行，
-    // 避免先生成 message 再作为 {s} 拼接回 full_message 触发别名拷贝。
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var buffer: std.ArrayList(u8) = .empty;
-    var writer_allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
-    const writer = &writer_allocating.writer;
-
-    writer.print("\x1b[{s}m", .{color_code}) catch return;
-    writer.writeAll(prefix) catch return;
-    writer.print(fmt, args) catch return;
-    writer.writeAll("\n\x1b[0m") catch return;
-
-    buffer = writer_allocating.toArrayList();
-    printUtf8(allocator, buffer.items);
+    var line_buf: [build_options.max_line_bytes]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line_buf);
+    w.writeAll(prefix) catch {};
+    // 超长时 writeAll/print 返回 NoSpaceLeft —— 保留已写入部分（截断而不是分配）
+    w.print(fmt, args) catch {};
+    emitText(level, thread_id, w.buffered());
 }
 
 /// 调试级别日志
@@ -584,4 +1353,81 @@ test "logger：clock 前缀形状为 HH:MM:SS.mmm" {
     try testing.expectEqual(@as(u8, ':'), s[2]);
     try testing.expectEqual(@as(u8, ':'), s[5]);
     try testing.expectEqual(@as(u8, '.'), s[8]);
+}
+
+test "logger：默认模板带注释，且与 Config 默认值逐项一致（防漂移）" {
+    // 模板由 config_template_layout + Config 默认值编译期渲染，这里再解析回来比对
+    try testing.expect(std.mem.indexOf(u8, default_config_template, "# zzig 日志配置") != null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const table = try toml_config.parse(aa, default_config_template);
+    const cfg = try toml_config.decode(Config, aa, table);
+    const def: Config = .{};
+
+    try testing.expectEqualStrings(def.LogLevel, cfg.LogLevel);
+    try testing.expectEqualStrings(def.LogPath, cfg.LogPath);
+    try testing.expectEqual(def.LogFileMaxBytes, cfg.LogFileMaxBytes);
+    try testing.expectEqual(def.LogFileBackups, cfg.LogFileBackups);
+    try testing.expectEqualStrings(def.LogLineFormat, cfg.LogLineFormat);
+    try testing.expectEqual(def.LogConsole, cfg.LogConsole);
+    try testing.expectEqual(def.LogAsyncQueue, cfg.LogAsyncQueue);
+
+    // 模板必须覆盖全部配置项，且每一项都不缺（audit 应报 0 缺键、有注释）
+    const audit = auditConfigText(aa, default_config_template, table);
+    try testing.expectEqual(@as(usize, 0), audit.missing);
+    try testing.expectEqual(@as(usize, 0), audit.unknown.items.len);
+    try testing.expect(audit.has_comment);
+}
+
+test "logger：配置自愈 —— 缺键补全、补注释、多余键清理、实际值保留" {
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const base = try dir.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "logger.toml" });
+    defer testing.allocator.free(path);
+
+    // 手写裸配置：只有一项、没有注释、还带一个拼错的键
+    try fsio.writeFile(io, path, "LogLevel = \"Debug\"\nBogusKey = 1\n");
+
+    var file = try config_file.FileText.open(io, testing.allocator, path, default_config_template, .{});
+    defer file.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const table = try toml_config.parse(aa, file.current());
+
+    const audit = auditConfigText(aa, file.current(), table);
+    try testing.expect(audit.missing > 0); // 缺其它 6 项
+    try testing.expect(!audit.has_comment); // 没有注释
+    try testing.expectEqual(@as(usize, 1), audit.unknown.items.len); // BogusKey
+    try testing.expectEqualStrings("BogusKey", audit.unknown.items[0]);
+
+    const cfg = try toml_config.decode(Config, aa, table);
+    try testing.expectEqualStrings("Debug", cfg.LogLevel); // 用户实际值
+
+    try repairConfigFile(io, testing.allocator, &file, cfg, audit);
+
+    const after = try fsio.readFileAlloc(io, testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(after);
+
+    // 1) 补了注释
+    try testing.expect(std.mem.indexOf(u8, after, "# zzig 日志配置") != null);
+    // 2) 保留了用户实际值
+    try testing.expect(std.mem.indexOf(u8, after, "LogLevel = \"Debug\"") != null);
+    // 3) 缺的键都补齐了
+    const after_table = try toml_config.parse(aa, after);
+    const after_cfg = try toml_config.decode(Config, aa, after_table);
+    try testing.expectEqualStrings("Debug", after_cfg.LogLevel);
+    try testing.expectEqual((Config{}).LogAsyncQueue, after_cfg.LogAsyncQueue);
+    // 4) 多余键被清理
+    try testing.expect(std.mem.indexOf(u8, after, "BogusKey") == null);
+    // 5) 自愈前留了现场
+    const backup = try std.fmt.allocPrint(testing.allocator, "{s}.old", .{path});
+    defer testing.allocator.free(backup);
+    try testing.expect(config_file.getStamp(io, backup) != null);
 }

@@ -6,41 +6,37 @@
 //! - 同步写、互斥保护：日志频率低的常驻服务足够可靠，不引入队列/后台线程。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fsio = @import("../file/fsio.zig");
+const level_mod = @import("level.zig");
 
-pub const Level = enum(u8) {
-    debug = 0,
-    info = 1,
-    warn = 2,
-    err = 3,
-    fatal = 4,
-
-    pub fn label(self: Level) []const u8 {
-        return switch (self) {
-            .debug => "Debug",
-            .info => "Info",
-            .warn => "Warn",
-            .err => "Error",
-            .fatal => "Fatal",
-        };
-    }
-
-    fn color(self: Level) []const u8 {
-        return switch (self) {
-            .warn => "\x1b[33m",
-            .err, .fatal => "\x1b[31m",
-            .debug => "\x1b[90m",
-            .info => "\x1b[37m",
-        };
-    }
+/// 文件头**必定出现**的字段前缀（逐字对齐 C# `NewLife.Log.Logger.WriteHead`）。
+///
+/// 这份清单就是「对齐是否真的做到」的可校验契约：
+/// `tools/check-log-header.ps1` 会用它逐条断言实际输出的文件头，**缺一条就退非 0**。
+pub const header_always_fields = [_][]const u8{
+    "#Software: ", "#ProcessID: ", "#AppDomain: ", "#ApplicationType: ",
+    "#CLR: ",      "#OS: ",        "#CPU: ",       "#Date: ",
+    "#详解：",
+    "#字段: ",
+    "#Fields: ",
 };
 
+/// 依赖平台/文件系统/宿主配置、**可以缺席**的字段（缺席时整行不输出，而不是编造值）。
+pub const header_optional_fields = [_][]const u8{
+    "#FileName: ", "#BaseDirectory: ", "#CurrentDirectory: ",
+    "#TempPath: ", "#SystemStarted: ",
+};
+
+/// 日志级别（**单一来源**：`level.zig`，对齐 DH.NCore `LogLevel`）。
+///
+/// 早期这里自带一份 5 级定义，与 `logger.zig` 的级别口径不一致（`all`/`off` 缺失，
+/// 配色规则也各写一遍）。现在统一引用 `level.zig`，避免两处漂移。
+pub const Level = @import("level.zig").Level;
+
+/// 解析级别名；非法值回退 `Info`（保留旧签名以兼容既有调用）。
 pub fn parseLevel(text: []const u8) Level {
-    if (std.ascii.eqlIgnoreCase(text, "debug") or std.ascii.eqlIgnoreCase(text, "all")) return .debug;
-    if (std.ascii.eqlIgnoreCase(text, "warn") or std.ascii.eqlIgnoreCase(text, "warning")) return .warn;
-    if (std.ascii.eqlIgnoreCase(text, "err") or std.ascii.eqlIgnoreCase(text, "error")) return .err;
-    if (std.ascii.eqlIgnoreCase(text, "fatal")) return .fatal;
-    return .info;
+    return Level.parse(text) orelse .info;
 }
 
 pub const Options = struct {
@@ -52,6 +48,14 @@ pub const Options = struct {
     backups: usize = 200,
     /// 文件头 `#Software`
     software: []const u8 = "zzig",
+    /// 行格式（决定文件头 `#Fields` 列名，需与实际写入一致）
+    line_format: []const u8 = "Time|ThreadId|Kind|Name|Message",
+    /// 机器名（`#OS` 第二段）；留空则整行不输出该段信息
+    machine_name: []const u8 = "",
+    /// 用户名（`#OS` 第二段）；留空同上
+    user_name: []const u8 = "",
+    /// 临时目录（`#TempPath`）；留空则跳过该行
+    temp_path: []const u8 = "",
 };
 
 pub const TextFileLog = struct {
@@ -100,27 +104,52 @@ pub const TextFileLog = struct {
     }
 
     pub fn log(self: *TextFileLog, level: Level, comptime fmt: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.level)) return;
-
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        if (@backingInt(level) < @backingInt(self.level)) return;
 
         var line: std.Io.Writer.Allocating = .init(self.gpa);
         defer line.deinit();
 
         formatLine(self.io, &line.writer, level, fmt, args) catch return;
-        const bytes = line.written();
+        self.emit(level, line.written());
+    }
+
+    /// 写一行**已格式化好**的日志（不含换行，由这里补）。
+    ///
+    /// 供 `logger.zig` 复用：门面统一负责前缀/行格式，这里只管落盘（+ 可选控制台），
+    /// 避免两处各格式化一次导致文件与控制台格式不一致。
+    pub fn writeRawLine(self: *TextFileLog, level: Level, text: []const u8) void {
+        if (@backingInt(level) < @backingInt(self.level)) return;
+        self.emit(level, text);
+    }
+
+    fn emit(self: *TextFileLog, level: Level, bytes: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.opts.use_console) {
-            std.Io.File.stdout().writeStreamingAll(self.io, level.color()) catch {};
+            std.Io.File.stdout().writeStreamingAll(self.io, level_mod.colorCode(level, 1)) catch {};
             std.Io.File.stdout().writeStreamingAll(self.io, bytes) catch {};
-            std.Io.File.stdout().writeStreamingAll(self.io, "\x1b[0m") catch {};
+            std.Io.File.stdout().writeStreamingAll(self.io, "\n\x1b[0m") catch {};
         }
 
         self.rollIfNeeded(false) catch return;
         const f = self.file orelse return;
-        const end = f.length(self.io) catch 0;
-        self.io.vtable.fileSeekTo(self.io.userdata, f, end) catch {};
+        // 文件位置在 rollIfNeeded 打开时已定位到末尾，这里直接顺序写：
+        // 不再每条 length()+seek（那样每条日志要 3 次系统调用，是写线程的瓶颈）。
+        f.writeStreamingAll(self.io, bytes) catch {};
+        f.writeStreamingAll(self.io, "\n") catch {};
+    }
+
+    /// 一次写入**整块**已格式化日志（每行自带换行）。
+    ///
+    /// 批量落盘：写线程一次取多条拼成一块，这里只做一次系统调用。
+    pub fn writeRawBlock(self: *TextFileLog, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.rollIfNeeded(false) catch return;
+        const f = self.file orelse return;
         f.writeStreamingAll(self.io, bytes) catch {};
     }
 
@@ -151,6 +180,9 @@ pub const TextFileLog = struct {
             defer self.gpa.free(header);
             f.writeStreamingAll(self.io, header) catch {};
         }
+        // 打开后定位一次到末尾：之后所有写入都是顺序追加，
+        // 避免每条日志都 length()+seek（那是写线程的主要开销）。
+        if (len > 0) self.io.vtable.fileSeekTo(self.io.userdata, f, len) catch {};
 
         if (self.file_name) |old| self.gpa.free(old);
         self.file_name = name;
@@ -180,18 +212,111 @@ pub const TextFileLog = struct {
         return error.LogFileExhausted;
     }
 
+    /// 写文件头 —— **逐字段对齐 DH.NCore `NewLife.Log.Logger.WriteHead`**。
+    ///
+    /// C# 侧会输出 `#Software/#ProcessID/#AppDomain/#FileName/#BaseDirectory/
+    /// #CurrentDirectory/#BasePath/#TempPath/#CommandLine/#ApplicationType/#CLR/#OS/
+    /// #CPU/#Memory/#Processor/#Product/#Temperature/#GC/#ThreadPool/#SystemStarted/
+    /// #Date/#详解/#字段/#Fields`。
+    ///
+    /// 其中依赖 .NET 运行时或需注册 MachineInfo 的字段（`#BasePath`/`#Memory`/`#Processor`/
+    /// `#Product`/`#Temperature`/`#GC`/`#ThreadPool`）在 Zig 下没有等价来源，**省略**；
+    /// `#CommandLine` 需要进程启动参数，而文件日志创建时拿不到，也省略。
+    /// 其余字段全部输出，且 `#Fields` 随 `LogLineFormat` 变化（含 Level 时自动带上）。
     fn renderHeader(self: *TextFileLog) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
+        const w = &out.writer;
 
-        var date_buf: [10]u8 = undefined;
-        @memset(&date_buf, '0');
-        formatDate(&date_buf, nowMillis(self.io)) catch {};
+        // ---- 程序与进程 ----
+        w.print("#Software: {s}\r\n", .{self.opts.software}) catch {};
 
-        out.writer.print("#Software: {s}\r\n", .{self.opts.software}) catch {};
-        out.writer.print("#Date: {s}\r\n", .{date_buf}) catch {};
-        out.writer.writeAll("#Fields: Time ThreadId Kind Name Message\r\n") catch {};
-        out.writer.writeAll("#字段: 时间 线程ID 类型 名称 消息内容\r\n") catch {};
+        const pid = currentProcessId();
+        if (builtin.target.ptrBitWidth() == 64) {
+            w.print("#ProcessID: {d} x64\r\n", .{pid}) catch {};
+        } else {
+            w.print("#ProcessID: {d}\r\n", .{pid}) catch {};
+        }
+
+        // Zig 无 AppDomain 概念，对齐 DH.RustBase 的做法：用程序名近似
+        w.print("#AppDomain: {s}\r\n", .{self.opts.software}) catch {};
+
+        const exe = std.process.executablePathAlloc(self.io, self.gpa) catch null;
+        defer if (exe) |p| self.gpa.free(p);
+
+        if (exe) |p| {
+            w.print("#FileName: {s}\r\n", .{p}) catch {};
+            if (std.fs.path.dirname(p)) |dir| {
+                w.print("#BaseDirectory: {s}{c}\r\n", .{ dir, std.fs.path.sep }) catch {};
+            }
+        }
+
+        const cwd = std.process.currentPathAlloc(self.io, self.gpa) catch null;
+        defer if (cwd) |p| self.gpa.free(p);
+        if (cwd) |c| {
+            // 对齐 C#：当前目录与基准目录一致时不输出（避免噪音）
+            const same = if (exe) |p| blk: {
+                const dir = std.fs.path.dirname(p) orelse break :blk false;
+                break :blk std.mem.eql(u8, trimSep(dir), trimSep(c));
+            } else false;
+            if (!same) w.print("#CurrentDirectory: {s}\r\n", .{c}) catch {};
+        }
+
+        if (self.opts.temp_path.len > 0) {
+            w.print("#TempPath: {s}{c}\r\n", .{ trimSep(self.opts.temp_path), std.fs.path.sep }) catch {};
+        }
+
+        // ---- 运行形态 ----
+        w.print("#ApplicationType: {s}\r\n", .{applicationType()}) catch {};
+        // 对应 C# 的 `#CLR: {ver}, {target}`：Zig 没有 CLR，给出工具链版本与目标架构
+        w.print("#CLR: Zig {s}, {s}-{s}\r\n", .{
+            builtin.zig_version_string,
+            @tagName(builtin.cpu.arch),
+            @tagName(builtin.os.tag),
+        }) catch {};
+
+        // ---- 机器信息 ----
+        // 机器名/用户名/临时目录由宿主通过 `Options` 传入（Zig 无跨平台可靠来源）；
+        // 未提供时不输出该段，不编造占位符。
+        w.print("#OS: {s} {s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) }) catch {};
+        if (self.opts.machine_name.len > 0 or self.opts.user_name.len > 0) {
+            w.print(", {s}/{s}", .{
+                if (self.opts.machine_name.len > 0) self.opts.machine_name else "-",
+                if (self.opts.user_name.len > 0) self.opts.user_name else "-",
+            }) catch {};
+        }
+        w.writeAll("\r\n") catch {};
+
+        const cpus = std.Thread.getCpuCount() catch 1;
+        w.print("#CPU: {d}\r\n", .{cpus}) catch {};
+
+        if (systemStarted()) |s| w.print("#SystemStarted: {s}\r\n", .{s}) catch {};
+
+        // `#Date` 对齐 C# 的 `yyyy-MM-dd`（**不是**文件名用的 `yyyy_MM_dd`）
+        w.print("#Date: {s}\r\n", .{fileDate(self.io, '-')}) catch {};
+        w.writeAll("#详解：https://newlifex.com/core/log\r\n") catch {};
+        // `#字段` 与 C# 原文逐字一致（说明每一列的含义，是列语义的权威描述）。
+        w.writeAll("#字段: 时间 线程ID 线程池Y/网页W/普通N 线程名/任务ID/定时T/线程池P/长任务L 消息内容\r\n") catch {};
+        // Zig 侧的各值来源写清楚：谁注入、什么条件下出现（全部为真实来源，非占位）。
+        w.writeAll("#字段说明: Kind: W=Web请求(由 http 注入) T=定时回调(由 timer 注入) Y=线程池线程 P=池内任务 IO=IO线程池 L=长任务(由线程池或宿主 pushKind 标注) N=其余(默认)\r\n") catch {};
+
+        // `#Fields` 由行格式决定：`Time|ThreadId|Kind|Name|Message` → 空格分隔；
+        // 若配置里含 Level，这里也会带出 Level（与正文列数严格一致）。
+        var fields_buf: [128]u8 = undefined;
+        var fields: []u8 = undefined;
+        if (std.fmt.bufPrint(&fields_buf, "{s}", .{self.opts.line_format})) |f| {
+            fields = f;
+        } else |_| {
+            // 配置串超出缓冲：截断后照样输出（宁可截断也不静默丢列）
+            const n = @min(self.opts.line_format.len, fields_buf.len);
+            @memcpy(fields_buf[0..n], self.opts.line_format[0..n]);
+            fields = fields_buf[0..n];
+        }
+        for (fields) |*c| {
+            if (c.* == '|') c.* = ' ';
+        }
+        w.print("#Fields: {s}\r\n", .{fields}) catch {};
+
         return out.toOwnedSlice();
     }
 
@@ -267,7 +392,7 @@ pub fn formatDate(buf: *[10]u8, ts_ms: i64) !void {
     const md = yd.calculateMonthDay();
     const s = try std.fmt.bufPrint(buf, "{d:0>4}_{d:0>2}_{d:0>2}", .{
         yd.year,
-        @intFromEnum(md.month),
+        @backingInt(md.month),
         md.day_index + 1,
     });
     std.debug.assert(s.len == 10);
@@ -282,4 +407,65 @@ test "text log: 行格式字段" {
     const text = out.written();
     try testing.expect(std.mem.indexOf(u8, text, " N - hello world\n") != null);
     try testing.expect(text.len >= 22);
+}
+
+// ============ 文件头所需系统信息（能拿到才输出，拿不到就省略）============
+
+/// 去掉路径尾部路径分隔符（`C:\a\` → `C:\a`），避免 `#BaseDirectory: C:\a\\`。
+fn trimSep(p: []const u8) []const u8 {
+    var s = p;
+    while (s.len > 0 and (s[s.len - 1] == '/' or s[s.len - 1] == '\\')) s = s[0 .. s.len - 1];
+    return s;
+}
+
+/// 当前进程 id（Windows 取真实 pid；其它平台返回 0，调用方输出时如实体现）。
+fn currentProcessId() u32 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        else => 0,
+    };
+}
+
+/// 应用形态。C# 会区分 Web/Service/Console/WinForm；Zig 侧无宿主抽象，
+/// 这里如实给出 `Console`（不臆造 `Web`/`Service`）。
+fn applicationType() []const u8 {
+    return "Console";
+}
+
+threadlocal var file_date_buf: [10]u8 = undefined;
+
+/// `#Date` 用的 `yyyy-MM-dd`（**注意与文件名 `yyyy_MM_dd` 不同**，C# 就是这样）。
+fn fileDate(io: std.Io, sep: u8) []const u8 {
+    formatDate(&file_date_buf, nowMillis(io)) catch {};
+    for (&file_date_buf) |*c| {
+        if (c.* == '_') c.* = sep;
+    }
+    return &file_date_buf;
+}
+
+threadlocal var started_buf: [40]u8 = undefined;
+
+/// Windows `GetTickCount64`：系统启动至今毫秒数。
+///
+/// Zig 0.17 的 `std.os.windows` 未导出该符号，这里直接声明（x64 上就是标准调用约定）。
+const kernel32 = struct {
+    extern "kernel32" fn GetTickCount64() u64;
+};
+
+/// `#SystemStarted`：系统启动至今的时长，格式对齐 C# `TimeSpan`（`d.hh:mm:ss.fffffff`）。
+fn systemStarted() ?[]const u8 {
+    if (builtin.os.tag != .windows) return null;
+    const ms: u64 = kernel32.GetTickCount64();
+
+    const days = ms / 86_400_000;
+    const rem = ms % 86_400_000;
+    const hh = rem / 3_600_000;
+    const mm = (rem % 3_600_000) / 60_000;
+    const ss = (rem % 60_000) / 1000;
+    const milli = rem % 1000;
+
+    return if (days > 0)
+        std.fmt.bufPrint(&started_buf, "{d}.{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}0000", .{ days, hh, mm, ss, milli }) catch null
+    else
+        std.fmt.bufPrint(&started_buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}0000", .{ hh, mm, ss, milli }) catch null;
 }

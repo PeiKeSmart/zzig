@@ -5,6 +5,10 @@ zig-cache*/
 # Zig 构建输出（文档、可执行文件、库文件等）
 zig-out*/
 
+# 运行期输出：日志目录与日志表头验证产物（不入库）
+Log/
+LogCheck/
+
 # 测试产生的临时库与报告
 *.db
 *.db-journal
