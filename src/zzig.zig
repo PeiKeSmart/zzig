@@ -315,6 +315,8 @@ pub const db = struct {
     pub const duckdb = @import("db/duckdb.zig");
     /// Oracle 驱动（OCI 动态加载 oci.dll / libclntsh.so，不链客户端库）
     pub const oracle = @import("db/oracle.zig");
+    /// ODBC 驱动（动态加载 odbc32.dll / libodbc.so；覆盖 Access / SqlCe / DB2 / HANA / Firebird / 达梦 / IRIS）
+    pub const odbc = @import("db/odbc.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -341,6 +343,8 @@ pub const bson = db.bson;
 pub const duckdb = db.duckdb;
 /// 便捷别名：`zzig.oracle` == `zzig.db.oracle`
 pub const oracle = db.oracle;
+/// 便捷别名：`zzig.odbc` == `zzig.db.odbc`
+pub const odbc = db.odbc;
 
 /// 动态库加载（Windows 无 `std.DynLib`，嵌入式驱动都走这里）
 pub const dyn = @import("dyn.zig");
@@ -371,6 +375,7 @@ test {
     _ = @import("db/bson.zig");
     _ = @import("db/duckdb.zig");
     _ = @import("db/oracle.zig");
+    _ = @import("db/odbc.zig");
     _ = @import("dyn.zig");
     _ = @import("db/inline.zig");
     _ = @import("db/http_loopback_test.zig");
