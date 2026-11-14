@@ -311,6 +311,8 @@ pub const db = struct {
     pub const mongodb = @import("db/mongodb.zig");
     /// BSON 编解码（MongoDB 文档表示）
     pub const bson = @import("db/bson.zig");
+    /// DuckDB 驱动（嵌入式，动态加载 duckdb.dll / libduckdb.so）
+    pub const duckdb = @import("db/duckdb.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -333,6 +335,11 @@ pub const clickhouse = db.clickhouse;
 pub const mongodb = db.mongodb;
 /// 便捷别名：`zzig.bson` == `zzig.db.bson`
 pub const bson = db.bson;
+/// 便捷别名：`zzig.duckdb` == `zzig.db.duckdb`
+pub const duckdb = db.duckdb;
+
+/// 动态库加载（Windows 无 `std.DynLib`，嵌入式驱动都走这里）
+pub const dyn = @import("dyn.zig");
 
 /// ZIP 归档（store / deflate 两种方法；写多条目 + 读回）
 pub const zip = @import("archive/zip.zig");
@@ -358,6 +365,8 @@ test {
     _ = @import("db/mongodb.zig");
     _ = @import("db/mongodb_loopback_test.zig");
     _ = @import("db/bson.zig");
+    _ = @import("db/duckdb.zig");
+    _ = @import("dyn.zig");
     _ = @import("db/inline.zig");
     _ = @import("db/http_loopback_test.zig");
     _ = @import("archive/zip.zig");
