@@ -10,6 +10,7 @@ const std = @import("std");
 const http_server = @import("../http/server.zig");
 const tdengine = @import("tdengine.zig");
 const influxdb = @import("influxdb.zig");
+const clickhouse = @import("clickhouse.zig");
 
 const Reply = http_server.Reply;
 
@@ -23,6 +24,11 @@ const Ctx = struct {
     body_len: usize = 0,
     auth: [256]u8 = undefined,
     auth_len: usize = 0,
+    /// ClickHouse 用 `X-ClickHouse-User` / `X-ClickHouse-Key` 头鉴权
+    ch_user: [128]u8 = undefined,
+    ch_user_len: usize = 0,
+    ch_key: [128]u8 = undefined,
+    ch_key_len: usize = 0,
     method: std.http.Method = .GET,
     reply_body: []const u8 = "{}",
     status: std.http.Status = .ok,
@@ -52,6 +58,10 @@ const Ctx = struct {
         for (req.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
                 copyInto(&self.auth, &self.auth_len, h.value);
+            } else if (std.ascii.eqlIgnoreCase(h.name, "x-clickhouse-user")) {
+                copyInto(&self.ch_user, &self.ch_user_len, h.value);
+            } else if (std.ascii.eqlIgnoreCase(h.name, "x-clickhouse-key")) {
+                copyInto(&self.ch_key, &self.ch_key_len, h.value);
             }
         }
         return .{ .status = self.status, .body = self.reply_body };
@@ -249,4 +259,85 @@ test "InfluxDB 端到端：v1 InfluxQL 走 GET /query 并解析 JSON" {
 
     try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
     try std.testing.expectEqual(@as(f64, 0.5), r.rows.rows[0].values[1].asF64().?);
+}
+
+test "ClickHouse 端到端：POST /?database=&default_format=JSONCompact + 头鉴权" {
+    const a = std.testing.allocator;
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    const bound = listenAny(sio, 39421) orelse return;
+    var listener = bound.listener;
+    defer listener.deinit(sio);
+
+    var ctx = Ctx{
+        .reply_body =
+        \\{"meta":[{"name":"n","type":"UInt64"},{"name":"name","type":"String"}],
+        \\"data":[["3","天气"]],"rows":1}
+        ,
+    };
+    var server = http_server.Server{ .gpa = a, .io = sio, .ctx = @ptrCast(&ctx), .handler = Ctx.handle };
+    var lctx = Listener{ .server = &server, .listener = &listener, .io = sio, .count = 1 };
+    const th = try std.Thread.spawn(.{}, Listener.run, .{&lctx});
+
+    var conn = try clickhouse.Conn.open(a, .{
+        .host = "127.0.0.1",
+        .port = bound.port,
+        .user = "default",
+        .password = "s3cret",
+        .database = "mydb",
+    });
+    defer conn.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const r = try conn.queryAlloc(arena.allocator(), "SELECT count() AS n, name FROM t WHERE id = ?", &.{.{ .int = 7 }});
+    th.join();
+
+    // 请求侧：路径 + 查询串 + 头 + body（参数已内联）
+    try std.testing.expectEqual(std.http.Method.POST, ctx.method);
+    try std.testing.expectEqualStrings("/", ctx.pathText());
+    try std.testing.expect(std.mem.indexOf(u8, ctx.queryText(), "database=mydb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.queryText(), "default_format=JSONCompact") != null);
+    try std.testing.expectEqualStrings("default", ctx.ch_user[0..ctx.ch_user_len]);
+    try std.testing.expectEqualStrings("s3cret", ctx.ch_key[0..ctx.ch_key_len]);
+    try std.testing.expectEqualStrings("SELECT count() AS n, name FROM t WHERE id = 7", ctx.bodyText());
+
+    // 响应侧：UInt64 用字符串回 → 还原成整数
+    try std.testing.expectEqual(@as(usize, 1), r.rows.rows.len);
+    try std.testing.expectEqual(@as(i64, 3), r.rows.rows[0].values[0].asI64().?);
+    try std.testing.expectEqualStrings("天气", r.rows.rows[0].values[1].asText().?);
+    try std.testing.expectEqualStrings("n", r.rows.rows[0].names[0]);
+}
+
+test "ClickHouse 端到端：400 响应带 DB::Exception 文本 → error.HttpFailed + 原因" {
+    const a = std.testing.allocator;
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    const bound = listenAny(sio, 39451) orelse return;
+    var listener = bound.listener;
+    defer listener.deinit(sio);
+
+    var ctx = Ctx{
+        .status = .bad_request,
+        .reply_body = "Code: 62. DB::Exception: Syntax error: failed at position 1",
+    };
+    var server = http_server.Server{ .gpa = a, .io = sio, .ctx = @ptrCast(&ctx), .handler = Ctx.handle };
+    var lctx = Listener{ .server = &server, .listener = &listener, .io = sio, .count = 1 };
+    const th = try std.Thread.spawn(.{}, Listener.run, .{&lctx});
+
+    var conn = try clickhouse.Conn.open(a, .{ .host = "127.0.0.1", .port = bound.port });
+    defer conn.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    try std.testing.expectError(clickhouse.Error.HttpFailed, conn.queryAlloc(arena.allocator(), "SELEC 1", &.{}));
+    th.join();
+    try std.testing.expect(std.mem.indexOf(u8, conn.lastError(), "DB::Exception") != null);
 }

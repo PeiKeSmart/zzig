@@ -305,6 +305,8 @@ pub const db = struct {
     pub const tdengine = @import("db/tdengine.zig");
     /// InfluxDB 驱动（HTTP：Line Protocol 写入 + Flux/InfluxQL 查询）
     pub const influxdb = @import("db/influxdb.zig");
+    /// ClickHouse 驱动（HTTP 8123，`default_format=JSONCompact`）
+    pub const clickhouse = @import("db/clickhouse.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -321,6 +323,8 @@ pub const tds = db.tds;
 pub const tdengine = db.tdengine;
 /// 便捷别名：`zzig.influxdb` == `zzig.db.influxdb`
 pub const influxdb = db.influxdb;
+/// 便捷别名：`zzig.clickhouse` == `zzig.db.clickhouse`
+pub const clickhouse = db.clickhouse;
 
 /// ZIP 归档（store / deflate 两种方法；写多条目 + 读回）
 pub const zip = @import("archive/zip.zig");
@@ -342,6 +346,8 @@ test {
     _ = @import("db/tds_loopback_test.zig");
     _ = @import("db/tdengine.zig");
     _ = @import("db/influxdb.zig");
+    _ = @import("db/clickhouse.zig");
+    _ = @import("db/inline.zig");
     _ = @import("db/http_loopback_test.zig");
     _ = @import("archive/zip.zig");
     _ = @import("http/server.zig");

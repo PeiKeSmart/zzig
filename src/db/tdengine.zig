@@ -419,82 +419,9 @@ fn fromMillis(ms: i64) DateTime {
 
 // ── 参数内联 ────────────────────────────────────────────────────────────────
 
-/// 把 SQL 里的 `?` 按顺序替换成字面量（REST 通道没有预处理语句）。
-///
-/// 跳过 `'...'`（含 `''` 转义）、`"..."`、`` `...` ``、`--` 行注释、`/* */` 块注释。
-pub fn inlineParamsAlloc(a: std.mem.Allocator, sql: []const u8, params: []const Value) ![]u8 {
-    if (params.len == 0) return a.dupe(u8, sql);
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(a);
-
-    var i: usize = 0;
-    var next: usize = 0;
-    while (i < sql.len) {
-        const c = sql[i];
-        switch (c) {
-            '\'', '"', '`' => {
-                const quote = c;
-                try out.append(a, c);
-                i += 1;
-                while (i < sql.len) {
-                    try out.append(a, sql[i]);
-                    if (sql[i] == quote) {
-                        // 双写转义：`''` 表示一个引号，继续留在字符串里
-                        if (i + 1 < sql.len and sql[i + 1] == quote) {
-                            try out.append(a, sql[i + 1]);
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            },
-            '-' => {
-                if (i + 1 < sql.len and sql[i + 1] == '-') {
-                    while (i < sql.len and sql[i] != '\n') : (i += 1) try out.append(a, sql[i]);
-                } else {
-                    try out.append(a, c);
-                    i += 1;
-                }
-            },
-            '/' => {
-                if (i + 1 < sql.len and sql[i + 1] == '*') {
-                    try out.appendSlice(a, "/*");
-                    i += 2;
-                    while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) : (i += 1) try out.append(a, sql[i]);
-                    if (i + 1 < sql.len) {
-                        try out.appendSlice(a, "*/");
-                        i += 2;
-                    }
-                } else {
-                    try out.append(a, c);
-                    i += 1;
-                }
-            },
-            '?' => {
-                if (next >= params.len) {
-                    // 占位符多于参数：原样留下，让服务端去报错（比静默吞掉更可诊断）
-                    try out.append(a, '?');
-                    i += 1;
-                    continue;
-                }
-                const lit = try params[next].toSqlLiteralAlloc(a);
-                defer a.free(lit);
-                try out.appendSlice(a, lit);
-                next += 1;
-                i += 1;
-            },
-            else => {
-                try out.append(a, c);
-                i += 1;
-            },
-        }
-    }
-    return out.toOwnedSlice(a);
-}
+/// 实现已下沉到 `inline.zig`（TDengine REST 与 ClickHouse HTTP 共用）：
+/// 这两家通道都没有预处理语句，`?` 必须客户端内联成字面量。
+pub const inlineParamsAlloc = @import("inline.zig").inlineParamsAlloc;
 
 // ── 测试 ────────────────────────────────────────────────────────────────────
 
