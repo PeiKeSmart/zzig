@@ -283,6 +283,9 @@ pub const xml = @import("xml/xml.zig");
 /// 通用字符串缓冲（`std.Io.Writer.Allocating` 封装：零碎拼接少一次临时分配）
 pub const Buf = @import("text/buf.zig").Buf;
 
+/// GUID / UUID（RFC 4122 v4 文本；`guidAlloc` / `guidInto` / `isValid`）
+pub const Guid = @import("string/guid.zig");
+
 /// 通用十进制（尾数 + 缩放因子；解析/格式化/精确比较，不含算术）
 pub const Decimal = @import("number/decimal.zig").Decimal;
 
