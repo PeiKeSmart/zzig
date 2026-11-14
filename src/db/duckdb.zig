@@ -160,7 +160,7 @@ pub const Lib = struct {
     pub fn load(gpa: std.mem.Allocator) !Lib {
         const builtin = @import("builtin");
         const names: []const []const u8 = if (builtin.os.tag == .windows)
-            &.{ "duckdb.dll" }
+            &.{"duckdb.dll"}
         else if (builtin.os.tag == .macos)
             &.{ "libduckdb.dylib", "duckdb.dylib" }
         else

@@ -107,27 +107,27 @@ pub const Lib = struct {
     env_create: *const fn (*?*anyopaque, u32, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, usize, ?*?*anyopaque) callconv(.c) c_int,
     handle_alloc: *const fn (?*const anyopaque, *?*anyopaque, u32, usize, ?*?*anyopaque) callconv(.c) c_int,
     handle_free: *const fn (?*anyopaque, u32) callconv(.c) c_int,
-    server_attach: *const fn(?*anyopaque, ?*anyopaque, ?[*]const u8, i32, u32) callconv(.c) c_int,
-    server_detach: *const fn(?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
-    session_begin: *const fn(?*anyopaque, ?*anyopaque, ?*anyopaque, u32, u32) callconv(.c) c_int,
-    session_end: *const fn(?*anyopaque, ?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
-    attr_set: *const fn(?*anyopaque, u32, ?*const anyopaque, u32, u32, ?*anyopaque) callconv(.c) c_int,
-    attr_get: *const fn(?*const anyopaque, u32, ?*anyopaque, ?*u32, u32, ?*anyopaque) callconv(.c) c_int,
-    stmt_prepare: *const fn(?*anyopaque, ?*anyopaque, ?[*]const u8, u32, u32, u32) callconv(.c) c_int,
-    stmt_execute: *const fn(?*anyopaque, ?*anyopaque, ?*anyopaque, u32, u32, ?*const anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
-    stmt_fetch2: *const fn(?*anyopaque, ?*anyopaque, u32, u16, i32, u32) callconv(.c) c_int,
-    define_by_pos: *const fn(?*anyopaque, *?*anyopaque, ?*anyopaque, u32, ?*anyopaque, i32, u16, ?*anyopaque, ?*u16, ?*u16, u32) callconv(.c) c_int,
-    param_get: *const fn(?*const anyopaque, u32, ?*anyopaque, *?*anyopaque, u32) callconv(.c) c_int,
-    descriptor_free: *const fn(?*anyopaque, u32) callconv(.c) c_int,
-    error_get: *const fn(?*anyopaque, u32, ?[*]u8, ?*i32, [*]u8, u32, u32) callconv(.c) c_int,
-    trans_commit: *const fn(?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
-    trans_rollback: *const fn(?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
+    server_attach: *const fn (?*anyopaque, ?*anyopaque, ?[*]const u8, i32, u32) callconv(.c) c_int,
+    server_detach: *const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
+    session_begin: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque, u32, u32) callconv(.c) c_int,
+    session_end: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
+    attr_set: *const fn (?*anyopaque, u32, ?*const anyopaque, u32, u32, ?*anyopaque) callconv(.c) c_int,
+    attr_get: *const fn (?*const anyopaque, u32, ?*anyopaque, ?*u32, u32, ?*anyopaque) callconv(.c) c_int,
+    stmt_prepare: *const fn (?*anyopaque, ?*anyopaque, ?[*]const u8, u32, u32, u32) callconv(.c) c_int,
+    stmt_execute: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque, u32, u32, ?*const anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
+    stmt_fetch2: *const fn (?*anyopaque, ?*anyopaque, u32, u16, i32, u32) callconv(.c) c_int,
+    define_by_pos: *const fn (?*anyopaque, *?*anyopaque, ?*anyopaque, u32, ?*anyopaque, i32, u16, ?*anyopaque, ?*u16, ?*u16, u32) callconv(.c) c_int,
+    param_get: *const fn (?*const anyopaque, u32, ?*anyopaque, *?*anyopaque, u32) callconv(.c) c_int,
+    descriptor_free: *const fn (?*anyopaque, u32) callconv(.c) c_int,
+    error_get: *const fn (?*anyopaque, u32, ?[*]u8, ?*i32, [*]u8, u32, u32) callconv(.c) c_int,
+    trans_commit: *const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
+    trans_rollback: *const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
 
     /// 按「exe 目录 → 裸名字」找库；全部失败返回 `error.OracleNotAvailable`。
     pub fn load(gpa: std.mem.Allocator) !Lib {
         const builtin = @import("builtin");
         const names: []const []const u8 = if (builtin.os.tag == .windows)
-            &.{ "oci.dll" }
+            &.{"oci.dll"}
         else if (builtin.os.tag == .macos)
             &.{ "libclntsh.dylib", "libclntsh.dylib.1" }
         else
