@@ -307,6 +307,10 @@ pub const db = struct {
     pub const influxdb = @import("db/influxdb.zig");
     /// ClickHouse 驱动（HTTP 8123，`default_format=JSONCompact`）
     pub const clickhouse = @import("db/clickhouse.zig");
+    /// MongoDB 驱动（OP_MSG 线协议 + SCRAM-SHA-256；文档 API）
+    pub const mongodb = @import("db/mongodb.zig");
+    /// BSON 编解码（MongoDB 文档表示）
+    pub const bson = @import("db/bson.zig");
     /// 结果集行（各驱动共用）
     pub const Row = @import("db/row.zig").Row;
 };
@@ -325,6 +329,10 @@ pub const tdengine = db.tdengine;
 pub const influxdb = db.influxdb;
 /// 便捷别名：`zzig.clickhouse` == `zzig.db.clickhouse`
 pub const clickhouse = db.clickhouse;
+/// 便捷别名：`zzig.mongodb` == `zzig.db.mongodb`
+pub const mongodb = db.mongodb;
+/// 便捷别名：`zzig.bson` == `zzig.db.bson`
+pub const bson = db.bson;
 
 /// ZIP 归档（store / deflate 两种方法；写多条目 + 读回）
 pub const zip = @import("archive/zip.zig");
@@ -347,6 +355,9 @@ test {
     _ = @import("db/tdengine.zig");
     _ = @import("db/influxdb.zig");
     _ = @import("db/clickhouse.zig");
+    _ = @import("db/mongodb.zig");
+    _ = @import("db/mongodb_loopback_test.zig");
+    _ = @import("db/bson.zig");
     _ = @import("db/inline.zig");
     _ = @import("db/http_loopback_test.zig");
     _ = @import("archive/zip.zig");

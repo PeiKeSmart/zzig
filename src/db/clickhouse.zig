@@ -169,7 +169,7 @@ pub const Conn = struct {
             return e;
         };
 
-        const code = @intFromEnum(resp.status);
+        const code = @backingInt(resp.status);
         if (code < 200 or code >= 300) {
             self.setError("ClickHouse 返回 HTTP {d}：{s}", .{ code, truncate(resp.body, 400) });
             std.debug.print("[zzig.clickhouse] {s}\n", .{self.lastError()});
@@ -221,8 +221,8 @@ pub const Conn = struct {
             self.setError("ClickHouse 探活失败（{s}）：{s}", .{ url, @errorName(e) });
             return e;
         };
-        if (@intFromEnum(resp.status) != 200) {
-            self.setError("ClickHouse 探活返回 HTTP {d}：{s}", .{ @intFromEnum(resp.status), truncate(resp.body, 200) });
+        if (@backingInt(resp.status) != 200) {
+            self.setError("ClickHouse 探活返回 HTTP {d}：{s}", .{ @backingInt(resp.status), truncate(resp.body, 200) });
             return Error.HttpFailed;
         }
     }
