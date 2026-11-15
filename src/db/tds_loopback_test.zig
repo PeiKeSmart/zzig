@@ -521,7 +521,14 @@ fn writeSampleResult(o: *Out) !void {
 
 fn handleRpc(ctx: *Ctx, stream: std.Io.net.Stream, io: std.Io, payload: []const u8) !void {
     var p = In{ .buf = payload };
-    try p.skip(4); // AllHeaders
+    // AllHeaders 是**变长**的（客户端发 22 字节：TotalLength=22 里含 TRANSACTION_DESCRIPTOR），
+    // 必须按 TotalLength 跳，不能固定跳 4 字节（2026-11-15 改协议时踩过）。
+    const all_headers_len = std.mem.readInt(u32, payload[0..4], .little);
+    if (all_headers_len < 4 or all_headers_len > payload.len) {
+        ctx.fail("AllHeaders 的 TotalLength 不合理：{d}", .{all_headers_len});
+        return error.Protocol;
+    }
+    try p.skip(all_headers_len);
     const proc_id = try p.u16le();
     _ = try p.u16le(); // OptionFlags
     if (proc_id != 10) {

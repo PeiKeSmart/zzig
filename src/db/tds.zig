@@ -180,6 +180,28 @@ const PRE_MARS: u8 = 0x04;
 const PRE_TRACEID: u8 = 0x05;
 const PRE_TERMINATOR: u8 = 0xFF;
 
+/// TDS 7.2+ 的消息载荷（SQL batch / RPC）必须以 ALL_HEADERS 开头，**且至少带一个
+/// TRANSACTION_DESCRIPTOR 头**。22 字节的布局是 2026-11-15 用命名管道中间人
+/// 抓 sqlcmd（ODBC 17）真实字节得到的（`tools/tds_probe7.ps1`）：
+///
+/// ```
+/// 16 00 00 00   TotalLength = 22（含自身 4 字节）
+/// 12 00 00 00   HeaderLength = 18（含自身 4 字节）
+/// 02 00         HeaderType = 2 (TRANSACTION_DESCRIPTOR)
+/// 00*8          TransactionDescriptor（0 = 不在外层事务里）
+/// 00 00 01 00   OutstandingRequestCount
+/// ```
+///
+/// **不能写成 4 字节的 0**（当作「无头」）—— 服务端会回 4009 State 1
+/// 「The TDS headers contained errors」；写成 4（「有空头」）会回 4013
+/// 「stream ended unexpectedly」，因为它按 18 字节的头去读而数据不够。
+const ALL_HEADERS = [_]u8{
+    0x16, 0, 0, 0, // TotalLength = 22
+    0x12, 0, 0, 0, // HeaderLength = 18
+    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, // HeaderType + TransactionDescriptor
+    0, 0, 1, 0, // OutstandingRequestCount（**抓包就是 00 00 01 00**）
+};
+
 /// 加密档位（服务端 PRELOGIN 应答里的取值）
 const ENCRYPT_OFF: u8 = 0x00;
 const ENCRYPT_ON: u8 = 0x01;
@@ -719,16 +741,7 @@ pub const Conn = struct {
 
     fn sendBatch(self: *Conn, sql: []const u8) !void {
         self.tx.clearRetainingCapacity();
-        // TDS 7.2+ 的 SQL batch 载荷以 ALL_HEADERS 开头（4 字节总长度，0 = 无自定义头部）。
-        //
-        // **2026-11-15 实测（LocalDB 2025，命名管道）**：PRELOGIN 与 LOGIN7 已打通，
-        // 服务端能回 ENVCHANGE 5701（切库）/ 5703（语言），但**第一条 SQL batch 仍被拒**：
-        //   · 完全不写这 4 字节      → 4009 State 2（TDS headers contained errors）
-        //   · 写 0（无头，本实现）    → 4009 State 1
-        //   · 写 4（空头含自身）      → 4013 State 1（stream ended unexpectedly）
-        // 报错会随写法变化，说明服务端确实在解析这 4 字节，但具体口径尚未对。
-        // 保教写法与 go-mssqldb / FreeTDS 一致（0），待下一轮抓 sqlcmd 的真实 batch 字节再定。
-        try self.tx.appendSlice(self.gpa, &[_]u8{ 0, 0, 0, 0 });
+        try self.tx.appendSlice(self.gpa, &ALL_HEADERS);
         const units = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, sql);
         defer self.gpa.free(units);
         try self.tx.ensureUnusedCapacity(self.gpa, units.len * 2);
@@ -741,8 +754,7 @@ pub const Conn = struct {
 
     fn sendRpc(self: *Conn, sql: []const u8, params: []const Value) !void {
         self.tx.clearRetainingCapacity();
-        // AllHeaders：4 字节长度（0 = 无头部）
-        try self.tx.appendSlice(self.gpa, &[_]u8{ 0, 0, 0, 0 });
+        try self.tx.appendSlice(self.gpa, &ALL_HEADERS);
         // ProcID（系统存储过程编号）+ OptionFlags
         try appendU16le(self.gpa, &self.tx, PROC_SP_EXECUTESQL);
         try appendU16le(self.gpa, &self.tx, 0);
@@ -756,7 +768,11 @@ pub const Conn = struct {
 
         for (params, 0..) |v, i| {
             var name_buf: [16]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "@p{d}", .{i}) catch unreachable;
+            // **RPC 参数名不带 `@`**：MS-TDS 的 B_VARCHAR 名字是「裸名」，服务端自己补 `@`。
+            // 写成 `@p0` 会让服务端按 `@@p0` 去匹配，声明里是 `@p0` → 绑定失败，
+            // 真库回 8009「The incoming tabular data stream (TDS) remote procedure call (RPC)
+            // protocol stream is incorrect」（2026-11-15 实测，LocalDB 2025）。
+            const name = std.fmt.bufPrint(&name_buf, "p{d}", .{i}) catch unreachable;
             try appendParam(self.gpa, &self.tx, name, v);
         }
 
