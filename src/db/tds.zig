@@ -89,6 +89,7 @@ pub const Pipe = struct {
             lpOverlapped: ?*anyopaque,
         ) callconv(.winapi) std.os.windows.BOOL;
         extern "kernel32" fn CloseHandle(hObject: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+        extern "kernel32" fn FlushFileBuffers(hFile: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
     };
 
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -141,6 +142,11 @@ pub const Pipe = struct {
             std.debug.print("[zzig.tds] 写命名管道失败（GetLastError={d}）\n", .{code});
             return error.WriteFailed;
         }
+        // **命名管道必须 Flush**：`WriteFile` 写进去的数据可能一直留在管道缓冲区里，
+        // 不刷就对端收不到。2026-11-15 实测：不调这个，LocalDB 在收到 PRELOGIN 前就超时断开，
+        // 客户端读的时候报 `233 ERROR_PIPE_NOT_CONNECTED`（而同样的字节用 .NET 的
+        // NamedPipeClientStream + Flush 发过去就能正常拿到 PRELOGIN 应答）。
+        _ = win.FlushFileBuffers(self.handle);
         return @intCast(sent);
     }
 
@@ -171,6 +177,7 @@ const PRE_ENCRYPTION: u8 = 0x01;
 const PRE_INSTOPT: u8 = 0x02;
 const PRE_THREADID: u8 = 0x03;
 const PRE_MARS: u8 = 0x04;
+const PRE_TRACEID: u8 = 0x05;
 const PRE_TERMINATOR: u8 = 0xFF;
 
 /// 加密档位（服务端 PRELOGIN 应答里的取值）
@@ -384,6 +391,9 @@ pub const Conn = struct {
     rx: std.ArrayList(u8) = .empty,
     /// 发送缓冲（整条消息拼好后一次发）
     tx: std.ArrayList(u8) = .empty,
+    /// 封包缓冲（header + 包体），与 `tx` 分开：`sendBatch` 传进来的 payload 就是 `tx`，
+    /// 若再用 `tx` 拼包会与入参别名（`@memcpy` 直接 panic）。
+    wbuf: std.ArrayList(u8) = .empty,
     packet_size: usize = default_packet_size,
     packet_id: u8 = 0,
     server_version_buf: [64]u8 = undefined,
@@ -470,6 +480,7 @@ pub const Conn = struct {
             self.closeQuietly();
             self.rx.deinit(gpa);
             self.tx.deinit(gpa);
+            self.wbuf.deinit(gpa);
         }
 
         self.handshake(opts) catch |e| {
@@ -488,6 +499,7 @@ pub const Conn = struct {
         self.closeQuietly();
         self.rx.deinit(self.gpa);
         self.tx.deinit(self.gpa);
+        self.wbuf.deinit(self.gpa);
     }
 
     fn closeQuietly(self: *Conn) void {
@@ -525,16 +537,32 @@ pub const Conn = struct {
     // ── PRELOGIN ────────────────────────────────────────────────────────────
 
     fn prelogin(self: *Conn) !void {
-        const table_len = 4 * 5 + 1; // 5 个选项 × {token, offset, len} + 0xFF
-        const values_len = 6 + 1 + 1 + 4 + 1; // VERSION / ENCRYPTION / INSTOPT / THREADID / MARS
+        // 每个选项占 5 字节：token(1) + offset(2, big-endian) + length(2, big-endian)，
+        // 6 个选项（VERSION / ENCRYPTION / INSTOPT / THREADID / MARS / TRACEID）+ 1 字节终结符
+        // 0xFF = **31**，与首个选项登记的 offset 相等。
+        //
+        // 这里曾经写的是 `4 * 5 + 1`（=21），少算了 2 个选项的 10 字节：选项表登记的
+        // offset 全部比真实数据区小，终结符落进数据区，服务端解析直接失败并**断开管道**
+        // （Windows 233 = ERROR_PIPE_NOT_CONNECTED）。假服务端的用例不解析 PRELOGIN，
+        // 所以一直没暴露；2026-11-15 用 LocalDB 真库才抓到。
+        // 2026-11-15 又补了 TRACEID：用命名管道假服务端抓 sqlcmd 的真实 PRELOGIN（88 字节，
+        // 表长 31、VERSION = 11 0a 00 06 00 00、带 36 字节 TRACEID），按它对齐。
+        const table_len = 6 * 5 + 1;
+        const values_len = 6 + 1 + 1 + 4 + 1 + 36; // VERSION / ENCRYPTION / INSTOPT / THREADID / MARS / TRACEID
         var payload: [table_len + values_len]u8 = undefined;
         @memset(&payload, 0);
 
         var off: usize = table_len;
         var i: usize = 0;
 
-        // VERSION：UL_VERSION(4) + US_SUBBUILD(2)，全 0 表示「客户端不关心」
+        // VERSION：UL_VERSION(4) + US_SUBBUILD(2)。
+        // 实测 sqlcmd（ODBC 17）填的是 17.10.6.0；**不能填全 0**，那样不像一个真实的
+        // 客户端版本声明，服务端行为不可依赖。
         i = writePreloginEntry(&payload, i, PRE_VERSION, off, 6);
+        payload[off + 0] = 0x11; // major 17
+        payload[off + 1] = 0x0a; // minor 10
+        payload[off + 2] = 0x00; // build hi
+        payload[off + 3] = 0x06; // build lo
         off += 6;
 
         // ENCRYPTION：0 = 只接受明文（本驱动未实现 TLS）
@@ -553,6 +581,11 @@ pub const Conn = struct {
         i = writePreloginEntry(&payload, i, PRE_MARS, off, 1);
         payload[off] = 0;
         off += 1;
+
+        // TRACEID：GUID(16) + ActivityId(20)，全 0 表示「不关联任何 trace」。
+        // sqlcmd 会填一段随机 GUID，这里保持全 0 即可（只为把选项表填满、布局对齐）。
+        i = writePreloginEntry(&payload, i, PRE_TRACEID, off, 36);
+        off += 36;
 
         payload[i] = PRE_TERMINATOR;
 
@@ -686,6 +719,16 @@ pub const Conn = struct {
 
     fn sendBatch(self: *Conn, sql: []const u8) !void {
         self.tx.clearRetainingCapacity();
+        // TDS 7.2+ 的 SQL batch 载荷以 ALL_HEADERS 开头（4 字节总长度，0 = 无自定义头部）。
+        //
+        // **2026-11-15 实测（LocalDB 2025，命名管道）**：PRELOGIN 与 LOGIN7 已打通，
+        // 服务端能回 ENVCHANGE 5701（切库）/ 5703（语言），但**第一条 SQL batch 仍被拒**：
+        //   · 完全不写这 4 字节      → 4009 State 2（TDS headers contained errors）
+        //   · 写 0（无头，本实现）    → 4009 State 1
+        //   · 写 4（空头含自身）      → 4013 State 1（stream ended unexpectedly）
+        // 报错会随写法变化，说明服务端确实在解析这 4 字节，但具体口径尚未对。
+        // 保教写法与 go-mssqldb / FreeTDS 一致（0），待下一轮抓 sqlcmd 的真实 batch 字节再定。
+        try self.tx.appendSlice(self.gpa, &[_]u8{ 0, 0, 0, 0 });
         const units = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, sql);
         defer self.gpa.free(units);
         try self.tx.ensureUnusedCapacity(self.gpa, units.len * 2);
@@ -730,23 +773,32 @@ pub const Conn = struct {
     fn writeMessage(self: *Conn, pkt_type: u8, payload: []const u8) !void {
         self.packet_id = 1;
         const max_chunk = self.packet_size - 8;
+        // **包必须拼好后一次写出**：命名管道是**消息模式**，每次 `WriteFile` 是**一条独立消息**。
+        // 早先把 8 字节包头与包体分两次写，服务端收到第一条消息就只有 8 字节，
+        // 而包头里声明的长度是 88 → 直接判定协议错并断开管道，客户端随后读到
+        // `233 ERROR_PIPE_NOT_CONNECTED`（2026-11-15 实测：同一份字节用一次 WriteFile 发过去，
+        // 服务端立刻回 PRELOGIN 应答；分成两次写就断）。TCP 不区分消息边界，所以只有命名管道踩到。
+        self.wbuf.clearRetainingCapacity();
         var off: usize = 0;
         while (true) {
             const chunk = @min(payload.len - off, max_chunk);
             const is_last = off + chunk >= payload.len;
-            var hdr: [8]u8 = undefined;
+            try self.wbuf.ensureUnusedCapacity(self.gpa, 8 + chunk);
+            const hdr_at = self.wbuf.items.len;
+            self.wbuf.appendNTimesAssumeCapacity(0, 8);
+            const hdr = self.wbuf.items[hdr_at..][0..8];
             hdr[0] = pkt_type;
             hdr[1] = if (is_last) STATUS_EOM else 0;
             std.mem.writeInt(u16, hdr[2..4], @intCast(8 + chunk), .big);
             std.mem.writeInt(u16, hdr[4..6], 0, .big);
             hdr[6] = self.packet_id;
             hdr[7] = 0;
-            try self.writeRaw(&hdr);
-            if (chunk > 0) try self.writeRaw(payload[off..][0..chunk]);
+            self.wbuf.appendSliceAssumeCapacity(payload[off..][0..chunk]);
             self.packet_id +%= 1;
             off += chunk;
             if (is_last) break;
         }
+        try self.writeRaw(self.wbuf.items);
     }
 
     fn readMessage(self: *Conn) !Message {
@@ -1569,22 +1621,41 @@ pub fn buildLogin7(gpa: std.mem.Allocator, opts: Options, packet_size: u16) ![]u
     var extra: std.ArrayList(u8) = .empty;
     defer extra.deinit(gpa);
 
+    // **偏移槽位必须严格按 MS-TDS 2.2.6.4 的固定布局**（2026-11-15 用 sqlcmd 抓包逐字节核对）：
+    //   36 ibHostName / 40 ibUserName / 44 ibPassword / 48 ibAppName / 52 ibServerName /
+    //   **56 ibExtension** / 60 ibCltIntName / 64 ibLanguage / 68 ibDatabase /
+    //   72 ClientID(6) / 78 ibSSPI / 82 ibAtchDBFile / 86 ibChangePassword / 90 cbSSPILong。
+    // 早先把 Extension 写成 slot 60，整张表从这一项起错位 4 字节：CltIntName 变成空、
+    // Language 变成 "Zig-ZCode"、Database 变成空 → 服务端拒绝登录并**直接断开管道**
+    // （客户端读到 233），且不返回 ERROR token，不查服务端错误日志基本无从下手。
     try appendLoginField(gpa, &head, &extra, 36, "pek-zcode", false); // HostName
     try appendLoginField(gpa, &head, &extra, 40, opts.user, false); // UserName
     try appendLoginField(gpa, &head, &extra, 44, opts.password, true); // Password
     try appendLoginField(gpa, &head, &extra, 48, opts.app_name, false); // AppName
     try appendLoginField(gpa, &head, &extra, 52, opts.host, false); // ServerName
-    try appendLoginField(gpa, &head, &extra, 60, "", false); // Extension（空）
-    try appendLoginField(gpa, &head, &extra, 64, "Zig-ZCode", false); // CltIntName
-    try appendLoginField(gpa, &head, &extra, 68, "", false); // Language
-    try appendLoginField(gpa, &head, &extra, 72, opts.database, false); // Database
+    try appendLoginField(gpa, &head, &extra, 56, "", false); // Extension（空）
+    try appendLoginField(gpa, &head, &extra, 60, "Zig-ZCode", false); // CltIntName
+    try appendLoginField(gpa, &head, &extra, 64, "", false); // Language
+    try appendLoginField(gpa, &head, &extra, 68, opts.database, false); // Database
 
-    std.mem.writeInt(u32, head[4..8], tds_version_74, .big);
+    // **端序口径（2026-11-15 用 sqlcmd 抓包实测确认，不要凭记忆改）**：
+    //   Length / TDSVersion / PacketSize / ClientPID / ConnectionID 全部是**小端**。
+    //   抓到的字节：`1f 01 00 00`(Length=287) / `04 00 00 74`(TDSVersion=0x74000004) /
+    //   `00 10 00 00`(PacketSize=4096)。
+    //   早先把 TDSVersion 和 PacketSize 当大端写，字节变成 `74 00 00 04` / `00 00 10 00`，
+    //   PacketSize 被服务端读成 1048576（超 512–32767）→ **不返 ERROR token 而是直接断开管道**，
+    //   客户端只能读到 233 ERROR_PIPE_NOT_CONNECTED。
+    std.mem.writeInt(u32, head[4..8], tds_version_74, .little);
     std.mem.writeInt(u32, head[8..12], packet_size, .little);
-    head[24] = 0x20; // OptionFlags1：fUseDB（要求服务端切到 Database 字段指定的库）
-    head[25] = 0x00; // OptionFlags2：不走集成认证
+    // OptionFlags1 = 0xE0（fUseDB | fSetLang | fLanguage），与 sqlcmd 一致：
+    // 置 fUseDB 服务端才会切到 Database 字段指定的库。
+    head[24] = 0xE0;
+    // OptionFlags2 = 0x03（fLanguage | fODBC），与 sqlcmd 一致
+    head[25] = 0x03;
     head[26] = 0x00; // TypeFlags：SQL 类型
-    head[27] = 0x00; // OptionFlags3：无扩展、不改密码
+    // OptionFlags3 = 0x00：不置 fExtension。置了就必须同时给 Extension 的 offset/长度，
+    // 否则服务端会去解析空的扩展列表。TDS 7.4 不带扩展是合法的（FreeTDS / go-mssqldb 同口径）。
+    head[27] = 0x00;
     // ClientID（6 字节）留 0：仅用于服务端审计，不参与鉴权
 
     const total = head.len + extra.items.len;
@@ -1776,9 +1847,15 @@ test "TDS LOGIN7 载荷：长度、版本、字段偏移与密码混淆" {
     defer a.free(payload);
 
     try std.testing.expectEqual(@as(u32, @intCast(payload.len)), std.mem.readInt(u32, payload[0..4], .little));
-    try std.testing.expectEqual(@as(u32, 0x7400_0004), std.mem.readInt(u32, payload[4..8], .big));
+    // TDSVersion **小端**（0x74000004 写成 `04 00 00 74`，与 sqlcmd 抓包一致）
+    try std.testing.expectEqual(@as(u32, 0x7400_0004), std.mem.readInt(u32, payload[4..8], .little));
     try std.testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, payload[8..12], .little));
-    try std.testing.expectEqual(@as(u8, 0x20), payload[24]);
+    // OptionFlags1 = 0xE0（fUseDB | fSetLang | fLanguage），与 sqlcmd 一致
+    try std.testing.expectEqual(@as(u8, 0xE0), payload[24]);
+    // OptionFlags2 = 0x03（fLanguage | fODBC）
+    try std.testing.expectEqual(@as(u8, 0x03), payload[25]);
+    // OptionFlags3 = 0：不置 fExtension（置了就必須同时给 Extension 的偏移/长度）
+    try std.testing.expectEqual(@as(u8, 0x00), payload[27]);
 
     // UserName：2 个字符，首个 UTF-16 码元是 's'
     const user_off: usize = std.mem.readInt(u16, payload[40..42], .little);
@@ -1795,8 +1872,9 @@ test "TDS LOGIN7 载荷：长度、版本、字段偏移与密码混淆" {
         try std.testing.expectEqual(expect_text[i], deobfuscatePasswordByte(payload[pw_off + i * 2]));
     }
 
-    const db_off: usize = std.mem.readInt(u16, payload[72..74], .little);
-    const db_len: usize = std.mem.readInt(u16, payload[74..76], .little);
+    // Database 在 slot **68**（56 是 Extension，60 CltIntName，64 Language）
+    const db_off: usize = std.mem.readInt(u16, payload[68..70], .little);
+    const db_len: usize = std.mem.readInt(u16, payload[70..72], .little);
     try std.testing.expectEqual(@as(usize, 6), db_len);
     try std.testing.expectEqual(@as(u16, 'm'), std.mem.readInt(u16, payload[db_off..][0..2], .little));
 }

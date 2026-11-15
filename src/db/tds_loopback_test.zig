@@ -356,7 +356,8 @@ fn captureLogin(ctx: *Ctx, payload: []const u8) !void {
         ctx.fail("LOGIN7 载荷太短：{d}", .{payload.len});
         return error.Protocol;
     }
-    ctx.login_tds_version = std.mem.readInt(u32, payload[4..8], .big);
+    // TDSVersion **小端**（0x74000004 → `04 00 00 74`，2026-11-15 用 sqlcmd 抓包核对）
+    ctx.login_tds_version = std.mem.readInt(u32, payload[4..8], .little);
     ctx.login_packet_size = std.mem.readInt(u32, payload[8..12], .little);
     ctx.login_option_flags1 = payload[24];
 
@@ -375,9 +376,9 @@ fn captureLogin(ctx: *Ctx, payload: []const u8) !void {
     for (0..pw_len * 2) |i| plain_buf[i] = deobfuscate(payload[pw_off + i]);
     ctx.login_password_len = try utf16ToBuf(&ctx.login_password, plain_buf[0 .. pw_len * 2]);
 
-    // Database（72..76）
-    const db_off: usize = std.mem.readInt(u16, payload[72..74], .little);
-    const db_len: usize = std.mem.readInt(u16, payload[74..76], .little);
+    // Database（**68..72**；56 是 Extension、60 CltIntName、64 Language）
+    const db_off: usize = std.mem.readInt(u16, payload[68..70], .little);
+    const db_len: usize = std.mem.readInt(u16, payload[70..72], .little);
     if (db_off + db_len * 2 > payload.len) return error.Protocol;
     ctx.login_database_len = try utf16ToBuf(&ctx.login_database, payload[db_off..][0 .. db_len * 2]);
 }
@@ -410,7 +411,15 @@ fn writeErrorToken(o: *Out, number: u32, msg: []const u8) !void {
 }
 
 fn handleBatch(ctx: *Ctx, stream: std.Io.net.Stream, io: std.Io, payload: []const u8) !void {
-    ctx.batch_sql_len = try utf16ToBuf(&ctx.batch_sql, payload);
+    // TDS 7.2+ 的 SQL batch 载荷以 ALL_HEADERS 开头：前 4 字节是头总长（0 = 无自定义头）。
+    // 假服务端也必须跳过它，否则会把 `04 00 00 00` 混进 SQL 文本（2026-11-15 补上后
+    // 才暴露出「期望 ZCodeTest… 实际只剩中文」的错位）。
+    var body = payload;
+    if (payload.len >= 4) {
+        const hdr_len = std.mem.readInt(u32, payload[0..4], .little);
+        if (hdr_len >= 4 and hdr_len <= payload.len) body = payload[hdr_len..] else body = payload[4..];
+    }
+    ctx.batch_sql_len = try utf16ToBuf(&ctx.batch_sql, body);
     const sql = ctx.batch_sql[0..ctx.batch_sql_len];
 
     var o = Out{ .a = std.heap.page_allocator };
@@ -656,7 +665,8 @@ test "TDS 回环：登录字段 / SQL 批处理 / 结果集解码 / RPC 带参 /
     // ① 登录字段（含密码解混淆）
     try std.testing.expectEqual(@as(u32, 0x7400_0004), ctx.login_tds_version);
     try std.testing.expectEqual(@as(u32, 4096), ctx.login_packet_size);
-    try std.testing.expectEqual(@as(u8, 0x20), ctx.login_option_flags1); // fUseDB
+    // fUseDB(0x20) | fSetLang(0x40) | fLanguage(0x80) = 0xE0，与 sqlcmd 抓包一致
+    try std.testing.expectEqual(@as(u8, 0xE0), ctx.login_option_flags1);
     try std.testing.expectEqualStrings(user, ctx.login_user[0..ctx.login_user_len]);
     try std.testing.expectEqualStrings(password, ctx.login_password[0..ctx.login_password_len]);
     try std.testing.expectEqualStrings(database, ctx.login_database[0..ctx.login_database_len]);
