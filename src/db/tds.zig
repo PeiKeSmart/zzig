@@ -199,7 +199,7 @@ const ALL_HEADERS = [_]u8{
     0x16, 0, 0, 0, // TotalLength = 22
     0x12, 0, 0, 0, // HeaderLength = 18
     0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, // HeaderType + TransactionDescriptor
-    0, 0, 1, 0, // OutstandingRequestCount（**抓包就是 00 00 01 00**）
+    1, 0, 0, 0, // OutstandingRequestCount（抓包就是 01 00 00 00）
 };
 
 /// 加密档位（服务端 PRELOGIN 应答里的取值）
@@ -216,6 +216,10 @@ const TOK_LOGINACK: u8 = 0xAD;
 const TOK_ROW: u8 = 0xD1;
 const TOK_NBCROW: u8 = 0xD2;
 const TOK_ENVCHANGE: u8 = 0xE3;
+/// ORDER：`ORDER BY` 时服务端在 COLMETADATA 之后发它，
+/// Length(2, LE 后面字节数) + 每列 1 字节（bit0 = fDescending）。
+/// 不处理会报「未识别的 TDS 令牌 0xA9」（2026-11-15 真库实测）。
+const TOK_ORDER: u8 = 0xA9;
 const TOK_DONE: u8 = 0xFD;
 const TOK_DONEPROC: u8 = 0xFE;
 const TOK_DONEINPROC: u8 = 0xFF;
@@ -717,8 +721,16 @@ pub const Conn = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        const r = self.run("SELECT SCOPE_IDENTITY()", &.{}, arena.allocator(), true) catch |e| {
-            std.debug.print("[zzig.tds] 取 SCOPE_IDENTITY() 失败（不影响写入）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
+        // **用 `@@IDENTITY` 而不是 `SCOPE_IDENTITY()`**：后者只在**同一批次**内有效，
+        // 而本驱动是「先发 INSERT，再单独发一条查询」，两次请求属于不同 scope → 恒为 NULL
+        // （2026-11-15 真库实测：insert 成功但 `id > 0` 断言失败、`lastInsertId()` 恒 0）。
+        // `@@IDENTITY` 是**连接级**的，下一次请求仍有效；代价是表上有触发器时会被触发器
+        // 的插入覆盖 —— 本仓生成的表不带触发器，先按这个口径；将来要支持触发器再改成
+        // 「INSERT 与 identity 查询拼进同一批次」。
+        // 另外必须 CAST：`@@IDENTITY` 的类型是 `numeric(38,0)`，TDS 上是 DECIMALNT，
+        // 本驱动解成 `.decimal` 时 `asI64()` 取不到值。
+        const r = self.run("SELECT CAST(@@IDENTITY AS bigint)", &.{}, arena.allocator(), true) catch |e| {
+            std.debug.print("[zzig.tds] 取 @@IDENTITY 失败（不影响写入）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
             return;
         };
         switch (r) {
@@ -755,6 +767,13 @@ pub const Conn = struct {
     fn sendRpc(self: *Conn, sql: []const u8, params: []const Value) !void {
         self.tx.clearRetainingCapacity();
         try self.tx.appendSlice(self.gpa, &ALL_HEADERS);
+        // RPC 在 ALL_HEADERS 之后还有 **2 字节 0xFF 0xFF**，然后才是 ProcID/OptionFlags。
+        // 这是 2026-11-15 用中间人抓 `System.Data.SqlClient` 的参数化查询字节时发现的
+        // （`tools/tds_probe8.ps1`）：抓到的序列是
+        //   [0..22] 22 字节 ALL_HEADERS | ff ff | 0a 00(ProcID=10) | 02 00(OptionFlags) | 参数…
+        // 当时把 ProcID 直接接在 ALL_HEADERS 后面，服务端就从错误的位置开始读参数，
+        // 报 8009「Parameter 1 (""): Data type 0x53 is unknown」（0x53 是 SQL 文本的首字母 'S'）。
+        try self.tx.appendSlice(self.gpa, &[_]u8{ 0xFF, 0xFF });
         // ProcID（系统存储过程编号）+ OptionFlags
         try appendU16le(self.gpa, &self.tx, PROC_SP_EXECUTESQL);
         try appendU16le(self.gpa, &self.tx, 0);
@@ -768,11 +787,11 @@ pub const Conn = struct {
 
         for (params, 0..) |v, i| {
             var name_buf: [16]u8 = undefined;
-            // **RPC 参数名不带 `@`**：MS-TDS 的 B_VARCHAR 名字是「裸名」，服务端自己补 `@`。
-            // 写成 `@p0` 会让服务端按 `@@p0` 去匹配，声明里是 `@p0` → 绑定失败，
-            // 真库回 8009「The incoming tabular data stream (TDS) remote procedure call (RPC)
-            // protocol stream is incorrect」（2026-11-15 实测，LocalDB 2025）。
-            const name = std.fmt.bufPrint(&name_buf, "p{d}", .{i}) catch unreachable;
+            // **参数名要带 `@`**：2026-11-15 用中间人抓 `System.Data.SqlClient` 的 RPC 字节，
+            // 第 3 个参数的字节是 `03 | 40 00 70 00 30 00 | 00 | 26 08 08 ...`，
+            // 即名字长度 3、内容 `@p0`（含 `@`）。之前误以为要「裸名」而去掉 `@`，
+            // 服务端就回 8178「expects the parameter '@p0', which was not supplied」。
+            const name = std.fmt.bufPrint(&name_buf, "@p{d}", .{i}) catch unreachable;
             try appendParam(self.gpa, &self.tx, name, v);
         }
 
@@ -1009,6 +1028,11 @@ pub const Conn = struct {
                 TOK_ENVCHANGE => {
                     const len = try p.u16le();
                     try p.skip(len);
+                },
+                TOK_ORDER => {
+                    // 排序信息与实际行数据无关（行顺序已由服务端排好），跳过即可
+                    const n = try p.u16le();
+                    try p.skip(n);
                 },
                 TOK_LOGINACK => {
                     const len = try p.u16le();

@@ -529,6 +529,13 @@ fn handleRpc(ctx: *Ctx, stream: std.Io.net.Stream, io: std.Io, payload: []const 
         return error.Protocol;
     }
     try p.skip(all_headers_len);
+    // RPC 在 ALL_HEADERS 之后还有 2 字节 0xFF 0xFF（抓 `System.Data.SqlClient` 得到），
+    // 之后才是 ProcID / OptionFlags。
+    if (payload.len < all_headers_len + 4) {
+        ctx.fail("RPC 载荷太短：{d}", .{payload.len});
+        return error.Protocol;
+    }
+    try p.skip(2);
     const proc_id = try p.u16le();
     _ = try p.u16le(); // OptionFlags
     if (proc_id != 10) {
