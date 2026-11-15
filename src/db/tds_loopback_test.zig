@@ -4,7 +4,7 @@
 //! 按「不能猜」的规矩，凡是没有真库验证的部分一律不写进文档当结论。这里覆盖的是**客户端状态机**：
 //! PRELOGIN 协商、LOGIN7 字段组装（含密码混淆）、SQL 批处理的 UTF-16LE 编码、
 //! RPC `sp_executesql` 的参数编码（INTN / NVARCHAR PLP / NULL）、
-//! COLMETADATA / ROW / DONE / ERROR 令牌解析、`SCOPE_IDENTITY()` 回写。
+//! COLMETADATA / ROW / DONE / ERROR 令牌解析、`CAST(@@IDENTITY AS bigint)` 回写。
 //!
 //! 假服务端是**确定性**的：同样的输入永远给同样的输出，断言写死具体值。
 //! 服务端侧的类型编码（PLP / 定长 / 长度前缀）是**独立按协议手写**的，不复用驱动里的函数，
@@ -425,18 +425,19 @@ fn handleBatch(ctx: *Ctx, stream: std.Io.net.Stream, io: std.Io, payload: []cons
     var o = Out{ .a = std.heap.page_allocator };
     defer o.deinit();
 
-    if (std.mem.startsWith(u8, sql, "SELECT SCOPE_IDENTITY()")) {
-        // 单列 decimal(38,0)，值 7
+    // 驱动现在发的是 `SELECT CAST(@@IDENTITY AS bigint)`：`SCOPE_IDENTITY()` 是批次级作用域，
+    // 本驱动 INSERT 与 identity 查询分两次发，真库上会恒为 NULL（2026-11-15 实测）。
+    // 返回 **INTN(8)** 而不是 DECIMALN，与 `CAST(... AS bigint)` 对应。
+    if (std.mem.indexOf(u8, sql, "@@IDENTITY") != null) {
         try o.u8v(0x81);
         try o.u16v(1);
         try o.u32v(0); // UserType
         try o.u16v(0); // Flags
-        try o.bytes(&[_]u8{ 0x6A, 0x11, 0x26, 0x00 }); // DECIMALN(38,0)
+        try o.bytes(&[_]u8{ 0x26, 0x08 }); // INTN, MaxLen=8
         try o.bVarChar("");
         try o.u8v(0xD1);
-        try o.u8v(2); // 值长度 = 符号 + 1 字节尾数
-        try o.u8v(1); // 正
-        try o.u8v(7);
+        try o.u8v(8); // 值长度 = 8（bigint 是 INTN(8)，不是 DECIMALN 的 2 字节）
+        try o.bytes(&[_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 }); // 值 = 7（小端 int64）
         try writeDone(&o, 0x10, 1); // DONE_COUNT
     } else if (std.mem.startsWith(u8, sql, "INSERT")) {
         try writeDone(&o, 0x10, 1);
