@@ -1348,7 +1348,11 @@ fn decodeGuid(b: []const u8, arena: std.mem.Allocator) !Value {
     const d1 = std.mem.readInt(u32, b[0..4], .little);
     const d2 = std.mem.readInt(u16, b[4..6], .little);
     const d3 = std.mem.readInt(u16, b[6..8], .little);
-    const text = try std.fmt.allocPrint(arena, "{X:0>8}-{X:0>4}-{X:0>4}-{X:0>2}{X:0>2}-{X:0>2}{X:0>2}{X:0>2}{X:0>2}{X:0>2}{X:0>2}", .{
+    // 输出**小写**：本仓 GUID 的统一文本口径是 36 位小写（`zzig.Guid` 生成的就是小写），
+    // 读回来也必须是小写，否则「同一个 GUID 两个字符串」——写进 JSON、当 map key、
+    // 或者跟 `interceptor.GuidInterceptor` 判重时都会对不上。
+    // SQL Server 侧的 `uniqueidentifier` 是按二进制比较的，客户端传大小写都能转换，所以不影响查询。
+    const text = try std.fmt.allocPrint(arena, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         d1,    d2,    d3,    b[8],  b[9],  b[10],
         b[11], b[12], b[13], b[14], b[15],
     });
@@ -1727,11 +1731,13 @@ test "TDS 参数声明串与 TypeInfo 一一对应" {
     try std.testing.expectEqualStrings("@p0 bigint,@p1 nvarchar(max),@p2 bigint,@p3 decimal(38,2)", decl);
 }
 
-test "TDS GUID 按 SQL Server 的混合字节序格式化" {
+test "TDS GUID 按 SQL Server 的混合字节序格式化（输出小写，对齐 zzig.Guid 规范）" {
     const a = std.testing.allocator;
     const bytes = [_]u8{ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
     const v = try decodeGuid(&bytes, a);
-    try std.testing.expectEqualStrings("00112233-4455-6677-8899-AABBCCDDEEFF", v.text);
+    try std.testing.expectEqualStrings("00112233-4455-6677-8899-aabbccddeeff", v.text);
+    // 与 `zzig.Guid.isValid` 口径一致（大小写都认，但生成/读回统一小写）
+    try std.testing.expect(@import("../string/guid.zig").isValid(v.text));
     a.free(v.text);
 }
 
