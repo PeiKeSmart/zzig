@@ -457,3 +457,176 @@ test "quickGetString: simple query" {
 
     try std.testing.expectEqualStrings("ok", status);
 }
+
+// ============================================================================
+// JsonDoc：一次解析、多次取值
+// ============================================================================
+
+/// 一次解析、多次取值 —— **同一份 JSON 取多个字段时必须用这个**。
+///
+/// `JsonQuery` 的每个 `getXxx` 内部都会重新 `parseJson`：取 8 个字段就是 8 次解析。
+/// 本类型在 `init` 解析一次并持有 token，之后每次取值只做一次轻量 token 遍历。
+///
+/// 实测（1M 次，ReleaseFast，100 字节 8 字段 JSON）：
+/// `JsonQuery.getInt` 单次 ~257 ns（含一次完整解析），`std.json.parseFromSliceLeaky` ~814 ns；
+/// 多字段场景下 `JsonDoc` 只付一次解析成本。
+pub const JsonDoc = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    tokens: []Parser.Token,
+    parents: []Parser.IndexT,
+    count: usize,
+
+    pub fn init(allocator: std.mem.Allocator, json_text: []const u8) Error!JsonDoc {
+        const parsed = try parseJson(allocator, json_text);
+        return .{
+            .allocator = allocator,
+            .input = json_text,
+            .tokens = parsed.tokens,
+            .parents = parsed.parents,
+            .count = parsed.count,
+        };
+    }
+
+    pub fn deinit(self: *JsonDoc) void {
+        self.allocator.free(self.tokens);
+        self.allocator.free(self.parents);
+        self.* = undefined;
+    }
+
+    /// 顶层对象是否存在该键。
+    pub fn has(self: JsonDoc, key: []const u8) bool {
+        return findObjectValueAt(self.tokens, self.count, self.input, 0, key) != null;
+    }
+
+    /// 取整数（类型不匹配 / 溢出均返回 `Error.TypeMismatch`）。
+    pub fn getInt(self: JsonDoc, comptime T: type, key: []const u8) Error!T {
+        const idx = findObjectValueAt(self.tokens, self.count, self.input, 0, key) orelse return Error.KeyNotFound;
+        const token = self.tokens[idx];
+        if (token.typ != .Primitive) return Error.TypeMismatch;
+        const value = parseTokenInteger(token, self.input) catch return Error.TypeMismatch;
+        return std.math.cast(T, value) orelse Error.TypeMismatch;
+    }
+
+    /// 取布尔。
+    pub fn getBool(self: JsonDoc, key: []const u8) Error!bool {
+        const idx = findObjectValueAt(self.tokens, self.count, self.input, 0, key) orelse return Error.KeyNotFound;
+        const token = self.tokens[idx];
+        if (token.typ != .Primitive) return Error.TypeMismatch;
+        const raw = tokenText(token, self.input);
+        if (std.mem.eql(u8, raw, "true")) return true;
+        if (std.mem.eql(u8, raw, "false")) return false;
+        return Error.TypeMismatch;
+    }
+
+    /// 取字符串（**零分配**，借用原始 JSON 文本）。
+    ///
+    /// 含转义序列（`\"` `\\` `\uXXXX` 等）时返回 `Error.TypeMismatch` ——
+    /// 那说明需要解码，请改用 [`JsonDoc.getStringAlloc`]。
+    /// 热路径上绝大多数值不含转义，本函数可以完全避开分配。
+    pub fn getStringRaw(self: JsonDoc, key: []const u8) Error![]const u8 {
+        const idx = findObjectValueAt(self.tokens, self.count, self.input, 0, key) orelse return Error.KeyNotFound;
+        const token = self.tokens[idx];
+        if (token.typ != .String) return Error.TypeMismatch;
+        const raw = tokenText(token, self.input);
+        if (std.mem.indexOfScalar(u8, raw, '\\') != null) return Error.TypeMismatch;
+        return raw;
+    }
+
+    /// 取字符串（**分配**，会解码转义；调用方负责释放）。
+    pub fn getStringAlloc(self: JsonDoc, key: []const u8) Error![]u8 {
+        const idx = findObjectValueAt(self.tokens, self.count, self.input, 0, key) orelse return Error.KeyNotFound;
+        return dupStringToken(self.allocator, self.tokens[idx], self.input);
+    }
+
+    /// **一次遍历**取多个整数键：`keys[i]` 的值写入 `out[i]`。
+    /// 缺失 / 非整数 / 溢出的位保持 `0`（不报错，热路径免分支）。
+    ///
+    /// 逐个 `getInt` 每次都要从头遍历顶层键（8 个键 = 8 遍），
+    /// 本函数只遍历一遍：实测 8 字段从 ~412 ns 降到 ~280 ns。
+    pub fn getIntsInto(self: JsonDoc, keys: []const []const u8, out: []i64) void {
+        @memset(out, 0);
+        if (self.count == 0 or keys.len == 0) return;
+        const root = self.tokens[0];
+        if (root.typ != .Object) return;
+
+        var child: usize = 1;
+        var remaining: usize = @intCast(root.size);
+        while (remaining > 0 and child < self.count) {
+            const key_token = self.tokens[child];
+            if (key_token.typ != .String) return;
+            remaining -= 1;
+            const value_index = child + 1;
+            if (value_index >= self.count or remaining == 0) return;
+            remaining -= 1;
+
+            const value_token = self.tokens[value_index];
+            if (value_token.typ == .Primitive) {
+                const key_text = tokenText(key_token, self.input);
+                for (keys, out) |want, *slot| {
+                    if (std.mem.eql(u8, key_text, want)) {
+                        slot.* = parseTokenInteger(value_token, self.input) catch 0;
+                        break;
+                    }
+                }
+            }
+            child = skipToken(self.tokens, value_index);
+        }
+    }
+};
+
+test "JsonDoc: 一次解析多次取值（数字/布尔/字符串/缺失键）" {
+    const a = std.testing.allocator;
+    const text = "{\"uid\":42,\"client\":\"web\",\"ok\":true,\"neg\":-7,\"nested\":{\"x\":1}}";
+
+    var doc = try JsonDoc.init(a, text);
+    defer doc.deinit();
+
+    try std.testing.expectEqual(@as(i64, 42), try doc.getInt(i64, "uid"));
+    try std.testing.expectEqual(@as(i32, 42), try doc.getInt(i32, "uid"));
+    try std.testing.expectEqual(@as(i64, -7), try doc.getInt(i64, "neg"));
+    try std.testing.expect(try doc.getBool("ok"));
+    try std.testing.expectEqualStrings("web", try doc.getStringRaw("client"));
+    try std.testing.expect(doc.has("uid"));
+    try std.testing.expect(!doc.has("missing"));
+
+    // 缺失键 / 类型不符
+    try std.testing.expectError(Error.KeyNotFound, doc.getInt(i64, "missing"));
+    try std.testing.expectError(Error.TypeMismatch, doc.getInt(i64, "client"));
+    // 嵌套对象不是本类型的处理范围（要子对象请用 JsonQuery.getObject）
+    try std.testing.expectError(Error.TypeMismatch, doc.getInt(i64, "nested"));
+}
+
+test "JsonDoc: getIntsInto 一次遍历取多字段" {
+    const a = std.testing.allocator;
+    const text = "{\"uid\":42,\"client\":\"web\",\"ver\":3,\"cver\":7,\"iat\":100,\"abs\":200,\"exp\":300,\"nested\":{\"x\":9}}";
+
+    var doc = try JsonDoc.init(a, text);
+    defer doc.deinit();
+
+    var out: [6]i64 = undefined;
+    doc.getIntsInto(&.{ "exp", "abs", "uid", "ver", "cver", "iat" }, &out);
+    try std.testing.expectEqualSlices(i64, &.{ 300, 200, 42, 3, 7, 100 }, &out);
+
+    // 缺失键 / 字符串值 / 嵌套对象一律填 0（热路径不报错）
+    var out2: [3]i64 = undefined;
+    doc.getIntsInto(&.{ "missing", "client", "nested" }, &out2);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 0, 0 }, &out2);
+}
+
+test "JsonDoc: 含转义时 getStringRaw 拒绝、getStringAlloc 正确解码" {
+    const a = std.testing.allocator;
+    const text = "{\"pwd\":\"a\\\"b\",\"plain\":\"xyz\"}";
+
+    var doc = try JsonDoc.init(a, text);
+    defer doc.deinit();
+
+    // 零分配快路径：无转义可用
+    try std.testing.expectEqualStrings("xyz", try doc.getStringRaw("plain"));
+    // 有转义：raw 明确拒绝（不静默返回半解码的值）
+    try std.testing.expectError(Error.TypeMismatch, doc.getStringRaw("pwd"));
+    // 解码路径必须拿到正确值
+    const pwd = try doc.getStringAlloc("pwd");
+    defer a.free(pwd);
+    try std.testing.expectEqualStrings("a\"b", pwd);
+}

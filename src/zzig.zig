@@ -204,6 +204,10 @@ pub const json = struct {
     /// JSON 查询器类型
     pub const JsonQuery = Query.JsonQuery;
 
+    /// **一次解析、多次取值**（同一份 JSON 取多个字段时用它；
+    /// `JsonQuery` 每次 get 都会重新解析）
+    pub const JsonDoc = Query.JsonDoc;
+
     /// 便捷函数：使用默认配置创建解析器实例
     pub fn createParser() type {
         return Jsmn(jsmn_default_config());
