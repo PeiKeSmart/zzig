@@ -28,6 +28,9 @@ pub const RequestView = struct {
     /// 原始请求头（名称小写，值原样；已复制到本次请求的 arena）。
     /// 鉴权/限流/追踪等业务层规则需要它；传输层本身不解读。
     headers: []const std.http.Header = &.{},
+    /// 对端地址（`ip:port` 文本，来自 accept 返回的 socket 地址；拿不到时为 `null`）。
+    /// WAF / 限流 / IP 名单靠它拿真实来源；不填就等于所有请求都「没有 IP」。
+    remote_addr: ?[]const u8 = null,
 };
 
 /// 业务回调要回的响应。
@@ -165,6 +168,17 @@ pub const Server = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
+        // 对端地址（accept 返回的 socket 地址即远端，Windows/POSIX 同口径）：
+        // 格式为 `ip:port`（IPv6 为 `[::1]:port`），消费方自行剥端口。
+        // 注意：`IpAddress` 只实现了新 `Io.Writer` 接口，`std.fmt` 的 `{}` 会退化成
+        // 结构体调试打印（实测输出 `.{ .ip4 = ... }`），必须显式用 `Io.Writer.fixed`。
+        const remote_addr: ?[]const u8 = blk: {
+            var buf: [80]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            stream.socket.address.format(&w) catch break :blk null;
+            break :blk arena.dupe(u8, w.buffered()) catch null;
+        };
+
         var req = try http.receiveHead();
         const path_end = std.mem.indexOfScalar(u8, req.head.target, '?') orelse req.head.target.len;
         const path = req.head.target[0..path_end];
@@ -207,6 +221,7 @@ pub const Server = struct {
             .query = query,
             .body = body,
             .headers = header_list.items,
+            .remote_addr = remote_addr,
         }, arena) catch |e| {
             std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.head.method), path, @errorName(e) });
             req.respond("{\"code\":500,\"msg\":\"internal error\"}", .{
@@ -345,8 +360,14 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
         io: std.Io,
         impl: Server,
         ok: bool = false,
+        /// 对端地址断言结果（在 handler 内算，避免借用请求 arena 的切片）
+        remote_ok: bool = false,
 
-        fn handler(_: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
+        fn handler(raw: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (req.remote_addr) |addr| {
+                self.remote_ok = std.mem.startsWith(u8, addr, "127.0.0.1:");
+            }
             if (std.mem.eql(u8, req.path, "/echo")) {
                 return .{ .body = try std.fmt.allocPrint(arena, "{{\"len\":{d}}}", .{req.body.len}) };
             }
@@ -423,6 +444,8 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
     try testing.expect(std.mem.indexOf(u8, resp_buf[0..got], "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp_buf[0..got], "{\"len\":5}") != null);
     try testing.expect(ctx.ok);
+    // 对端地址必须拿到（WAF / 限流 / IP 名单全靠它）
+    try testing.expect(ctx.remote_ok);
     std.debug.print("[http] 端到端 OK：收到 {d} 字节响应\n", .{got});
 }
 

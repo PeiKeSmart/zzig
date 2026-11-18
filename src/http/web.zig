@@ -266,6 +266,7 @@ pub const App = struct {
             .query = req.query,
             .body = req.body,
             .headers = req.headers,
+            .remote_addr = req.remote_addr,
         }) catch |e| {
             // 失败必须可定位：方法 + 路径 + 具体错误（不接受只有"服务器错误"的笼统文案）
             std.debug.print("[zzig.web] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.method), req.path, @errorName(e) });
@@ -522,7 +523,8 @@ test "web：处理失败返回 500 且带错误名" {
     try testing.expect(std.mem.indexOf(u8, reply.body, "DatabaseDown") != null);
 }
 
-test "web：注册组件后可在控制器视图中调用" {    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+test "web：注册组件后可在控制器视图中调用" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = compat.currentIo();
