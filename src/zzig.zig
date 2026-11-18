@@ -324,6 +324,8 @@ pub const db = struct {
     pub const Row = @import("db/row.zig").Row;
 };
 
+/// 可复用的 TLS 客户端（上游 `std.crypto.tls.Client` 补丁版；供各协议自行套 stream）
+pub const tls_client = @import("db/tls_client.zig");
 /// 便捷别名：`zzig.sqlite` == `zzig.db.sqlite`
 pub const sqlite = db.sqlite;
 /// 便捷别名：`zzig.mysql` == `zzig.db.mysql`
