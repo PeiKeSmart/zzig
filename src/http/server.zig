@@ -5,7 +5,7 @@
 //!
 //! 口径：
 //! - 请求体上限（默认 1 MB）、连接数上限（超限直接关，不排队不分配线程）、每连接独立 arena；
-//! - 默认 `Connection: close`（不复用连接，最简单也最安全）；
+//! - 默认 HTTP/1.1 **keep-alive**（复用连接；可用 `Options.keep_alive = false` 改回短连接）；
 //! - **鉴权/限流不在这里**：传输层只管收发，令牌/白名单/限流由业务层做。
 //!
 //! 线程与 Io（踩坑记录）：`Io` 实例必须用**线程安全**的分配器构造
@@ -56,7 +56,17 @@ pub const Options = struct {
     /// 请求体上限（数据库请求是几 KB 级 JSON）
     max_body: usize = 1024 * 1024,
     /// 同时处理连接数上限（超限立刻关连接）
-    max_connections: usize = 64,
+    ///
+    /// 取 512 的理由：**每连接一线程**，浏览器对同一域名默认就开 6 条连接，
+    /// 80 个用户同时打开面板就能打满 480 条 —— 原先的 64 会在正常使用下直接拒连、页面白屏。
+    /// 上千**长连接**不要靠调大这个值硬扛（线程数与连接数 O(n)），应改用事件循环后端。
+    max_connections: usize = 512,
+    /// 是否复用连接（HTTP/1.1 keep-alive）；关闭则每个请求结束后立即关连接
+    keep_alive: bool = true,
+    /// 单连接最多处理的请求数（防长连接长期占用一个线程；`0` 按 1 处理）
+    keep_alive_requests: usize = 100,
+    /// `Keep-Alive: timeout=N` 提示（秒）；**不做硬超时**，空闲超时建议由前置反代管理
+    keep_alive_timeout_secs: u32 = 5,
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
@@ -150,36 +160,59 @@ pub const Server = struct {
 
     fn connMain(self: *Server, stream: std.Io.net.Stream) void {
         defer _ = self.active.fetchSub(1, .acq_rel);
-        self.serveOne(stream) catch |e| {
-            std.debug.print("[zzig.http] 连接处理结束（{s}）\n", .{@errorName(e)});
+        const limit = if (self.opts.keep_alive) @max(self.opts.keep_alive_requests, 1) else 1;
+        self.serveWithLimit(stream, limit) catch |e| switch (e) {
+            error.HttpConnectionClosing => {},
+            else => std.debug.print("[zzig.http] 连接处理结束（{s}）\n", .{@errorName(e)}),
         };
         stream.close(self.io);
     }
 
     /// 处理**一条**连接上的一个请求（单线程可用，便于测试）。
     pub fn serveOne(self: *Server, stream: std.Io.net.Stream) !void {
+        return self.serveWithLimit(stream, 1);
+    }
+
+    /// 连接主循环：在同一连接上服务最多 `max_requests` 个请求（keep-alive）。
+    fn serveWithLimit(self: *Server, stream: std.Io.net.Stream, max_requests: usize) !void {
         var recv_buf: [16 * 1024]u8 = undefined;
         var send_buf: [16 * 1024]u8 = undefined;
         var sr = stream.reader(self.io, &recv_buf);
         var sw = stream.writer(self.io, &send_buf);
         var http = std.http.Server.init(&sr.interface, &sw.interface);
 
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
         // 对端地址（accept 返回的 socket 地址即远端，Windows/POSIX 同口径）：
         // 格式为 `ip:port`（IPv6 为 `[::1]:port`），消费方自行剥端口。
         // 注意：`IpAddress` 只实现了新 `Io.Writer` 接口，`std.fmt` 的 `{}` 会退化成
         // 结构体调试打印（实测输出 `.{ .ip4 = ... }`），必须显式用 `Io.Writer.fixed`。
+        var remote_buf: [80]u8 = undefined;
+        var remote_writer: std.Io.Writer = .fixed(&remote_buf);
         const remote_addr: ?[]const u8 = blk: {
-            var buf: [80]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            stream.socket.address.format(&w) catch break :blk null;
-            break :blk arena.dupe(u8, w.buffered()) catch null;
+            stream.socket.address.format(&remote_writer) catch break :blk null;
+            break :blk remote_writer.buffered();
         };
 
-        var req = try http.receiveHead();
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+
+        var served: usize = 0;
+        while (served < max_requests) : (served += 1) {
+            _ = arena_state.reset(.retain_capacity);
+            const keep = try self.handleOne(&http, remote_addr, arena_state.allocator());
+            // keep-alive 时必须立即把响应刷给客户端：否则数据滞留在写缓冲里，
+            // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
+            try sw.interface.flush();
+            if (!keep) return;
+        }
+    }
+
+    /// 在已就绪的连接上处理**一个**请求；返回 `true` 表示连接可以继续复用。
+    fn handleOne(self: *Server, http: *std.http.Server, remote_addr: ?[]const u8, arena: std.mem.Allocator) !bool {
+        var req = http.receiveHead() catch |e| switch (e) {
+            // 客户端主动关闭（或 keep-alive 空闲超时）→ 正常结束
+            error.HttpConnectionClosing => return false,
+            else => return e,
+        };
         const path_end = std.mem.indexOfScalar(u8, req.head.target, '?') orelse req.head.target.len;
         const path = req.head.target[0..path_end];
         const query = if (path_end < req.head.target.len) req.head.target[path_end + 1 ..] else "";
@@ -194,15 +227,18 @@ pub const Server = struct {
             });
         }
 
+        // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（不读 body）都不能复用
+        const keep = self.opts.keep_alive and req.head.keep_alive and req.head.transfer_encoding == .none;
+
         // 早拒：声明长度超上限就不读 body
         var body: []const u8 = "";
         if (req.head.content_length) |len| {
             if (len > self.opts.max_body) {
                 try req.respond("{\"code\":413,\"msg\":\"request body too large\"}", .{
                     .status = .payload_too_large,
-                    .extra_headers = &.{.{ .name = "connection", .value = "close" }},
+                    .keep_alive = false,
                 });
-                return;
+                return false;
             }
             if (len > 0) {
                 var buf: [4096]u8 = undefined;
@@ -226,9 +262,9 @@ pub const Server = struct {
             std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.head.method), path, @errorName(e) });
             req.respond("{\"code\":500,\"msg\":\"internal error\"}", .{
                 .status = .internal_server_error,
-                .extra_headers = &.{.{ .name = "connection", .value = "close" }},
+                .keep_alive = false,
             }) catch {};
-            return;
+            return false;
         };
 
         // 文件响应：流式发送（大文件不整读进内存）
@@ -240,7 +276,8 @@ pub const Server = struct {
                 .content_length = file_body.length,
                 .respond_options = .{
                     .status = reply.status,
-                    .extra_headers = try buildHeaders(arena, reply),
+                    .keep_alive = keep,
+                    .extra_headers = try buildHeaders(arena, reply, keep, self.opts.keep_alive_timeout_secs),
                 },
             });
 
@@ -249,7 +286,7 @@ pub const Server = struct {
             // 只把已写的响应头刷出去即可。
             if (req.head.method == .HEAD) {
                 try bw.flush();
-                return;
+                return keep;
             }
 
             // 优先零拷贝（Linux sendfile 走内核 file→socket，不经过用户态内存）；
@@ -288,52 +325,72 @@ pub const Server = struct {
                     "[zzig.http] 发送文件时被截断：已声明 {d} 字节，还差 {d} 字节\n",
                     .{ file_body.length, remaining },
                 );
-                return;
+                return false;
             }
             try bw.end();
-            return;
+            return keep;
         }
 
         // 无正文但需声明长度（通常 HEAD）：transfer-encoding none + 自填 content-length
         if (reply.content_length) |length| {
-            const headers = try buildHeadersWithLength(arena, reply, length);
+            const headers = try buildHeadersWithLength(arena, reply, length, keep, self.opts.keep_alive_timeout_secs);
             try req.respond("", .{
                 .status = reply.status,
                 .transfer_encoding = .none,
-                .keep_alive = false,
+                .keep_alive = keep,
                 .extra_headers = headers,
             });
-            return;
+            return keep;
         }
 
         try req.respond(reply.body, .{
             .status = reply.status,
-            .extra_headers = try buildHeaders(arena, reply),
+            .keep_alive = keep,
+            .extra_headers = try buildHeaders(arena, reply, keep, self.opts.keep_alive_timeout_secs),
         });
+        return keep;
     }
 };
 
-/// 组装响应头：`content-type` → 业务附加头（跳过重名）→ `connection: close`。
-fn buildHeaders(arena: std.mem.Allocator, reply: Reply) ![]const std.http.Header {
+/// 组装响应头：`content-type` → 业务附加头（跳过重名）→ `connection/keep-alive`。
+fn buildHeaders(
+    arena: std.mem.Allocator,
+    reply: Reply,
+    keep_alive: bool,
+    keep_alive_timeout_secs: u32,
+) ![]const std.http.Header {
     var headers: std.ArrayList(std.http.Header) = .empty;
     try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         try headers.append(arena, header);
     }
-    try headers.append(arena, .{ .name = "connection", .value = "close" });
+    if (keep_alive) {
+        try headers.append(arena, .{
+            .name = "keep-alive",
+            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{keep_alive_timeout_secs}),
+        });
+    }
     return headers.items;
 }
 
 /// 同上，但额外带上明确的 `content-length`（无正文的 HEAD 响应）。
-fn buildHeadersWithLength(arena: std.mem.Allocator, reply: Reply, length: u64) ![]const std.http.Header {
+fn buildHeadersWithLength(
+    arena: std.mem.Allocator,
+    reply: Reply,
+    length: u64,
+    keep_alive: bool,
+    keep_alive_timeout_secs: u32,
+) ![]const std.http.Header {
     var headers: std.ArrayList(std.http.Header) = .empty;
     try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         try headers.append(arena, header);
     }
@@ -341,7 +398,12 @@ fn buildHeadersWithLength(arena: std.mem.Allocator, reply: Reply, length: u64) !
         .name = "content-length",
         .value = try std.fmt.allocPrint(arena, "{d}", .{length}),
     });
-    try headers.append(arena, .{ .name = "connection", .value = "close" });
+    if (keep_alive) {
+        try headers.append(arena, .{
+            .name = "keep-alive",
+            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{keep_alive_timeout_secs}),
+        });
+    }
     return headers.items;
 }
 
@@ -583,4 +645,267 @@ test "HTTP 服务端：文件流式响应（真 socket，GET + HEAD）" {
         try testing.expect(ctx.ok);
         std.debug.print("[http] 文件流式端到端 OK：GET + HEAD 均通过（HEAD 收到 {d} 字节）\n", .{got});
     }
+}
+
+/// keep-alive 用例共用的服务端骨架：真监听 + 单连接跑到 `serveWithLimit`。
+fn KeepAliveHarness(comptime requests: usize) type {
+    return struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        impl: Server,
+        served: usize = 0,
+
+        fn handler(raw: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.served += 1;
+            return .{ .body = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{req.path}) };
+        }
+
+        fn serve(self: *@This()) void {
+            const stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            self.impl.serveWithLimit(stream, requests) catch |e| switch (e) {
+                error.HttpConnectionClosing => {},
+                else => std.debug.print("[FAIL] serveWithLimit：{s}\n", .{@errorName(e)}),
+            };
+        }
+    };
+}
+
+/// 读一次响应，直到出现 `needle`（或对端关闭 / 轮次用尽）。
+fn readUntil(reader: *std.Io.Reader, buf: []u8, needle: []const u8) !usize {
+    var got: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 16) : (rounds += 1) {
+        const n = reader.readSliceShort(buf[got..]) catch break; // 对端已关（或读失败）都按结束处理
+        if (n == 0) break;
+        got += n;
+        if (std.mem.indexOf(u8, buf[0..got], needle) != null) break;
+    }
+    return got;
+}
+
+test "HTTP 服务端：keep-alive 在同一连接上复用（连发两个请求）" {
+    std.debug.print("[trace] === 用例A 开始 ===\n", .{});
+    const Ctx = KeepAliveHarness(2);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39370;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39389) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39370-39388 端口均不可用，跳过 keep-alive 用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+
+    const io = compat.currentIo();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+        th.join();
+        std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    var stream_alive = true;
+    defer if (stream_alive) stream.close(io);
+
+    var cw_buf: [4096]u8 = undefined;
+    var cw = stream.writer(io, &cw_buf);
+    var cr_buf: [4096]u8 = undefined;
+    var cr = stream.reader(io, &cr_buf);
+
+    // 请求 1 + 请求 2 一次性发出（HTTP pipelining），验证同一连接能连续服务两个请求
+    std.debug.print("[trace] 客户端：写请求 1+2\n", .{});
+    try cw.interface.writeAll("GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n");
+    try cw.interface.flush();
+    std.debug.print("[trace] 客户端：已 flush，开始读\n", .{});
+    var resp1: [4096]u8 = undefined;
+    const got1 = try readUntil(&cr.interface, &resp1, "{\"path\":\"/two\"}");
+    std.debug.print("[trace] 客户端：共收到 {d} 字节\n", .{got1});
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/one\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/two\"}") != null);
+    // 复用提示头必须出现（客户端 / 反代据此判断这条连接还能不能继续用）
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "keep-alive") != null);
+    // 复用时不得回 `connection: close`
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "connection: close") == null);
+
+    // 两个请求由同一条连接服务完 → 服务端按请求上限自行退出
+    th.join();
+    stream.close(io);
+    stream_alive = false;
+
+    try testing.expectEqual(@as(usize, 2), ctx.served);
+    std.debug.print("[http] keep-alive OK：同一连接完成 2 个请求（共 {d} 字节）\n", .{got1});
+}
+
+test "HTTP 服务端：Connection: close 与 keep_alive=false 都只服务一个请求" {
+    const Ctx = KeepAliveHarness(8);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39390;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39409) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39390-39408 端口均不可用，跳过 close 用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const io = compat.currentIo();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+
+    // 轮 1：客户端显式 `Connection: close`
+    {
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+            th.join();
+            std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+            return;
+        };
+        var cw_buf: [2048]u8 = undefined;
+        var cw = stream.writer(io, &cw_buf);
+        var cr_buf: [2048]u8 = undefined;
+        var cr = stream.reader(io, &cr_buf);
+
+        // 一次性发两个请求：若服务端错误地复用连接，会额外回一个 `/two` 响应
+        try cw.interface.writeAll("GET /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n");
+        try cw.interface.flush();
+        var resp: [4096]u8 = undefined;
+        const got = try readUntil(&cr.interface, &resp, "{\"path\":\"/one\"}");
+        try testing.expect(std.mem.indexOf(u8, resp[0..got], "connection: close") != null);
+        try testing.expect(std.mem.indexOf(u8, resp[0..got], "keep-alive") == null);
+
+        // 服务端应已关连接：第二段请求拿不到响应
+        var resp_after: [512]u8 = undefined;
+        const got_after = try readUntil(&cr.interface, &resp_after, "{\"path\":\"/two\"}");
+        try testing.expectEqual(@as(usize, 0), got_after);
+
+        th.join();
+        stream.close(io);
+        try testing.expectEqual(@as(usize, 1), ctx.served);
+    }
+
+    // 轮 2：服务端关掉 keep_alive（客户端没要求 close 也不复用）
+    {
+        ctx.impl.opts.keep_alive = false;
+        ctx.served = 0;
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp });
+        var cw_buf: [2048]u8 = undefined;
+        var cw = stream.writer(io, &cw_buf);
+        var cr_buf: [2048]u8 = undefined;
+        var cr = stream.reader(io, &cr_buf);
+
+        try cw.interface.writeAll("GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n");
+        try cw.interface.flush();
+        var resp: [4096]u8 = undefined;
+        const got = try readUntil(&cr.interface, &resp, "{\"path\":\"/one\"}");
+        try testing.expect(std.mem.indexOf(u8, resp[0..got], "connection: close") != null);
+        try testing.expect(std.mem.indexOf(u8, resp[0..got], "keep-alive") == null);
+
+        var resp_after: [512]u8 = undefined;
+        const got_after = try readUntil(&cr.interface, &resp_after, "{\"path\":\"/two\"}");
+        try testing.expectEqual(@as(usize, 0), got_after);
+
+        th.join();
+        stream.close(io);
+        try testing.expectEqual(@as(usize, 1), ctx.served);
+        ctx.impl.opts.keep_alive = true;
+    }
+
+    std.debug.print("[http] 关闭语义 OK：Connection: close 与 keep_alive=false 均只服务 1 个请求\n", .{});
+}
+
+test "HTTP 服务端：keep_alive_requests 达到上限即关闭连接" {
+    const Ctx = KeepAliveHarness(2);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39410;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39429) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39410-39428 端口均不可用，跳过上限用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+
+    const io = compat.currentIo();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+        th.join();
+        std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    var stream_alive = true;
+    defer if (stream_alive) stream.close(io);
+
+    var cw_buf: [4096]u8 = undefined;
+    var cw = stream.writer(io, &cw_buf);
+    var cr_buf: [4096]u8 = undefined;
+    var cr = stream.reader(io, &cr_buf);
+
+    // 一次发 3 个请求：服务端只应服务前 2 个（max_requests=2），第 3 个拿不到响应
+    try cw.interface.writeAll("GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\nGET /three HTTP/1.1\r\nHost: x\r\n\r\n");
+    try cw.interface.flush();
+    var resp1: [4096]u8 = undefined;
+    const got1 = try readUntil(&cr.interface, &resp1, "{\"path\":\"/two\"}");
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/one\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/two\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/three\"}") == null);
+
+    var resp3: [512]u8 = undefined;
+    const got3 = try readUntil(&cr.interface, &resp3, "{\"path\":\"/three\"}");
+    th.join();
+
+    try testing.expectEqual(@as(usize, 0), got3);
+    try testing.expectEqual(@as(usize, 2), ctx.served);
+    stream.close(io);
+    stream_alive = false;
+    std.debug.print("[http] 上限 OK：keep_alive_requests=2 时第 3 个请求被拒（服务端已关连接）\n", .{});
 }
