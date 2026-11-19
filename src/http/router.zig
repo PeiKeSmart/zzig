@@ -115,6 +115,9 @@ pub const Response = struct {
     }
 };
 
+/// 中间件状态键：伪静态后缀（命中时写入，如 `.html`）。
+pub const STATE_SUFFIX = "router.suffix";
+
 /// 请求上下文。
 pub const Ctx = struct {
     /// 请求级分配器（请求结束统一释放）
@@ -171,6 +174,13 @@ pub const Ctx = struct {
     /// 中间件状态。
     pub fn stateValue(self: *const Ctx, name: []const u8) ?[]const u8 {
         return self.state.get(name);
+    }
+
+    /// 本次请求命中的伪静态后缀（如 `.html`；精确命中时为 `null`）。
+    ///
+    /// 典型用途：生成 canonical 链接、或将无后缀地址 301 到带后缀地址。
+    pub fn suffix(self: *const Ctx) ?[]const u8 {
+        return self.stateValue(STATE_SUFFIX);
     }
 
     /// 写入中间件状态。
@@ -334,6 +344,52 @@ pub fn middleware(comptime f: anytype) Middleware {
     return .{ .call = Wrap.invoke };
 }
 
+/// 伪静态链接生成：`/about` + `.html` → `/about.html`。
+///
+/// - 已以该后缀结尾（大小写不敏感）→ 原样返回副本（幂等）；
+/// - 末尾 `/` 去掉后再拼：`/a/` → `/a.html`；
+/// - 带 query 只处理 `?` 之前：`/a?x=1` → `/a.html?x=1`；
+/// - **根路径 `/` 原样返回**（首页请显式传 `/index`）。
+pub fn withSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []const u8) ![]u8 {
+    var buffer: [max_suffix_len]u8 = undefined;
+    const normalized = normalizeSuffix(suffix, &buffer);
+    if (normalized.len == 0) return allocator.dupe(u8, path);
+
+    const query_index = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+    const base = path[0..query_index];
+    const tail = path[query_index..];
+    if (base.len == 0 or std.mem.eql(u8, base, "/")) return allocator.dupe(u8, path);
+    if (endsWithIgnoreCase(base, normalized)) return allocator.dupe(u8, path);
+
+    const trimmed = std.mem.trimEnd(u8, base, "/");
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ trimmed, normalized, tail });
+}
+
+/// 伪静态后缀的最大长度（含前导点）。
+pub const max_suffix_len = 16;
+
+/// 规范化后缀（`html` / `.HTML` → `.html`）；非法返回空切片。
+fn normalizeSuffix(text: []const u8, buffer: *[max_suffix_len]u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0) return "";
+
+    const has_dot = trimmed[0] == '.';
+    const body = if (has_dot) trimmed[1..] else trimmed;
+    if (body.len == 0 or body.len + 1 > buffer.len) return "";
+    for (body) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return "";
+    }
+
+    buffer[0] = '.';
+    for (body, 0..) |c, index| buffer[index + 1] = std.ascii.toLower(c);
+    return buffer[0 .. body.len + 1];
+}
+
+fn endsWithIgnoreCase(text: []const u8, suffix: []const u8) bool {
+    if (suffix.len == 0 or text.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(text[text.len - suffix.len ..], suffix);
+}
+
 // ————— 路由表 —————
 
 const Segment = union(enum) {
@@ -346,6 +402,8 @@ const Route = struct {
     method: []const u8,
     pattern: []const u8,
     segments: []const Segment,
+    /// 含 `{param}` 段（伪静态阶段一先跳过这类路由，避免参数路由把 `/x.html` 吞掉）
+    has_param: bool,
     handler: Handler,
 };
 
@@ -369,6 +427,11 @@ pub const Router = struct {
     routes: std.ArrayList(Route) = .empty,
     middlewares: std.ArrayList(Middleware) = .empty,
     fallback_handler: ?Handler = null,
+    /// 伪静态后缀（如 `.html`）：**原路径未命中时**再去掉后缀匹配一次。
+    ///
+    /// 官网/门户类站点常用：`/about.html` → 命中 `/about`，`/news/123.html` → 命中 `/news/{id}`
+    /// （`id` = `123`，不含后缀）。磁盘上已存在的同名静态文件不受影响（静态在路由之后兜底）。
+    pseudo_suffixes: std.ArrayList([]const u8) = .empty,
 
     /// 新建空路由器。
     pub fn init(allocator: std.mem.Allocator) Router {
@@ -384,6 +447,44 @@ pub const Router = struct {
         }
         self.routes.deinit(self.allocator);
         self.middlewares.deinit(self.allocator);
+        for (self.pseudo_suffixes.items) |suffix| self.allocator.free(suffix);
+        self.pseudo_suffixes.deinit(self.allocator);
+    }
+
+    /// 注册伪静态后缀（`.html` / `html` 都接受，自动补前导点；重复注册忽略）。
+    pub fn addSuffix(self: *Router, suffix: []const u8) !void {
+        const trimmed = std.mem.trim(u8, suffix, " \t");
+        if (trimmed.len == 0) return;
+
+        var buffer: [max_suffix_len]u8 = undefined;
+        const normalized = normalizeSuffix(trimmed, &buffer);
+        if (normalized.len == 0) return error.InvalidSuffix;
+
+        for (self.pseudo_suffixes.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, normalized)) return;
+        }
+        try self.pseudo_suffixes.append(self.allocator, try self.allocator.dupe(u8, normalized));
+    }
+
+    /// 批量注册伪静态后缀。
+    pub fn addSuffixes(self: *Router, suffixes: []const []const u8) !void {
+        for (suffixes) |suffix| try self.addSuffix(suffix);
+    }
+
+    /// 该路径命中的伪静态后缀（大小写不敏感；无则 `null`）。
+    pub fn suffixOf(self: *const Router, path: []const u8) ?[]const u8 {
+        for (self.pseudo_suffixes.items) |suffix| {
+            if (endsWithIgnoreCase(path, suffix)) return suffix;
+        }
+        return null;
+    }
+
+    /// 去掉伪静态后缀后的路径（只处理 `?` 之前；剥完不能为空；无后缀返回 `null`）。
+    pub fn stripPseudoSuffix(self: *const Router, path: []const u8) ?[]const u8 {
+        const suffix = self.suffixOf(path) orelse return null;
+        const stripped = path[0 .. path.len - suffix.len];
+        if (stripped.len == 0) return null;
+        return stripped;
     }
 
     /// 注册中间件（先注册先进入）。
@@ -419,10 +520,16 @@ pub const Router = struct {
             }
         }
 
+        var has_param = false;
+        for (segments.items) |segment| {
+            if (segment == .param) has_param = true;
+        }
+
         try self.routes.append(self.allocator, .{
             .method = method_copy,
             .pattern = pattern_copy,
             .segments = try segments.toOwnedSlice(self.allocator),
+            .has_param = has_param,
             .handler = h,
         });
     }
@@ -458,9 +565,56 @@ pub const Router = struct {
     }
 
     /// 只做匹配（不执行处理器、不跑中间件）；命中时写入 `c.params` 与 `c.pattern`。
+    ///
+    /// 三阶段（伪静态友好，且不破坏既有语义）：
+    /// 1. **原路径的字面量路由**（`/exact.html` 这类精确路由永远优先）；
+    /// 2. 若路径带已注册伪静态后缀 → **去掉后缀再完整匹配**（含参数路由：`/news/123.html` → `id=123`）；
+    /// 3. 原路径的完整匹配（保持未注册后缀时 `id="123.html"` 的旧行为）。
     pub fn match(self: *const Router, c: *Ctx) !Match {
+        var pending_405: ?[]const u8 = null;
+
+        // 1) 字面量精确路由
+        switch (try self.matchPath(c, c.req.path, true)) {
+            .handler => |h| return .{ .handler = h },
+            .method_not_allowed => |allow| pending_405 = allow,
+            .not_found => {},
+        }
+
+        // 2) 伪静态：去掉后缀后再匹配（字面量 + 参数）
+        for (self.pseudo_suffixes.items) |suffix| {
+            if (!endsWithIgnoreCase(c.req.path, suffix)) continue;
+            const stripped = c.req.path[0 .. c.req.path.len - suffix.len];
+            if (stripped.len == 0) continue;
+
+            switch (try self.matchPath(c, stripped, false)) {
+                .handler => |h| {
+                    c.setState(STATE_SUFFIX, suffix) catch {};
+                    return .{ .handler = h };
+                },
+                .method_not_allowed => |allow| {
+                    if (pending_405 == null) pending_405 = allow;
+                },
+                .not_found => {},
+            }
+        }
+
+        // 3) 原路径完整匹配（参数路由的旧行为）
+        switch (try self.matchPath(c, c.req.path, false)) {
+            .handler => |h| return .{ .handler = h },
+            .method_not_allowed => |allow| {
+                if (pending_405 == null) pending_405 = allow;
+            },
+            .not_found => {},
+        }
+
+        if (pending_405) |allow| return .{ .method_not_allowed = allow };
+        return .not_found;
+    }
+
+    /// 单次路径匹配（`literal_only` = 只允许无参数路由）。
+    fn matchPath(self: *const Router, c: *Ctx, path: []const u8, literal_only: bool) !Match {
         var segments: std.ArrayList([]const u8) = .empty;
-        var iter = std.mem.splitScalar(u8, c.req.path, '/');
+        var iter = std.mem.splitScalar(u8, path, '/');
         while (iter.next()) |raw| {
             if (raw.len == 0) continue;
             try segments.append(c.arena, raw);
@@ -473,6 +627,7 @@ pub const Router = struct {
 
         for (self.routes.items) |*route| {
             if (route.segments.len != segments.items.len) continue;
+            if (literal_only and route.has_param) continue;
             const maybe_params = try matchSegments(c.arena, route.segments, segments.items);
             const params = maybe_params orelse continue;
             path_matched = true;
@@ -619,6 +774,121 @@ test "router：路径参数 + 大小写不敏感 + HEAD 兼容 GET" {
         .response => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "router：伪静态后缀（字面量 / 参数 / 优先精确 / 未注册不影响）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+    try router.addSuffixes(&.{ "html", ".htm" });
+
+    const S = struct {
+        fn about(c: *Ctx) anyerror!Response {
+            return Response.json(if (c.suffix()) |s| s else "none");
+        }
+
+        fn news(c: *Ctx) anyerror!Response {
+            return Response.json(c.param("id") orelse "");
+        }
+
+        fn literal(_: *Ctx) anyerror!Response {
+            return Response.json("literal");
+        }
+    };
+    try router.get("/about", handler(S.about));
+    try router.get("/news/{id}", handler(S.news));
+    try router.get("/exact.html", handler(S.literal));
+
+    // 1) 字面量路由：`/about.html` 命中 `/about`，并回报后缀
+    var ctx = try buildCtx(arena, "GET", "/about.html", "");
+    defer ctx.deinit();
+    switch (try router.dispatch(&ctx)) {
+        .response => |resp| try testing.expectEqualStrings(".html", resp.body),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // 2) 参数路由：后缀不进入参数值
+    var news_ctx = try buildCtx(arena, "GET", "/news/123.html", "");
+    defer news_ctx.deinit();
+    switch (try router.dispatch(&news_ctx)) {
+        .response => |resp| try testing.expectEqualStrings("123", resp.body),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // 3) 精确路由优先：`/exact.html` 不应被剥离
+    var exact_ctx = try buildCtx(arena, "GET", "/exact.html", "");
+    defer exact_ctx.deinit();
+    switch (try router.dispatch(&exact_ctx)) {
+        .response => |resp| try testing.expectEqualStrings("literal", resp.body),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(exact_ctx.suffix() == null);
+
+    // 4) 未注册的后缀不做剥离
+    var json_ctx = try buildCtx(arena, "GET", "/about.json", "");
+    defer json_ctx.deinit();
+    switch (try router.dispatch(&json_ctx)) {
+        .not_found => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "router：伪静态后缀的 405 语义与大小写" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+    try router.addSuffix(".HTML");
+
+    const S = struct {
+        fn save(_: *Ctx) anyerror!Response {
+            return Response.json("{}");
+        }
+    };
+    try router.post("/api/save", handler(S.save));
+
+    var ctx = try buildCtx(arena, "GET", "/api/save.html", "");
+    defer ctx.deinit();
+    switch (try router.dispatch(&ctx)) {
+        .method_not_allowed => |allow| try testing.expectEqualStrings("POST", allow),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "router：后缀规范化与 withSuffix 链接生成" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+    try router.addSuffix("html");
+    try router.addSuffix(".HTML"); // 重复（大小写）忽略
+    try router.addSuffix(""); // 忽略
+    try testing.expectEqual(@as(usize, 1), router.pseudo_suffixes.items.len);
+    try testing.expectEqualStrings(".html", router.pseudo_suffixes.items[0]);
+    try testing.expectError(error.InvalidSuffix, router.addSuffix("a/b"));
+
+    try testing.expectEqualStrings(".html", router.suffixOf("/about.HTML").?);
+    try testing.expect(router.suffixOf("/about.json") == null);
+    try testing.expectEqualStrings("/about", router.stripPseudoSuffix("/about.html").?);
+
+    const about = try withSuffix(testing.allocator, "/about", ".html");
+    defer testing.allocator.free(about);
+    try testing.expectEqualStrings("/about.html", about);
+
+    const idempotent = try withSuffix(testing.allocator, "/about.html", "html");
+    defer testing.allocator.free(idempotent);
+    try testing.expectEqualStrings("/about.html", idempotent);
+
+    const query = try withSuffix(testing.allocator, "/news/?page=2", ".html");
+    defer testing.allocator.free(query);
+    try testing.expectEqualStrings("/news.html?page=2", query);
+
+    const root = try withSuffix(testing.allocator, "/", ".html");
+    defer testing.allocator.free(root);
+    try testing.expectEqualStrings("/", root);
 }
 
 test "router：方法不符 → 405 且带 Allow" {
