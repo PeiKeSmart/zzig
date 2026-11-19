@@ -290,11 +290,15 @@ pub const Db = struct {
         return rows;
     }
 
-    /// 预处理一条语句（SQL 文本在返回前即可释放：sqlite 会复制 SQL）。
+    /// 预处理一条语句。
+    ///
+    /// **SQL 文本由 `Stmt` 自己持有**：`sqlite3_prepare_v2` 不复制 SQL（`SQLITE_STATIC` 语义），
+    /// 语句存活期间 SQL 缓冲必须有效。早期实现里 `defer buf.deinit()` 会提前释放，
+    /// 导致「带参数的 prepare 在后续 bind/step 时读到已释放内存」而崩溃（已修）。
     pub fn prepare(self: *Db, gpa: std.mem.Allocator, sql: []const u8) !Stmt {
         // 0.17 移除了 Allocator.dupeZ，这里手工补 \0
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(gpa);
+        errdefer buf.deinit(gpa);
         try buf.appendSlice(gpa, sql);
         try buf.append(gpa, 0);
         const sql_z: [*:0]const u8 = @ptrCast(buf.items.ptr);
@@ -305,7 +309,9 @@ pub const Db = struct {
             self.setError(std.mem.span(self.lib.errmsg(self.handle)));
             return error.Sqlite;
         }
-        return .{ .db = self, .handle = handle };
+        // 成功：把缓冲交给 Stmt（含尾部 \0），由 `Stmt.finalize` 释放
+        const owned = try buf.toOwnedSlice(gpa);
+        return .{ .db = self, .handle = handle, .sql = owned, .sql_allocator = gpa };
     }
 
     pub fn changes(self: *Db) usize {
@@ -320,14 +326,32 @@ pub const Db = struct {
 pub const Stmt = struct {
     db: *Db,
     handle: ?*anyopaque,
+    /// 本语句的 SQL 副本（sqlite 不复制 SQL，必须由语句对象持有）
+    sql: ?[]u8 = null,
+    sql_allocator: ?std.mem.Allocator = null,
 
     pub fn finalize(self: Stmt) void {
         _ = self.db.lib.finalize(self.handle);
+        if (self.sql) |owned| {
+            if (self.sql_allocator) |gpa| gpa.free(owned);
+        }
     }
 
     pub fn reset(self: Stmt) void {
         _ = self.db.lib.reset(self.handle);
         _ = self.db.lib.clear_bindings(self.handle);
+    }
+
+    /// 推进一行。返回 sqlite 原始码（`sqlite_row` / `sqlite_done` / 错误）。
+    ///
+    /// **`readRow` 必须在 `step()` 返回 `sqlite_row` 之后调用**（未 step 时列值均为 null）。
+    pub fn step(self: Stmt) c_int {
+        return self.db.lib.step(self.handle);
+    }
+
+    /// 推进一步并判断是否拿到了行（未拿到时已设置为错误行或 done）。
+    pub fn hasRow(self: Stmt) bool {
+        return self.step() == sqlite_row;
     }
 
     /// 绑定参数（索引从 1 开始）。

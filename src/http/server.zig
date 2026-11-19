@@ -28,8 +28,9 @@ pub const RequestView = struct {
     /// 原始请求头（名称小写，值原样；已复制到本次请求的 arena）。
     /// 鉴权/限流/追踪等业务层规则需要它；传输层本身不解读。
     headers: []const std.http.Header = &.{},
-    /// 对端地址（`ip:port` 文本，来自 accept 返回的 socket 地址；拿不到时为 `null`）。
-    /// WAF / 限流 / IP 名单靠它拿真实来源；不填就等于所有请求都「没有 IP」。
+    /// 对端地址（**纯 IP**，不含端口；IPv6 为 `::1` 这种裸形式）。
+    /// WAF / 限流 / IP 名单 / 审计直接用它；**不要**再自己剥端口。
+    /// 反代场景下它已被 `trust_forwarded_for` 换成真实客户端 IP。
     remote_addr: ?[]const u8 = null,
 };
 
@@ -75,11 +76,15 @@ pub const Options = struct {
     /// 只加这三个「不依赖页面结构」的头；CSP 会打到内联脚本与外链 CDN，
     /// 必须由业务按自己页面定制，库不默认开。
     security_headers: bool = true,
-    /// 是否信任反代转发头（**仅当 TCP 对端是回环时**才采纳，符合「只信任紧邻那一跳」口径）：
-    /// `x-real-ip` 优先 → `x-forwarded-for` **末段**。
-    /// 开了它，`RequestView.remote_addr` 才是真实客户端 IP（WAF / 限流 / 审计都靠它）；
-    /// 不开则恒为 TCP 对端（反代后全是 `127.0.0.1`）。
-    trust_forwarded_for: bool = false,
+    /// 是否信任反代转发头：**只当 TCP 对端是回环或命中 `trusted_proxy_prefixes` 时才采纳**，
+    /// 按 `x-real-ip` 优先 → `x-forwarded-for` **末段** 取真实客户端 IP。
+    ///
+    /// **默认开**：生态里应用绝大多数跑在 nginx 之后；直连公网时对端不是回环/受信网段，
+    /// 转发头一律忽略 —— 所以默认开与关的安全强度一致，但少了「反代后面全变 127.0.0.1」这个默衰。
+    trust_forwarded_for: bool = true,
+    /// 除回环外，还信任哪些「TCP 对端地址前缀」（容器 / 跨机反代）：如 `&.{"172.16.", "10."}`。
+    /// **只在明确知道反代网段时配**：前缀越宽越容易被伪造。
+    trusted_proxy_prefixes: []const []const u8 = &.{},
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
@@ -200,9 +205,10 @@ pub const Server = struct {
         // 结构体调试打印（实测输出 `.{ .ip4 = ... }`），必须显式用 `Io.Writer.fixed`。
         var remote_buf: [80]u8 = undefined;
         var remote_writer: std.Io.Writer = .fixed(&remote_buf);
-        const remote_addr: ?[]const u8 = blk: {
+        const tcp_peer: ?[]const u8 = blk: {
             stream.socket.address.format(&remote_writer) catch break :blk null;
-            break :blk remote_writer.buffered();
+            // 只留纯 IP：`127.0.0.1:52341` / `[::1]:52341` → `127.0.0.1` / `::1`
+            break :blk stripPort(remote_writer.buffered());
         };
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -211,7 +217,7 @@ pub const Server = struct {
         var served: usize = 0;
         while (served < max_requests) : (served += 1) {
             _ = arena_state.reset(.retain_capacity);
-            const keep = try self.handleOne(&http, remote_addr, arena_state.allocator());
+            const keep = try self.handleOne(&http, tcp_peer, arena_state.allocator());
             // keep-alive 时必须立即把响应刷给客户端：否则数据滞留在写缓冲里，
             // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
             try sw.interface.flush();
@@ -226,6 +232,15 @@ pub const Server = struct {
             .keep_alive_timeout_secs = self.opts.keep_alive_timeout_secs,
             .security_headers = self.opts.security_headers,
         };
+    }
+
+    /// TCP 对端是否可信代理（回环，或命中 `trusted_proxy_prefixes`）。
+    fn isTrustedProxy(self: *const Server, peer: []const u8) bool {
+        if (isLoopbackPeer(peer)) return true;
+        for (self.opts.trusted_proxy_prefixes) |prefix| {
+            if (prefix.len > 0 and std.mem.startsWith(u8, peer, prefix)) return true;
+        }
+        return false;
     }
 
     /// 在已就绪的连接上处理**一个**请求；返回 `true` 表示连接可以继续复用。
@@ -249,11 +264,11 @@ pub const Server = struct {
             });
         }
 
-        // 真实客户端 IP：反代场景下 TCP 对端恒为回环，需采纳转发头（只信紧邻那一跳）
+        // 真实客户端 IP：反代场景下 TCP 对端是回环/受信代理，需采纳转发头（只信紧邻那一跳）
         var remote_addr = tcp_peer;
         if (self.opts.trust_forwarded_for) {
             if (tcp_peer) |peer| {
-                if (isLoopbackPeer(peer)) {
+                if (self.isTrustedProxy(peer)) {
                     if (headerValue(header_list.items, "x-real-ip")) |value| {
                         const trimmed = std.mem.trim(u8, value, " \t");
                         if (trimmed.len > 0) remote_addr = trimmed;
@@ -455,11 +470,18 @@ fn lastForwardedFor(value: []const u8) ?[]const u8 {
     return if (last.len == 0) null else last;
 }
 
-/// TCP 对端是否回环（`127.x.x.x` / `[::1]` / `::1`，含端口）。
+/// TCP 对端是否回环（`127.x.x.x` / `::1`）。
 fn isLoopbackPeer(peer: []const u8) bool {
     if (std.mem.startsWith(u8, peer, "127.")) return true;
-    if (std.mem.startsWith(u8, peer, "[::1]")) return true;
-    return std.mem.eql(u8, peer, "::1");
+    return std.mem.eql(u8, peer, "::1") or std.mem.eql(u8, peer, "[::1]");
+}
+
+/// 去掉 `ip:port` 的端口：`1.2.3.4:80` → `1.2.3.4`、`[::1]:80` → `::1`、裸 IPv6 原样。
+fn stripPort(addr: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, addr, ']')) |close| return addr[1..close];
+    const first = std.mem.indexOfScalar(u8, addr, ':') orelse return addr;
+    if (std.mem.lastIndexOfScalar(u8, addr, ':').? != first) return addr; // 裸 IPv6
+    return addr[0..first];
 }
 
 /// 同上，但额外带上明确的 `content-length`（无正文的 HEAD 响应）。
@@ -514,7 +536,7 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
         fn handler(raw: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (req.remote_addr) |addr| {
-                self.remote_ok = std.mem.startsWith(u8, addr, "127.0.0.1:");
+                self.remote_ok = std.mem.eql(u8, addr, "127.0.0.1");
             }
             if (std.mem.eql(u8, req.path, "/echo")) {
                 return .{ .body = try std.fmt.allocPrint(arena, "{{\"len\":{d}}}", .{req.body.len}) };
@@ -1057,7 +1079,7 @@ test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-F
         }
     };
 
-    // 轮 1：默认不信任转发头 → remote_addr 必须是 TCP 对端（127.0.0.1:port）
+    // 轮 1：默认信任转发头 → `X-Real-IP` 优先
     {
         const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
         var resp: [2048]u8 = undefined;
@@ -1072,23 +1094,12 @@ test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-F
         try testing.expect(std.mem.indexOf(u8, text, "x-content-type-options: nosniff") != null);
         try testing.expect(std.mem.indexOf(u8, text, "x-frame-options: SAMEORIGIN") != null);
         try testing.expect(std.mem.indexOf(u8, text, "referrer-policy: no-referrer") != null);
-        // 默认不信任反代：仍是回环对端
-        try testing.expect(std.mem.startsWith(u8, ctx.remoteSlice(), "127.0.0.1:"));
-    }
-
-    // 轮 2：信任反代 + X-Real-IP 优先
-    {
-        ctx.impl.opts.trust_forwarded_for = true;
-        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
-        var resp: [2048]u8 = undefined;
-        _ = try Send.one(address, io, "X-Real-IP: 8.8.8.8\r\nX-Forwarded-For: 1.1.1.1, 9.9.9.9\r\n", &resp);
-        th.join();
+        // 默认信任回环反代：采纳 X-Real-IP
         try testing.expectEqualStrings("8.8.8.8", ctx.remoteSlice());
     }
 
-    // 轮 3：信任反代 + 只有 XFF → 取**末段**（左侧客户端可伪造）
+    // 轮 2：只有 XFF → 取**末段**（左侧客户端可伪造）
     {
-        ctx.impl.opts.trust_forwarded_for = true;
         const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
         var resp: [2048]u8 = undefined;
         _ = try Send.one(address, io, "X-Forwarded-For: 1.1.1.1, 9.9.9.9\r\n", &resp);
@@ -1096,6 +1107,27 @@ test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-F
         try testing.expectEqualStrings("9.9.9.9", ctx.remoteSlice());
     }
 
-    ctx.impl.opts.trust_forwarded_for = false;
-    std.debug.print("[http] 安全头 + 真实 IP OK：默认 nosniff/SAMEORIGIN/no-referrer，XFF 取末段\n", .{});
+    // 轮 3：显式关掉信任 → 仍是回环对端（直连部署的安全兜底）
+    {
+        ctx.impl.opts.trust_forwarded_for = false;
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        var resp: [2048]u8 = undefined;
+        _ = try Send.one(address, io, "X-Real-IP: 8.8.8.8\r\n", &resp);
+        th.join();
+        try testing.expectEqualStrings("127.0.0.1", ctx.remoteSlice());
+        ctx.impl.opts.trust_forwarded_for = true;
+    }
+
+    // 轮 4：受信代理网段（容器里 nginx 的 172.16.x.x 也要认）
+    {
+        ctx.impl.opts.trusted_proxy_prefixes = &.{"127."};
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        var resp: [2048]u8 = undefined;
+        _ = try Send.one(address, io, "X-Real-IP: 7.7.7.7\r\n", &resp);
+        th.join();
+        try testing.expectEqualStrings("7.7.7.7", ctx.remoteSlice());
+        ctx.impl.opts.trusted_proxy_prefixes = &.{};
+    }
+
+    std.debug.print("[http] 安全头 + 真实 IP OK：默认信任回环反代，XFF 取末段，可关可加网段\n", .{});
 }
