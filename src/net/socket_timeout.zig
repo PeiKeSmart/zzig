@@ -96,7 +96,7 @@ fn setSocketOptionAfd(io: std.Io, stream: std.Io.net.Stream, which: Which, value
             // 带上具体 NTSTATUS：0xC00000BB = NOT_SUPPORTED，0xC000000D = INVALID_PARAMETER
             std.debug.print(
                 "[socket_timeout] AFD SOCKOPT 失败：opt={s} value={d} status=0x{X}\n",
-                .{ @tagName(which), value_in, @intFromEnum(status) },
+                .{ @tagName(which), value_in, @backingInt(status) },
             );
             return error.SetFailed;
         },

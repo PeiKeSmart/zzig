@@ -409,7 +409,7 @@ test {
     _ = @import("file/glob.zig");
     _ = @import("file/fsio.zig");
     _ = @import("net/url.zig");
-_ = @import("net/socket_timeout.zig");
+    _ = @import("net/socket_timeout.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
