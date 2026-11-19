@@ -4,8 +4,9 @@
 //!
 //! **协议解析已不再使用 `std.http.Server`**（2026-11-19 起）：它的 head 解析路径实测需要
 //! >64 KiB 的协程栈，在 zio 协程后端下把每连接内存推到 59 KB（C# Kestrel 11 KB / Rust hyper 14 KB）。
-//! 现在改用 `lighting` 的 `parseRequestHead`（零拷贝）+ `BodyReader`（Content-Length/chunked）
-//! + `ResponseWriter`（双模缓冲），实测降到 20 KB/连接。连接循环、上限、早拒、XFF 仍在本文件。
+//! 现在改用**本库收编的** `head_parser.parseRequestHead`（零拷贝）+ `body_reader.BodyReader`
+//! （两者均收编自 lighting / MIT，已去 header 容器与 deadline 参数，纯零分配），
+//! 实测降到 20 KB/连接。连接循环、上限、早拒、XFF 仍在本文件。
 //!
 //! 口径：
 //! - 请求体上限（默认 1 MB）、连接数上限（超限直接关，不排队不分配线程）、每连接独立 arena；
@@ -17,7 +18,8 @@
 //! 这类带检查的非线程安全分配器，会在 accept 相关的内部路径上直接 panic。
 
 const std = @import("std");
-const lighting = @import("lighting");
+const head_parser = @import("head_parser.zig");
+const body_reader = @import("body_reader.zig");
 const compat = @import("../compat.zig");
 const socket_timeout = @import("../net/socket_timeout.zig");
 
@@ -427,8 +429,8 @@ pub const Server = struct {
         const head_bytes = try arena.dupe(u8, head_raw);
         cb.consume(head_len);
 
-        // 2) 解析（lighting 的零拷贝分帧，不再用 std.http —— 后者要吃 39 KB 协程栈）
-        const head = lighting.parseRequestHead(arena, head_bytes) catch |e| {
+        // 2) 解析（本库收编的零拷贝分帧，不用 std.http —— 后者要吃 39 KB 协程栈）
+        const head = head_parser.parseRequestHead(head_bytes) catch |e| {
             std.debug.print("[zzig.http] 请求头解析失败：{s}\n", .{@errorName(e)});
             const msg = "{\"code\":400,\"msg\":\"bad request\"}";
             try self.writeReply(sw, .{ .status = .bad_request, .body = msg }, null, self.headerOptions(false), false);
@@ -439,7 +441,7 @@ pub const Server = struct {
         const path = head.target[0..path_end];
         const query = if (path_end < head.target.len) head.target[path_end + 1 ..] else "";
 
-        // 3) 头列表：lighting 的 `HeaderMap` 只提供 get/set（没有遍历接口），
+        // 3) 头列表：解析器不建 header 容器（只做校验与关键字段提取），
         //    这里直接按原始字节扫一遍 —— head_bytes 已通过 `parseRequestHead` 的格式校验，
         //    二次扫描是安全的，且零额外分配（名字转小写，符合 `RequestView.headers` 的约定）。
         var header_list: std.ArrayList(std.http.Header) = .empty;
@@ -657,14 +659,14 @@ pub const Server = struct {
         return out;
     }
 
-    /// 读分块（chunked）请求体：交给 lighting 的 `BodyReader`（已处理分块解码与 trailer）。
+    /// 读分块（chunked）请求体：交给 `body_reader.BodyReader`（已处理分块解码与 trailer 校验）。
     fn readChunkedBody(
         self: *Server,
         stream: std.Io.net.Stream,
         cb: *ConnBuf,
         arena: std.mem.Allocator,
     ) ![]const u8 {
-        var br = lighting.BodyReader.init(stream, self.io, cb.buf[0..cb.len], null, true);
+        var br = body_reader.BodyReader.init(stream, self.io, cb.buf[0..cb.len], null, true);
         const body = try br.readAllAlloc(arena, self.opts.max_body);
         // BodyReader 直接消费 socket 流，连接缓冲里的字节已由它接管
         cb.len = 0;
@@ -689,10 +691,10 @@ const ConnBuf = struct {
     }
 };
 
-/// lighting 的方法枚举 → `std.http.Method`（`RequestView.method` 保持标准库类型，
+/// 收编的解析器方法枚举 → `std.http.Method`（`RequestView.method` 保持标准库类型，
 /// 消费方的 `.method == .GET` 之类写法不用改）。`std.http.Method` 多一个 `QUERY`，
-/// lighting 不认（返回 InvalidMethod → 400），属于可接受的行为收窄。
-fn toStdMethod(m: lighting.Method) std.http.Method {
+/// 解析器不认（返回 InvalidMethod → 400），属于可接受的行为收窄。
+fn toStdMethod(m: head_parser.Method) std.http.Method {
     return switch (m) {
         .GET => .GET,
         .HEAD => .HEAD,

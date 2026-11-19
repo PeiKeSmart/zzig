@@ -26,11 +26,8 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // lighting：HTTP/1.1 解析与响应生成基础层（自写分帧，**不依赖 std.http.Server**）。
-        // 只借用它的 `parseRequestHead`（零拷贝头解析）、`BodyReader`（Content-Length / chunked）、
-        // `ResponseWriter`（双模缓冲 + keep-alive 语义）；连接循环、上限、早拒、XFF 仍在本库实现。
-        // 动机见 docs/决策记录.md 2026-11-19（十）：std.http 的 head 解析吃掉 ~39 KB/连接的协程栈。
-        .lighting = .{ .path = "../lighting" },
+        // 本包**零外部依赖**：HTTP 解析已收编进 src/http/{head_parser,body_reader}.zig
+        // （均源于 lighting / MIT，已在文件头标注署名）。
     },
 
     // Specifies the set of files and directories that are included in this package.
