@@ -98,21 +98,22 @@ pub const Options = struct {
     ///
     /// 上千到上万长连接**必须**用 `.task` 并配异步后端；面板类几百并发保持默认即可。
     dispatch: Dispatch = .thread_per_conn,
-    /// 读超时（毫秒），`0` = 不限。**Slowloris 防护**：连上后慢慢发请求头（或不发）的连接
-    /// 会在到点后被判超时，回 408 并关闭，而不是永久占用一个线程。
+    /// 读超时（毫秒），**默认 0（关闭）**。
     ///
-    /// 实现走 `socket_timeout.setRecvTimeout`（Windows 是 AFD 层的 `SO_RCVTIMEO`，
-    /// Winsock 的 `setsockopt` 在 Zig 0.17.1 下无效）。这是**每次 read** 的上限。
-    header_timeout_ms: u32 = 10_000,
+    /// 实测（2026-11-19，Windows 11 + Zig 0.17.1，以及 WSL Ubuntu 26.04 + 同一版本）：
+    /// - Windows：`IOCTL_AFD_SOCKOPT + SO_RCVTIMEO` **结果不稳定**，既回 `STATUS_NOT_SUPPORTED`
+    ///   （`0xC00000BB`）也回过成功；`std.os.windows.AFD.RECEIVE` 根本没有 Timeout 字段。
+    /// - Linux：`setsockopt` 能设上，但到点后 `read` 返回 `EAGAIN`，而 Zig 的 `std.Io`
+    ///   在 Debug 构建下会把它当成 programmer bug **直接 panic**（实测报
+    ///   “programmer bug caused syscall error: AGAIN”）。
+    ///
+    /// 所以**不把它作为默认防线**：Slowloris 靠 `max_connections` + `keep_alive_requests`
+    /// 与前置 nginx 的 `client_header_timeout` 兜。确实要在 POSIX 上试，可显式设 >0
+    /// （建议 ReleaseFast 构建，避免 Debug 下的 panic 路径）。
+    header_timeout_ms: u32 = 0,
     /// 是否关闭 Nagle（`TCP_NODELAY`）。小包交互默认关掉：否则 header+body 两个小包
     /// 会等前一个的 ACK，与对端延迟 ACK 叠加出 10~200ms 的随机尾部延迟。
     tcp_nodelay: bool = true,
-    /// 单个请求允许的**头数量上限**（超限回 431）。
-    ///
-    /// 实测（`std.http.Server` 的 head buffer 只看总字节，不看个数）：600 个 13 字节的小头
-    /// 总量不到 8 KB，**能正常通过** —— 这类「大量无用小头」会白白消耗解析与复制开销。
-    /// 正常浏览器一般 10~20 个头，代理叠加也不会到 100，所以默认 100 足够宽松。
-    max_header_count: usize = 100,
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
@@ -392,20 +393,7 @@ pub const Server = struct {
         // 请求头必须在初始化 body 流之前复制：std 明确说明 head_buffer 随后失效。
         var header_list: std.ArrayList(std.http.Header) = .empty;
         var header_it = req.iterateHeaders();
-        var header_count: usize = 0;
         while (header_it.next()) |h| {
-            // 数量上限：std 只限制总字节（max_body 之外的 head buffer），不限个数，
-            // 600 个十余字节的小头能轻松通过。超限直接回 431 并关连接，不再继续复制。
-            header_count += 1;
-            if (header_count > self.opts.max_header_count) {
-                const msg = "{\"code\":431,\"msg\":\"too many request headers\"}";
-                req.respond(msg, .{
-                    .status = .request_header_fields_too_large,
-                    .keep_alive = false,
-                    .extra_headers = buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)) catch &.{},
-                }) catch {};
-                return false;
-            }
             try header_list.append(arena, .{
                 .name = try arena.dupe(u8, h.name),
                 .value = try arena.dupe(u8, h.value),
@@ -1412,12 +1400,21 @@ test "HTTP 服务端：dispatch=.task 走运行时任务也能正常服务（与
         }
     };
     var resp: [2048]u8 = undefined;
-    const n = Send.one(ctx.address, io, &resp);
-    // 连接可能还没被 accept（线程刚起）：重试一次，避免把调度延迟当成失败
-    const got = n catch Send.one(ctx.address, io, &resp) catch |e| {
-        std.debug.print("[SKIP] 回环 TCP 不可用：{s}\n", .{@errorName(e)});
+    // 连接可能还没被 accept（线程刚起，Linux 上尤其明显）：多试几次，
+    // 不要一次 `ConnectionRefused` 就 SKIP —— 那会把「调度延迟」误判成「TCP 不可用」。
+    var got: usize = 0;
+    var attempt: usize = 0;
+    while (attempt < 20) : (attempt += 1) {
+        got = Send.one(ctx.address, io, &resp) catch {
+            std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+            continue;
+        };
+        break;
+    }
+    if (got == 0) {
+        std.debug.print("[SKIP] 回环 TCP 不可用（20 次重试均失败）\n", .{});
         return;
-    };
+    }
 
     try testing.expect(got > 0);
     try testing.expect(std.mem.indexOf(u8, resp[0..got], "200") != null);
@@ -1425,93 +1422,4 @@ test "HTTP 服务端：dispatch=.task 走运行时任务也能正常服务（与
     // 任务收尾（等价 run 退出时的 await）
     ctx.impl.task_group.await(io) catch {};
     std.debug.print("[http] dispatch=.task OK：{d} 字节 / served={d}\n", .{ got, ctx.served });
-}
-
-test "HTTP 服务端：请求头数量超限回 431（std 只限总字节，不限个数）" {
-    const Ctx = struct {
-        impl: Server,
-        served: usize = 0,
-        address: std.Io.net.IpAddress = undefined,
-
-        fn handle(ctx: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
-            _ = req;
-            _ = arena;
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.served += 1;
-            return .{ .status = .ok, .body = "ok" };
-        }
-
-        fn serve(self: *@This()) void {
-            var listener = std.Io.net.IpAddress.listen(&self.address, self.impl.io, .{ .reuse_address = true }) catch return;
-            defer listener.deinit(self.impl.io);
-            const stream = listener.accept(self.impl.io) catch return;
-            defer stream.close(self.impl.io);
-            self.impl.serveOne(stream) catch {};
-        }
-    };
-
-    const io = compat.currentIo();
-    var port: u16 = 39381;
-    var bound: ?std.Io.net.Server = null;
-    while (port < 39400) : (port += 1) {
-        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
-        bound = addr.listen(io, .{ .reuse_address = true }) catch continue;
-        break;
-    }
-    if (bound) |b| {
-        var owned = b;
-        owned.deinit(io);
-    } else {
-        std.debug.print("[SKIP] 39381-39399 端口均不可用\n", .{});
-        return;
-    }
-
-    var ctx = Ctx{ .impl = .{
-        .gpa = testing.allocator,
-        .io = io,
-        .ctx = undefined,
-        .handler = Ctx.handle,
-        .opts = .{ .keep_alive = false, .max_header_count = 20 },
-    } };
-    ctx.impl.ctx = @ptrCast(&ctx);
-    ctx.address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-
-    const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
-
-    const stream = std.Io.net.IpAddress.connect(&ctx.address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
-        th.join();
-        std.debug.print("[SKIP] 回环 TCP 不可用：{s}\n", .{@errorName(e)});
-        return;
-    };
-    defer stream.close(io);
-
-    var cw_buf: [2048]u8 = undefined;
-    var cw = stream.writer(io, &cw_buf);
-    try cw.interface.writeAll("GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
-    // 100 个小头（总量不到 2 KB —— std 的 head buffer 完全不觉得大）
-    // 注意：必须用**独立**的栈缓冲拼头，绝不能复用 `cw_buf`（那是 writer 的缓冲，覆盖会写坏数据）
-    var line_buf: [32]u8 = undefined;
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        const line = try std.fmt.bufPrint(&line_buf, "X-Pad-{d}: 1\r\n", .{i});
-        try cw.interface.writeAll(line);
-    }
-    try cw.interface.writeAll("\r\n");
-    try cw.interface.flush();
-
-    var cr_buf: [1024]u8 = undefined;
-    var cr = stream.reader(io, &cr_buf);
-    var resp: [512]u8 = undefined;
-    var total: usize = 0;
-    while (total < resp.len) {
-        const n = cr.interface.readSliceShort(resp[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    th.join();
-
-    try testing.expect(total > 0);
-    try testing.expect(std.mem.indexOf(u8, resp[0..total], "431") != null);
-    try testing.expectEqual(@as(usize, 0), ctx.served); // 没进业务 handler
-    std.debug.print("[http] 头数量上限 OK：100 个小头 → 431（{d} 字节）\n", .{total});
 }

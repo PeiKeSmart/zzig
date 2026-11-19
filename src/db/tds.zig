@@ -64,7 +64,9 @@ const builtin = @import("builtin");
 pub const Pipe = struct {
     handle: std.os.windows.HANDLE,
 
-    const win = struct {
+    /// **必须条件编译**：`extern "kernel32"` 在 Linux 上声明会报
+    /// “dependency on dynamic library 'kernel32' requires enabling Position Independent Code”。
+    const win = if (builtin.os.tag == .windows) struct {
         extern "kernel32" fn CreateFileW(
             lpFileName: [*:0]const u16,
             dwDesiredAccess: u32,
@@ -125,6 +127,7 @@ pub const Pipe = struct {
     }
 
     pub fn read(self: *Pipe, dst: []u8) !usize {
+        if (builtin.os.tag != .windows) return error.Unsupported;
         if (dst.len == 0) return 0;
         var got: u32 = 0;
         if (!win.ReadFile(self.handle, dst.ptr, @intCast(dst.len), &got, null).toBool()) {
@@ -136,6 +139,7 @@ pub const Pipe = struct {
     }
 
     pub fn write(self: *Pipe, src: []const u8) !usize {
+        if (builtin.os.tag != .windows) return error.Unsupported;
         var sent: u32 = 0;
         if (!win.WriteFile(self.handle, src.ptr, @intCast(src.len), &sent, null).toBool()) {
             const code = std.os.windows.GetLastError();
@@ -151,6 +155,7 @@ pub const Pipe = struct {
     }
 
     pub fn close(self: *Pipe) void {
+        if (builtin.os.tag != .windows) return;
         _ = win.CloseHandle(self.handle);
     }
 };

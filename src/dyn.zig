@@ -33,9 +33,10 @@ pub const Module = struct {
             const proc = win.GetProcAddress(self.handle, name.ptr) orelse return null;
             return @ptrFromInt(@intFromPtr(proc));
         }
+        // Unix：`std.DynLib.lookup` 返回 `?T`（**不是** error union，`catch` 会报
+        // “expected error union type” —— 这一支以前从没在 Linux 上编译过）。
         const lib = self.lib orelse return null;
-        const T2 = T;
-        return lib.lookup(T2, name) catch null;
+        return lib.lookup(T, name);
     }
 
     pub fn close(self: Module, gpa: std.mem.Allocator) void {
@@ -43,8 +44,9 @@ pub const Module = struct {
             if (self.handle) |h| _ = win.FreeLibrary(h);
             return;
         }
+        // Unix：方法是 `close()`，不是 `deinit()`
         if (self.lib) |lib| {
-            lib.deinit();
+            lib.close();
             gpa.destroy(lib);
         }
     }

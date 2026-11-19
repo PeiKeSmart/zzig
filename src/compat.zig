@@ -41,9 +41,20 @@ pub fn sleep(ns: u64) void {
         switch (builtin.os.tag) {
             .windows => {
                 var interval_100ns: i64 = -@as(i64, @intCast(@divTrunc(ns + 99, 100)));
-                _ = std.os.windows.ntdll.NtDelayExecution(@enumFromInt(1), &interval_100ns);
+                _ = std.os.windows.ntdll.NtDelayExecution(@fromBackingInt(@intCast(1)), &interval_100ns);
+            },
+            // Linux 走 **syscall**：`std.c.nanosleep` 需要显式链接 libc，
+            // 而 zzig 作为库会被「不链 libc」的静态可执行文件使用（如本仓库自己的测试），
+            // 一调就报 "dependency on libc must be explicitly specified in the build command"。
+            .linux => {
+                var ts = std.os.linux.timespec{
+                    .sec = @intCast(ns / std.time.ns_per_s),
+                    .nsec = @intCast(ns % std.time.ns_per_s),
+                };
+                _ = std.os.linux.nanosleep(&ts, null);
             },
             else => {
+                // 其它 POSIX（mac / BSD）：默认链接 libc，可用 std.c
                 var req = std.c.timespec{
                     .sec = @intCast(ns / std.time.ns_per_s),
                     .nsec = @intCast(ns % std.time.ns_per_s),
@@ -72,6 +83,13 @@ pub fn nanoTimestamp() i128 {
                 const ticks_100ns: i128 = (@as(i128, file_time.dwHighDateTime) << 32) | file_time.dwLowDateTime;
                 const windows_to_unix_epoch_100ns: i128 = 116_444_736_000_000_000;
                 return (ticks_100ns - windows_to_unix_epoch_100ns) * 100;
+            },
+            // Linux 走 syscall（`clock_gettime(CLOCK_REALTIME)`）：`std.c` 需要显式链接 libc，
+            // 不链 libc 的静态可执行文件（本仓库测试就是）会直接编译失败。
+            .linux => {
+                var ts: std.os.linux.timespec = undefined;
+                _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+                return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
             },
             else => {
                 var ts: std.c.timespec = undefined;
@@ -297,8 +315,8 @@ pub const windows = struct {
     const BYTE = u8;
     const LONG = i32;
     const PSID = *anyopaque;
-    const BOOL_FALSE: BOOL = @enumFromInt(0);
-    const BOOL_TRUE: BOOL = @enumFromInt(1);
+    const BOOL_FALSE: BOOL = @fromBackingInt(@intCast(0));
+    const BOOL_TRUE: BOOL = @fromBackingInt(@intCast(1));
     const ERROR_SUCCESS: DWORD = 0;
     const KEY_READ: REGSAM = @bitCast(@as(DWORD, 0x20019));
     const REG_SZ: DWORD = 1;

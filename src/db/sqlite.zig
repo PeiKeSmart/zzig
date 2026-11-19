@@ -46,16 +46,20 @@ const sqlite_blob: c_int = 4;
 const sqlite_null: c_int = 5;
 
 /// Win32 动态加载（Zig 0.17 的 `std.DynLib` **不支持 Windows**，只有 linux/mac/BSD 分支）。
-const win = struct {
+///
+/// **必须条件编译**：`extern "kernel32"` 如果在 Linux 上被声明，会报
+/// “dependency on dynamic library 'kernel32' requires enabling Position Independent Code”。
+const win = if (@import("builtin").os.tag == .windows) struct {
     extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(hModule: ?*anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
     extern "kernel32" fn FreeLibrary(hLibModule: ?*anyopaque) callconv(.winapi) i32;
-};
+} else struct {};
 
 const ModuleHandle = struct {
     handle: ?*anyopaque,
 
     pub fn lookup(self: ModuleHandle, comptime T: type, name: [:0]const u8) ?T {
+        if (@import("builtin").os.tag != .windows) return null;
         const proc = win.GetProcAddress(self.handle, name.ptr) orelse return null;
         return @ptrFromInt(@intFromPtr(proc));
     }
@@ -74,7 +78,11 @@ fn loadModule(path: []const u8) ?ModuleHandle {
 }
 
 fn closeModule(m: ModuleHandle) void {
-    if (m.handle) |h| _ = win.FreeLibrary(h);
+    // 写成 `if (windows) { ... }` 而不是「先 return」：Zig 只对 **comptime 命中的分支**
+    // 做语义分析，`if (cond) return;` 后面的语句照样会被分析（Linux 上 `win` 是空 struct）。
+    if (@import("builtin").os.tag == .windows) {
+        if (m.handle) |h| _ = win.FreeLibrary(h);
+    }
 }
 
 /// 动态加载得到的函数表。
