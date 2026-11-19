@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const compat = @import("../compat.zig");
+const socket_timeout = @import("../net/socket_timeout.zig");
 const bson = @import("bson.zig");
 const Value = @import("value.zig").Value;
 const Row = @import("row.zig").Row;
@@ -88,6 +89,8 @@ pub const Conn = struct {
             std.debug.print("[zzig.mongodb] 连接失败：{s}:{d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
             return e;
         };
+        // 关 Nagle：小包请求-响应协议，Nagle + 延迟 ACK 会产生 40 ms 级延迟
+        socket_timeout.setNoDelay(io, stream, true) catch {};
 
         var self = Conn{ .gpa = gpa, .io = io, .stream = stream };
         errdefer {

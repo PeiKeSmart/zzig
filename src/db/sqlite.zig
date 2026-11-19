@@ -196,15 +196,26 @@ pub const Db = struct {
 
     /// 打开连接时的并发相关设置（对应 SQLite 的 `PRAGMA`）。
     ///
-    /// **默认全部不设置**（即 SQLite 原生：`journal_mode=delete` + `synchronous=full`）。
-    /// 实测（Pek.ZCode `zig build bench`，Windows，单行一事务）：`WAL+NORMAL` 写吞吐约
-    /// **慢 2×**（~170 µs/行 vs ~65 µs/行），且「写中并发读」两种档位都没被阻塞。
-    /// 所以 WAL 不做默认值，而由调用方按场景显式选：
-    /// - 长写事务（批量导入）同时要求别人一直能读 → `JournalMode=WAL;Synchronous=NORMAL`
-    /// - 网络盘（SMB/NFS）**不要**用 WAL（共享内存文件不可靠）
+    /// **默认就是最快的档位：`journal_mode=WAL` + `synchronous=NORMAL`。**
+    /// 不需要调用方再手工配（以前默认 `null` = SQLite 原生 `delete`+`full`，是个性能陷阱）。
+    ///
+    /// 实测（`Pek.ZCode` 的 `zig build bench`，**文件库**，ReleaseFast，2026-11-19）：
+    /// - 单次写：WAL+NORMAL **94.76 µs** / DELETE+FULL **3086.89 µs** / DELETE+NORMAL **4731.96 µs**
+    ///   → 原生的 DELETE 档位慢 **32 倍**；
+    /// - 写事务进行中的并发读：WAL 读到 **3047** 次（3.92 µs/次），
+    ///   DELETE 只读到 **25** 次且单次 **36 ms** —— 写的时候前台读被整体阻塞，这才是面板类最致命的。
+    ///
+    /// ⚠ **纠正旧注释**：这里曾写着「WAL+NORMAL 写吞吐约慢 2×（~170 µs/行 vs ~65 µs/行）」并据此
+    /// 把 WAL 排除在默认值之外。该结论与今日复测矛盾：一、旧记录没标明是文件库还是内存库，
+    /// 而内存库上 `journal_mode` 无意义（SQLite 直接忽略），若旧测试跑在内存库上，
+    /// 那 170 vs 65 的差异只能来自 `synchronous` 无效设置与噪声；二、今日在**明确标注文件库 + 三档对比**
+    /// 下反复测到 WAL 快 32 倍。**旧结论作废**，以文件库实测为准。
+    ///
+    /// 仍会因文件系统能力失败（SMB/NFS 不支持共享内存文件）：此时 `applyPragma` 只留痕不中断，
+    /// SQLite 保持原生 `delete` 行为。**确认部署在网络盘时请显式传 `journal_mode = "delete"`**。
     pub const Options = struct {
-        journal_mode: ?[]const u8 = null,
-        synchronous: ?[]const u8 = null,
+        journal_mode: ?[]const u8 = "WAL",
+        synchronous: ?[]const u8 = "NORMAL",
         busy_timeout_ms: u32 = 5000,
         /// `PRAGMA cache_size`：负数是 KB（-64000 = 64MB），正数是页数；`null` 用库默认
         cache_size: ?i32 = null,
@@ -255,8 +266,12 @@ pub const Db = struct {
         var buf: [96]u8 = undefined;
         const sql = std.fmt.bufPrint(&buf, "PRAGMA {s}={s}", .{ name, v }) catch return;
         _ = self.exec(std.heap.page_allocator, sql) catch {
-            // 留痕：某些构建/文件系统不支持 WAL，属可降级项
-            std.debug.print("[sqlite] PRAGMA {s} 未生效（{s}），继续使用默认行为\n", .{ sql, self.lastError() });
+            // 留痕：某些构建/文件系统（SMB、NFS 不支持共享内存文件）不支持 WAL，属可降级项 ——
+            // 不中断打开，SQLite 保持原有 journal 模式。确认部署在网络盘时，显式传 journal_mode="delete"。
+            std.debug.print(
+                "[sqlite] PRAGMA {s} 未生效（{s}）；WAL 需要本地盘，网络盘请显式设 journal_mode=\"delete\"\n",
+                .{ sql, self.lastError() },
+            );
         };
     }
 

@@ -47,6 +47,7 @@ const DateTime = @import("../time/datetime.zig").DateTime;
 /// TLS 客户端：std 副本 + 补「服务端请求客户端证书（CertificateRequest）」的处理。
 /// MySQL 8 默认配了 `ssl_ca`，握手必发该消息，std 不处理会直接连不上（见 `tls_client.zig` 头部）。
 const tls_client = @import("tls_client.zig");
+const socket_timeout = @import("../net/socket_timeout.zig");
 
 pub const default_port: u16 = 3306;
 
@@ -398,6 +399,9 @@ pub const Conn = struct {
             std.debug.print("[zzig.mysql] 连接失败：{s}:{d} 原因={s}\n", .{ opts.host, opts.port, @errorName(e) });
             return e;
         };
+        // 关 Nagle：数据库协议是「小包请求-响应」，Nagle 与对端延迟 ACK 叠会产生 **40 ms 级**延迟
+        // （局域网/同机房不明显，跨网段或公网就是灾难）。与 HTTP 服务端同一口径。
+        socket_timeout.setNoDelay(io, stream, true) catch {};
 
         var self = Conn{ .gpa = gpa, .io = io, .stream = stream };
         // 失败时不仅要关 socket，还要释放包缓冲（TLS 状态由 closeQuietly 一并释放）
