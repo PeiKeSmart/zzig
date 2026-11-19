@@ -90,7 +90,6 @@ pub const web = struct {
 
 /// 网络工具（CIDR 解析、IP 处理、接口检测）
 pub const Net = @import("net/net.zig");
-
 /// 控制台工具（UTF-8 编码、ANSI 颜色支持、跨平台兼容）
 pub const Console = @import("console/console.zig");
 
@@ -124,6 +123,12 @@ pub const glob = @import("file/glob.zig");
 
 /// URL 查询串编解码
 pub const url = @import("net/url.zig");
+
+/// Cookie 请求头解析（`Cookie: a=1; b=2`）
+pub const cookie = @import("net/cookie.zig");
+
+/// ASCII 大小写不敏感的前缀/后缀/子串判定
+pub const ascii = @import("text/ascii.zig");
 
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");

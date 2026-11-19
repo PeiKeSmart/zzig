@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const ascii = @import("../text/ascii.zig");
 
 /// 视图/动作通用值（复用 [`value.Value`]）。
 pub const Value = value.Value;
@@ -386,8 +387,7 @@ fn normalizeSuffix(text: []const u8, buffer: *[max_suffix_len]u8) []const u8 {
 }
 
 fn endsWithIgnoreCase(text: []const u8, suffix: []const u8) bool {
-    if (suffix.len == 0 or text.len < suffix.len) return false;
-    return std.ascii.eqlIgnoreCase(text[text.len - suffix.len ..], suffix);
+    return ascii.endsWithIgnoreCase(text, suffix);
 }
 
 // ————— 路由表 —————
@@ -736,6 +736,29 @@ fn methodAllowed(route_method: []const u8, request_method: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(route_method, request_method)) return true;
     if (std.ascii.eqlIgnoreCase(request_method, "HEAD") and
         std.ascii.eqlIgnoreCase(route_method, "GET")) return true;
+    return false;
+}
+
+/// 站内跳转目标校验（防开放重定向）：**只允许单个 `/` 开头的相对路径**。
+///
+/// 拒绝：绝对 URL、协议相对地址（`//evil.example`）、含反斜杠（`/a\b`）、空白串。
+pub fn safeLocalPath(target: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, target, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '/') return null;
+    if (std.mem.startsWith(u8, trimmed, "//")) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '\\') != null) return null;
+    return trimmed;
+}
+
+/// 是否 Ajax 请求（与 C# `Request.IsAjaxRequest()` 同口径）：
+/// `X-Requested-With: XMLHttpRequest`，或 `Accept` 包含 `application/json`。
+pub fn isAjax(req: Request) bool {
+    if (req.header("x-requested-with")) |value_text| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value_text, " \t"), "xmlhttprequest")) return true;
+    }
+    if (req.header("accept")) |accept| {
+        return ascii.containsIgnoreCase(accept, "application/json");
+    }
     return false;
 }
 
