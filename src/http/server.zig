@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const compat = @import("../compat.zig");
+const socket_timeout = @import("../net/socket_timeout.zig");
 
 /// 业务回调看到的请求视图（只在本次调用内有效）。
 pub const RequestView = struct {
@@ -85,10 +86,39 @@ pub const Options = struct {
     /// 除回环外，还信任哪些「TCP 对端地址前缀」（容器 / 跨机反代）：如 `&.{"172.16.", "10."}`。
     /// **只在明确知道反代网段时配**：前缀越宽越容易被伪造。
     trusted_proxy_prefixes: []const []const u8 = &.{},
+    /// 连接调度方式（与 `zgrpc.grpc.ConnDispatch` 同一口径）：
+    ///
+    /// - `.thread_per_conn`（默认）：每连接一独立线程。几百连接以内吞吐最好，
+    ///   但线程数随连接数线性增长（每线程 ~86µs 创建成本，上万长连接会被拖垮）；
+    /// - `.task`：连接跑在 `std.Io.Group` 的**运行时任务**里，而不是 OS 线程里。
+    ///   语义完全由传入的 `std.Io` 决定：
+    ///   - 传 `std.Io.Threaded`：落到线程池（有并发上限，超限会自动回退独立线程，不丢连接）；
+    ///   - 传异步后端（如 zio：Windows IOCP / Linux io_uring）：任务是**协程**，
+    ///     连接数不再等于线程数。
+    ///
+    /// 上千到上万长连接**必须**用 `.task` 并配异步后端；面板类几百并发保持默认即可。
+    dispatch: Dispatch = .thread_per_conn,
+    /// 读超时（毫秒），`0` = 不限。**Slowloris 防护**：连上后慢慢发请求头（或不发）的连接
+    /// 会在到点后被判超时，回 408 并关闭，而不是永久占用一个线程。
+    ///
+    /// 实现走 `socket_timeout.setRecvTimeout`（Windows 是 AFD 层的 `SO_RCVTIMEO`，
+    /// Winsock 的 `setsockopt` 在 Zig 0.17.1 下无效）。这是**每次 read** 的上限。
+    header_timeout_ms: u32 = 10_000,
+    /// 是否关闭 Nagle（`TCP_NODELAY`）。小包交互默认关掉：否则 header+body 两个小包
+    /// 会等前一个的 ACK，与对端延迟 ACK 叠加出 10~200ms 的随机尾部延迟。
+    tcp_nodelay: bool = true,
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
 pub const HandlerFn = *const fn (ctx: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply;
+
+/// 连接调度方式（对齐 `zgrpc.grpc.ConnDispatch`；`.pool` 需外部线程池，本库不内建）。
+pub const Dispatch = enum {
+    /// 每连接一独立线程（默认；几百连接以内吞吐最好）
+    thread_per_conn,
+    /// 每连接一个运行时任务（配异步 `std.Io` 后端就是事件循环）
+    task,
+};
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -104,6 +134,10 @@ pub const Server = struct {
     listener: ?*std.Io.net.Server = null,
     /// 唤醒 accept 用的回连地址（由 `run` 记下）
     wake_addr: ?std.Io.net.IpAddress = null,
+    /// `.task` 调度时的连接任务组：`run` 退出时 await 它（优雅收尾）。
+    task_group: std.Io.Group = .init,
+    /// 读超时设置失败的提示是否已发过（只提示一次，避免每连接刷屏）
+    timeout_warned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// 阻塞跑监听循环（调用方决定放主线程还是子线程）。
     /// `host` 必须是 IP 字面量；绑不上会返回错误（调用方决定重试还是 SKIP）。
@@ -131,6 +165,8 @@ pub const Server = struct {
             self.listener_guard.unlock(self.io);
             listener.deinit(self.io);
         }
+        // `.task` 调度：连接任务挂在 `task_group` 上，退出时必须 await（否则改内存时还有未完成连接）
+        defer if (self.opts.dispatch == .task) self.task_group.await(self.io) catch {};
 
         while (!self.stopped.load(.acquire)) {
             const stream = listener.accept(self.io) catch |e| {
@@ -149,14 +185,39 @@ pub const Server = struct {
                 continue;
             }
             _ = self.active.fetchAdd(1, .acq_rel);
-            const th = std.Thread.spawn(.{}, connMain, .{ self, stream }) catch |e| {
-                _ = self.active.fetchSub(1, .acq_rel);
-                std.debug.print("[zzig.http] 创建连接线程失败：{s}\n", .{@errorName(e)});
-                stream.close(self.io);
-                continue;
-            };
-            th.detach();
+            self.dispatchStream(stream);
         }
+    }
+
+    /// 按 `opts.dispatch` 把一条已 accept 的连接交给对应执行体（调用方已 `active +1`）。
+    ///
+    /// `.task` 在「带并发上限的后端」（如 `std.Io.Threaded` 的线程池）也可能返回
+    /// `ConcurrencyUnavailable` —— 那时**回退独立线程，绝不丢连接**（与 zgrpc 一致）。
+    fn dispatchStream(self: *Server, stream: std.Io.net.Stream) void {
+        if (self.opts.dispatch == .task) {
+            self.task_group.concurrent(self.io, connTaskEntry, .{ self, stream }) catch |e| {
+                std.debug.print("[zzig.http] 连接任务创建失败（{s}），回退为独立线程\n", .{@errorName(e)});
+                self.spawnConnThread(stream);
+            };
+            return;
+        }
+        self.spawnConnThread(stream);
+    }
+
+    /// `.task` 的任务入口：`std.Io.Group` 要求返回值可强转成 `Cancelable!void`。
+    fn connTaskEntry(self: *Server, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+        self.connMain(stream);
+    }
+
+    /// 独立线程模型：起线程后立即 detach，连接结束由线程自己退出。
+    fn spawnConnThread(self: *Server, stream: std.Io.net.Stream) void {
+        const th = std.Thread.spawn(.{}, connMain, .{ self, stream }) catch |e| {
+            _ = self.active.fetchSub(1, .acq_rel);
+            std.debug.print("[zzig.http] 创建连接线程失败：{s}\n", .{@errorName(e)});
+            stream.close(self.io);
+            return;
+        };
+        th.detach();
     }
 
     /// 让 `run` 退出（幂等）。
@@ -178,12 +239,32 @@ pub const Server = struct {
 
     fn connMain(self: *Server, stream: std.Io.net.Stream) void {
         defer _ = self.active.fetchSub(1, .acq_rel);
+        self.applySocketOptions(stream);
         const limit = if (self.opts.keep_alive) @max(self.opts.keep_alive_requests, 1) else 1;
         self.serveWithLimit(stream, limit) catch |e| switch (e) {
             error.HttpConnectionClosing => {},
             else => std.debug.print("[zzig.http] 连接处理结束（{s}）\n", .{@errorName(e)}),
         };
         stream.close(self.io);
+    }
+
+    /// 连接级 socket 选项：读超时（Slowloris）与 TCP_NODELAY。
+    ///
+    /// 失败只降级不报错：某些平台/被包装的 socket 不支持这些选项，但服务必须能继续。
+    fn applySocketOptions(self: *Server, stream: std.Io.net.Stream) void {
+        if (self.opts.header_timeout_ms > 0) {
+            socket_timeout.setRecvTimeout(self.io, stream, self.opts.header_timeout_ms) catch |e| {
+                // 只提示一次：Windows 上 AFD 不支持 SO_RCVTIMEO（实测 STATUS_NOT_SUPPORTED），
+                // 每连接打一条会把日志变成负担。生产部署走 Linux（POSIX 生效）。
+                if (!self.timeout_warned.swap(true, .acq_rel)) {
+                    std.debug.print(
+                        "[zzig.http] 原生读超时不可用（{s}）：该平台请靠 max_connections + keep_alive_requests + 反代 client_header_timeout 兜住 Slowloris\n",
+                        .{@errorName(e)},
+                    );
+                }
+            };
+        }
+        if (self.opts.tcp_nodelay) socket_timeout.setNoDelay(self.io, stream, true) catch {};
     }
 
     /// 处理**一条**连接上的一个请求（单线程可用，便于测试）。
@@ -235,13 +316,42 @@ pub const Server = struct {
                     stream.shutdown(self.io, .send) catch {};
                     return;
                 },
-                else => return e,
+                // 读超时（Slowloris / 空闲 keep-alive）：回 408 并关闭，不让连接永久占线程。
+                // 用 isReadTimeout 判定而不是写死错误名：该错误来自底层 socket 读，
+                // 不在 `handleOne` 声明的错误集里，Windows 是 ConnectionTimedOut、POSIX 是 WouldBlock。
+                else => {
+                    if (socket_timeout.isReadTimeout(e)) {
+                        self.replyRequestTimeout(stream);
+                        return;
+                    }
+                    return e;
+                },
             };
             // keep-alive 时必须立即把响应刷给客户端：否则数据滞留在写缓冲里，
             // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
             try sw.interface.flush();
             if (!keep) return;
         }
+    }
+
+    /// 读超时时回 408（连接不再复用）：让客户端/反代拿到明确原因，而不是只看到连接被重置。
+    fn replyRequestTimeout(self: *Server, stream: std.Io.net.Stream) void {
+        var send_buf: [512]u8 = undefined;
+        var sw = stream.writer(self.io, &send_buf);
+        const body = "{\"code\":408,\"msg\":\"request timeout\"}";
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 408 Request Timeout\r\n" ++
+                "content-type: application/json; charset=utf-8\r\n" ++
+                "content-length: {d}\r\nconnection: close\r\n\r\n",
+            .{body.len},
+        ) catch return;
+        sw.interface.writeAll(head) catch return;
+        sw.interface.writeAll(body) catch return;
+        sw.interface.flush() catch return;
+        // 先发 FIN 再返回：直接 close 会让 Windows 发 RST，408 可能到不了客户端
+        stream.shutdown(self.io, .send) catch {};
     }
 
     /// 本次响应的头组装开关（安全头 / keep-alive 提示）。
@@ -1208,4 +1318,92 @@ test "HTTP 服务端：请求头超限返回 431（而不是只断连接）" {
     try testing.expect(std.mem.indexOf(u8, resp[0..got], "431") != null);
     try testing.expectEqual(@as(usize, 0), ctx.served); // 没进业务 handler
     std.debug.print("[http] 431 OK：超长请求头收到 {d} 字节（含 431）\n", .{got});
+}
+
+test "HTTP 服务端：dispatch=.task 走运行时任务也能正常服务（与 zgrpc ConnDispatch 对齐）" {
+    const Ctx = struct {
+        impl: Server,
+        served: usize = 0,
+        address: std.Io.net.IpAddress = undefined,
+
+        fn handle(ctx: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
+            _ = req;
+            _ = arena;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.served += 1;
+            return .{ .status = .ok, .body = "task-ok" };
+        }
+
+        /// 模拟 accept 循环的那一步：拿到连接后按 dispatch 分发
+        fn acceptAndDispatch(self: *@This()) void {
+            var listener = std.Io.net.IpAddress.listen(&self.address, self.impl.io, .{ .reuse_address = true }) catch return;
+            defer listener.deinit(self.impl.io);
+            const stream = listener.accept(self.impl.io) catch return;
+            _ = self.impl.active.fetchAdd(1, .acq_rel);
+            self.impl.dispatchStream(stream);
+        }
+    };
+
+    const io = compat.currentIo();
+    // 端口从 39351 起找一个能绑的；找不到就显式 SKIP（不静默通过）
+    var port: u16 = 39351;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39370) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(io, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    if (bound) |b| {
+        var owned = b;
+        owned.deinit(io);
+    } else {
+        std.debug.print("[SKIP] 39351-39369 端口均不可用，跳过 dispatch=.task 用例\n", .{});
+        return;
+    }
+    var ctx = Ctx{ .impl = .{
+        .gpa = testing.allocator,
+        .io = io,
+        .ctx = undefined,
+        .handler = Ctx.handle,
+        .opts = .{ .dispatch = .task, .keep_alive = false },
+    } };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    ctx.address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+
+    const th = try std.Thread.spawn(.{}, Ctx.acceptAndDispatch, .{&ctx});
+    defer th.join();
+
+    const Send = struct {
+        fn one(addr: std.Io.net.IpAddress, io2: std.Io, buf: []u8) !usize {
+            const stream = try std.Io.net.IpAddress.connect(&addr, io2, .{ .mode = .stream, .protocol = .tcp });
+            defer stream.close(io2);
+            var cw_buf: [1024]u8 = undefined;
+            var cw = stream.writer(io2, &cw_buf);
+            try cw.interface.writeAll("GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            try cw.interface.flush();
+            var cr_buf: [1024]u8 = undefined;
+            var cr = stream.reader(io2, &cr_buf);
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = cr.interface.readSliceShort(buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
+        }
+    };
+    var resp: [2048]u8 = undefined;
+    const n = Send.one(ctx.address, io, &resp);
+    // 连接可能还没被 accept（线程刚起）：重试一次，避免把调度延迟当成失败
+    const got = n catch Send.one(ctx.address, io, &resp) catch |e| {
+        std.debug.print("[SKIP] 回环 TCP 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+
+    try testing.expect(got > 0);
+    try testing.expect(std.mem.indexOf(u8, resp[0..got], "200") != null);
+    try testing.expectEqual(@as(usize, 1), ctx.served);
+    // 任务收尾（等价 run 退出时的 await）
+    ctx.impl.task_group.await(io) catch {};
+    std.debug.print("[http] dispatch=.task OK：{d} 字节 / served={d}\n", .{ got, ctx.served });
 }

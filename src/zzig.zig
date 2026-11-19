@@ -127,6 +127,9 @@ pub const url = @import("net/url.zig");
 /// Cookie 请求头解析（`Cookie: a=1; b=2`）
 pub const cookie = @import("net/cookie.zig");
 
+/// 原生 socket 读超时（Windows AFD / POSIX setsockopt）+ TCP_NODELAY
+pub const socket_timeout = @import("net/socket_timeout.zig");
+
 /// ASCII 大小写不敏感的前缀/后缀/子串判定
 pub const ascii = @import("text/ascii.zig");
 
@@ -406,6 +409,7 @@ test {
     _ = @import("file/glob.zig");
     _ = @import("file/fsio.zig");
     _ = @import("net/url.zig");
+_ = @import("net/socket_timeout.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
