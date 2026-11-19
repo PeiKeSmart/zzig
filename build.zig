@@ -39,6 +39,10 @@ const versions = struct {
         const zzig = b.addModule("zzig", .{
             .root_source_file = b.path(b.pathJoin(&.{ "src", "zzig.zig" })),
         });
+        // HTTP 接入层借用 lighting 的解析器 / body 读取 / 响应生成
+        // （自写 HTTP/1.1 分帧，不用 std.http.Server —— 后者每连接要吃 ~39 KB 协程栈）。
+        const lighting_dep = b.dependency("lighting", .{ .target = target, .optimize = optimize });
+        zzig.addImport("lighting", lighting_dep.module("lighting"));
 
         generateDocs(b, optimize, target);
 
@@ -495,6 +499,7 @@ const versions = struct {
             .target = target,
             .optimize = optimize,
         });
+        self_module.addImport("lighting", lighting_dep.module("lighting"));
         const zzig_module_tests = b.addTest(.{
             .name = "zzig-module-tests",
             .root_module = self_module,

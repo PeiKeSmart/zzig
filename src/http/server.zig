@@ -1,7 +1,11 @@
 //! 极简 HTTP/1.1 服务端（服务型接口用：数据库远程服务、内部 API）。
 //!
-//! 为什么自建：Zig 标准库有 `std.http.Server`（协议解析），但**没有**「监听 + 线程 + 上限」这层。
-//! 本文件只补这一层，协议解析仍交给 std，不重复实现。
+//! 为什么自建监听层：Zig 标准库有 `std.http.Server`（协议解析），但**没有**「监听 + 线程 + 上限」这层。
+//!
+//! **协议解析已不再使用 `std.http.Server`**（2026-11-19 起）：它的 head 解析路径实测需要
+//! >64 KiB 的协程栈，在 zio 协程后端下把每连接内存推到 59 KB（C# Kestrel 11 KB / Rust hyper 14 KB）。
+//! 现在改用 `lighting` 的 `parseRequestHead`（零拷贝）+ `BodyReader`（Content-Length/chunked）
+//! + `ResponseWriter`（双模缓冲），实测降到 20 KB/连接。连接循环、上限、早拒、XFF 仍在本文件。
 //!
 //! 口径：
 //! - 请求体上限（默认 1 MB）、连接数上限（超限直接关，不排队不分配线程）、每连接独立 arena；
@@ -13,6 +17,7 @@
 //! 这类带检查的非线程安全分配器，会在 accept 相关的内部路径上直接 panic。
 
 const std = @import("std");
+const lighting = @import("lighting");
 const compat = @import("../compat.zig");
 const socket_timeout = @import("../net/socket_timeout.zig");
 
@@ -293,19 +298,15 @@ pub const Server = struct {
 
     /// 连接主循环：在同一连接上服务最多 `max_requests` 个请求（keep-alive）。
     fn serveWithLimit(self: *Server, stream: std.Io.net.Stream, max_requests: usize) !void {
-        // **收发缓冲必须放堆上，不能是栈数组**。
-        //
-        // 实测（2026-11-19，zio 协程后端 + 2 executor）：原来这两个 16 KiB 数组在栈上，
-        // 合计 32 KiB，而协程栈只提交了 16 KiB → 强制扩容（16→32→64→128…），
-        // 5000 连接实际吃掉 **562 MB（~112 KB/连接）**；改成堆分配后降到 ~80 MB。
-        // 32 executor 时因为栈复用率高看不出问题，小规格机器上直接是 5 倍内存差距。
+        // **收发缓冲必须在堆上**：原先两个 16 KiB 栈数组会把协程栈顶到 128 KiB 以上，
+        // 5000 个连接就是几百 MB 的差距（见 docs/决策记录.md 2026-11-19（八））。
         const recv_buf = self.gpa.alloc(u8, self.opts.conn_recv_buf_size) catch return error.OutOfMemory;
         defer self.gpa.free(recv_buf);
         const send_buf = self.gpa.alloc(u8, self.opts.conn_send_buf_size) catch return error.OutOfMemory;
         defer self.gpa.free(send_buf);
-        var sr = stream.reader(self.io, recv_buf);
         var sw = stream.writer(self.io, send_buf);
-        var http = std.http.Server.init(&sr.interface, &sw.interface);
+        // 读缓冲由本层自己管：需要「读到 \r\n\r\n 为止」并保留管线化剩余字节。
+        var cb = ConnBuf{ .buf = recv_buf };
 
         // 对端地址（accept 返回的 socket 地址即远端，Windows/POSIX 同口径）：
         // 格式为 `ip:port`（IPv6 为 `[::1]:port`），消费方自行剥端口。
@@ -325,9 +326,8 @@ pub const Server = struct {
         var served: usize = 0;
         while (served < max_requests) : (served += 1) {
             _ = arena_state.reset(.retain_capacity);
-            const keep = self.handleOne(&http, tcp_peer, arena_state.allocator()) catch |e| switch (e) {
-                // 请求头超出 std 的 head buffer：std 已放弃这条连接（不再解析），
-                // 这里补一个 431 让客户端/反向代理拿到明确原因（否则只看到连接被重置）。
+            const keep = self.handleOne(stream, &sw, &cb, tcp_peer, arena_state.allocator()) catch |e| switch (e) {
+                // 请求头超过缓冲上限 / 头数量超限：回 431 让客户端或反代拿到明确原因。
                 error.HttpHeadersOversize => {
                     const body = "{\"code\":431,\"msg\":\"request headers too large\"}";
                     const raw = std.fmt.allocPrint(
@@ -342,6 +342,8 @@ pub const Server = struct {
                     stream.shutdown(self.io, .send) catch {};
                     return;
                 },
+                // 对端正常关闭（含 keep-alive 空闲后客户端先关）→ 结束本条连接。
+                error.HttpConnectionClosing => return,
                 // 读超时（Slowloris / 空闲 keep-alive）：回 408 并关闭，不让连接永久占线程。
                 // 用 isReadTimeout 判定而不是写死错误名：该错误来自底层 socket 读，
                 // 不在 `handleOne` 声明的错误集里，Windows 是 ConnectionTimedOut、POSIX 是 WouldBlock。
@@ -357,6 +359,18 @@ pub const Server = struct {
             // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
             try sw.interface.flush();
             if (!keep) return;
+        }
+    }
+
+    /// 读到 `\r\n\r\n` 为止；返回的头字节**指向 `cb.buf`**，调用方必须先复制再读 body。
+    fn readHeadBytes(self: *Server, stream: std.Io.net.Stream, cb: *ConnBuf) ![]const u8 {
+        while (true) {
+            if (std.mem.indexOf(u8, cb.buf[0..cb.len], "\r\n\r\n")) |idx| return cb.buf[0 .. idx + 4];
+            if (cb.len >= cb.buf.len) return error.HttpHeadersOversize;
+            var slices: [1][]u8 = .{cb.buf[cb.len..]};
+            const n = stream.read(self.io, &slices) catch |e| return e;
+            if (n == 0) return error.HttpConnectionClosing;
+            cb.len += n;
         }
     }
 
@@ -399,29 +413,53 @@ pub const Server = struct {
     }
 
     /// 在已就绪的连接上处理**一个**请求；返回 `true` 表示连接可以继续复用。
-    fn handleOne(self: *Server, http: *std.http.Server, tcp_peer: ?[]const u8, arena: std.mem.Allocator) !bool {
-        var req = http.receiveHead() catch |e| switch (e) {
-            // 客户端主动关闭（或 keep-alive 空闲超时）→ 正常结束
-            error.HttpConnectionClosing => return false,
-            else => return e,
-        };
-        const path_end = std.mem.indexOfScalar(u8, req.head.target, '?') orelse req.head.target.len;
-        const path = req.head.target[0..path_end];
-        const query = if (path_end < req.head.target.len) req.head.target[path_end + 1 ..] else "";
+    fn handleOne(
+        self: *Server,
+        stream: std.Io.net.Stream,
+        sw: *std.Io.net.Stream.Writer,
+        cb: *ConnBuf,
+        tcp_peer: ?[]const u8,
+        arena: std.mem.Allocator,
+    ) !bool {
+        // 1) 读头 → **立即拷进 arena**：下一步读 body 会覆盖连接缓冲。
+        const head_raw = try self.readHeadBytes(stream, cb);
+        const head_len = head_raw.len;
+        const head_bytes = try arena.dupe(u8, head_raw);
+        cb.consume(head_len);
 
-        // 请求头必须在初始化 body 流之前复制：std 明确说明 head_buffer 随后失效。
+        // 2) 解析（lighting 的零拷贝分帧，不再用 std.http —— 后者要吃 39 KB 协程栈）
+        const head = lighting.parseRequestHead(arena, head_bytes) catch |e| {
+            std.debug.print("[zzig.http] 请求头解析失败：{s}\n", .{@errorName(e)});
+            const msg = "{\"code\":400,\"msg\":\"bad request\"}";
+            try self.sendReply(sw, arena, .bad_request, msg, try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)), null, false);
+            return false;
+        };
+        const method = toStdMethod(head.method);
+        const path_end = std.mem.indexOfScalar(u8, head.target, '?') orelse head.target.len;
+        const path = head.target[0..path_end];
+        const query = if (path_end < head.target.len) head.target[path_end + 1 ..] else "";
+
+        // 3) 头列表：lighting 的 `HeaderMap` 只提供 get/set（没有遍历接口），
+        //    这里直接按原始字节扫一遍 —— head_bytes 已通过 `parseRequestHead` 的格式校验，
+        //    二次扫描是安全的，且零额外分配（名字转小写，符合 `RequestView.headers` 的约定）。
         var header_list: std.ArrayList(std.http.Header) = .empty;
-        var header_it = req.iterateHeaders();
-        var header_count: usize = 0;
-        while (header_it.next()) |h| {
-            header_count += 1;
-            if (header_count > self.opts.max_header_count) {
-                return error.HttpHeadersOversize;
+        {
+            var line_it = std.mem.splitSequence(u8, head_bytes, "\r\n");
+            _ = line_it.next(); // 请求行
+            while (line_it.next()) |line| {
+                if (line.len == 0) break; // 头部结束的空行
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const name = std.mem.trim(u8, line[0..colon], " \t");
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (name.len == 0) continue;
+                if (header_list.items.len >= self.opts.max_header_count) return error.HttpHeadersOversize;
+                const lower = try arena.alloc(u8, name.len);
+                for (name, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
+                try header_list.append(arena, .{
+                    .name = lower,
+                    .value = try arena.dupe(u8, value),
+                });
             }
-            try header_list.append(arena, .{
-                .name = try arena.dupe(u8, h.name),
-                .value = try arena.dupe(u8, h.value),
-            });
         }
 
         // 真实客户端 IP：反代场景下 TCP 对端是回环/受信代理，需采纳转发头（只信紧邻那一跳）
@@ -439,47 +477,37 @@ pub const Server = struct {
             }
         }
 
-        // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（不读 body）都不能复用
-        const keep = self.opts.keep_alive and req.head.keep_alive and req.head.transfer_encoding == .none;
+        // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（body 流未读完）
+        const keep = self.opts.keep_alive and head.keep_alive and !head.is_chunked;
 
         // 早拒：声明长度超上限就不读 body
         var body: []const u8 = "";
-        if (req.head.content_length) |len| {
+        if (head.content_length) |len| {
             if (len > self.opts.max_body) {
                 const msg = "{\"code\":413,\"msg\":\"request body too large\"}";
-                try req.respond(msg, .{
-                    .status = .payload_too_large,
-                    .keep_alive = false,
-                    .extra_headers = try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)),
-                });
+                try self.sendReply(sw, arena, .payload_too_large, msg, try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)), null, false);
                 return false;
             }
-            if (len > 0) {
-                var buf: [4096]u8 = undefined;
-                const r = try req.readerExpectContinue(&buf);
-                body = r.allocRemaining(arena, .limited(len)) catch |e| {
-                    std.debug.print("[zzig.http] 读请求体失败（声明 {d} 字节）：{s}\n", .{ len, @errorName(e) });
-                    return e;
-                };
-            }
+            if (len > 0) body = try self.readBody(stream, cb, @intCast(len), arena);
+        } else if (head.is_chunked) {
+            body = self.readChunkedBody(stream, cb, arena) catch |e| {
+                std.debug.print("[zzig.http] 读分块请求体失败：{s}\n", .{@errorName(e)});
+                return false;
+            };
         }
 
         const reply = self.handler(self.ctx, .{
-            .method = req.head.method,
-            .target = req.head.target,
+            .method = method,
+            .target = head.target,
             .path = path,
             .query = query,
             .body = body,
             .headers = header_list.items,
             .remote_addr = remote_addr,
         }, arena) catch |e| {
-            std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.head.method), path, @errorName(e) });
+            std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(method), path, @errorName(e) });
             const msg = "{\"code\":500,\"msg\":\"internal error\"}";
-            req.respond(msg, .{
-                .status = .internal_server_error,
-                .keep_alive = false,
-                .extra_headers = buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)) catch &.{},
-            }) catch {};
+            self.sendReply(sw, arena, .internal_server_error, msg, buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)) catch &.{}, null, false) catch {};
             return false;
         };
 
@@ -487,33 +515,29 @@ pub const Server = struct {
         if (reply.file) |file_body| {
             defer file_body.file.close(self.io);
 
-            var body_buf: [8 * 1024]u8 = undefined;
-            var bw = try req.respondStreaming(&body_buf, .{
-                .content_length = file_body.length,
-                .respond_options = .{
-                    .status = reply.status,
-                    .keep_alive = keep,
-                    .extra_headers = try buildHeaders(arena, reply, self.headerOptions(keep)),
-                },
-            });
+            const headers = try buildHeaders(arena, reply, self.headerOptions(keep));
+            try self.writeHead(sw, reply.status, headers, file_body.length, keep);
 
-            // HEAD：只发头（respondStreaming 已按 content-length 写好），不读文件。
-            // 注意：eliding 分支不会递减 content-length 状态，此处**不能** end()（会断言长度不符），
-            // 只把已写的响应头刷出去即可。
-            if (req.head.method == .HEAD) {
-                try bw.flush();
+            // HEAD：只发头（content-length 已按文件长度声明），不读文件。
+            if (method == .HEAD) {
+                try sw.interface.flush();
                 return keep;
             }
 
             // 优先零拷贝（Linux sendfile 走内核 file→socket，不经过用户态内存）；
             // `Unimplemented`（如 Windows）回退到 32 KB 缓冲的读-写循环。
-            var read_buf: [32 * 1024]u8 = undefined;
-            var file_reader = file_body.file.reader(self.io, &read_buf);
+            //
+            // **这个缓冲必须堆分配**：写成 `var read_buf: [32 * 1024]u8` 会让 Zig 在函数入口
+            // 就为整个 `handleOne` 预留 32 KiB 栈 —— 即使走的是非文件分支，每个连接协程也要吃满，
+            // 实测把每连接内存顶到 53 KB（与 128 KiB / 32 KiB 栈上限无关）。
+            const read_buf = try self.gpa.alloc(u8, 32 * 1024);
+            defer self.gpa.free(read_buf);
+            var file_reader = file_body.file.reader(self.io, read_buf);
             var remaining = file_body.length;
             var zero_copy = true;
             while (remaining > 0) {
                 if (zero_copy) {
-                    const n = bw.writer.sendFile(&file_reader, .limited64(remaining)) catch |e| switch (e) {
+                    const n = sw.interface.sendFile(&file_reader, .limited64(remaining)) catch |e| switch (e) {
                         error.Unimplemented => {
                             zero_copy = false;
                             continue;
@@ -530,43 +554,159 @@ pub const Server = struct {
                 // `readSliceShort` 内部已把 EOF 表示为「返回 0」，只报 ReadFailed
                 const n = try file_reader.interface.readSliceShort(read_buf[0..want]);
                 if (n == 0) break;
-                try bw.writer.writeAll(read_buf[0..n]);
+                try sw.interface.writeAll(read_buf[0..n]);
                 remaining -= n;
             }
 
             if (remaining > 0) {
-                // 文件被截断：content-length 已声明，不能再 end()（会断言长度不符），
-                // 直接返回让连接关闭，并留下可定位的日志。
+                // 文件被截断：content-length 已声明，直接返回让连接关闭，并留下可定位的日志。
                 std.debug.print(
                     "[zzig.http] 发送文件时被截断：已声明 {d} 字节，还差 {d} 字节\n",
                     .{ file_body.length, remaining },
                 );
                 return false;
             }
-            try bw.end();
             return keep;
         }
 
-        // 无正文但需声明长度（通常 HEAD）：transfer-encoding none + 自填 content-length
+        // 无正文但需声明长度（通常 HEAD）：自填 content-length，不发 body
         if (reply.content_length) |length| {
             const headers = try buildHeadersWithLength(arena, reply, length, self.headerOptions(keep));
-            try req.respond("", .{
-                .status = reply.status,
-                .transfer_encoding = .none,
-                .keep_alive = keep,
-                .extra_headers = headers,
-            });
+            try self.writeHead(sw, reply.status, headers, length, keep);
             return keep;
         }
 
-        try req.respond(reply.body, .{
-            .status = reply.status,
-            .keep_alive = keep,
-            .extra_headers = try buildHeaders(arena, reply, self.headerOptions(keep)),
-        });
+        const headers = try buildHeaders(arena, reply, self.headerOptions(keep));
+        if (method == .HEAD) {
+            // HEAD：头里声明 body 长度，但**不写** body
+            try self.writeHead(sw, reply.status, headers, reply.body.len, keep);
+        } else {
+            try self.sendReply(sw, arena, reply.status, reply.body, headers, null, keep);
+        }
         return keep;
     }
+
+    /// 写响应头（状态行 + 业务/安全头 + content-length + connection）。
+    fn writeHead(
+        self: *Server,
+        sw: *std.Io.net.Stream.Writer,
+        status: std.http.Status,
+        headers: []const std.http.Header,
+        content_length: u64,
+        keep: bool,
+    ) !void {
+        _ = self;
+        try sw.interface.print("HTTP/1.1 {d} {s}\r\n", .{
+            @backingInt(status),
+            status.phrase() orelse "OK",
+        });
+        for (headers) |h| {
+            try sw.interface.writeAll(h.name);
+            try sw.interface.writeAll(": ");
+            try sw.interface.writeAll(h.value);
+            try sw.interface.writeAll("\r\n");
+        }
+        try sw.interface.print("content-length: {d}\r\n", .{content_length});
+        try sw.interface.writeAll(if (keep) "connection: keep-alive\r\n\r\n" else "connection: close\r\n\r\n");
+    }
+
+    /// 写完整响应（头 + body）。
+    fn sendReply(
+        self: *Server,
+        sw: *std.Io.net.Stream.Writer,
+        arena: std.mem.Allocator,
+        status: std.http.Status,
+        body: []const u8,
+        headers: []const std.http.Header,
+        content_length: ?u64,
+        keep: bool,
+    ) !void {
+        _ = arena;
+        try self.writeHead(sw, status, headers, content_length orelse body.len, keep);
+        if (body.len > 0) try sw.interface.writeAll(body);
+    }
+
+    /// 读固定长度请求体：连接缓冲里已有的先取（管线化场景下后面还可能有下一个请求），
+    /// 不够再从 socket 读。
+    fn readBody(
+        self: *Server,
+        stream: std.Io.net.Stream,
+        cb: *ConnBuf,
+        len: usize,
+        arena: std.mem.Allocator,
+    ) ![]const u8 {
+        if (len == 0) return "";
+        const out = try arena.alloc(u8, len);
+        var filled: usize = 0;
+        const take = @min(len, cb.len);
+        if (take > 0) {
+            @memcpy(out[0..take], cb.buf[0..take]);
+            cb.consume(take);
+            filled = take;
+        }
+        while (filled < len) {
+            var slices: [1][]u8 = .{out[filled..]};
+            const n = stream.read(self.io, &slices) catch |e| {
+                std.debug.print(
+                    "[zzig.http] 读请求体失败（声明 {d} 字节，已读 {d}）：{s}\n",
+                    .{ len, filled, @errorName(e) },
+                );
+                return e;
+            };
+            if (n == 0) return error.HttpConnectionClosing;
+            filled += n;
+        }
+        return out;
+    }
+
+    /// 读分块（chunked）请求体：交给 lighting 的 `BodyReader`（已处理分块解码与 trailer）。
+    fn readChunkedBody(
+        self: *Server,
+        stream: std.Io.net.Stream,
+        cb: *ConnBuf,
+        arena: std.mem.Allocator,
+    ) ![]const u8 {
+        var br = lighting.BodyReader.init(stream, self.io, cb.buf[0..cb.len], null, true);
+        const body = try br.readAllAlloc(arena, self.opts.max_body);
+        // BodyReader 直接消费 socket 流，连接缓冲里的字节已由它接管
+        cb.len = 0;
+        return body;
+    }
 };
+
+/// 连接级读缓冲（跨请求复用）。支持管线化：一次 `read` 可能带回多个请求，
+/// 消费掉当前请求后把剩余字节前移，不做额外分配。
+const ConnBuf = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn consume(self: *ConnBuf, n: usize) void {
+        const drop = @min(n, self.len);
+        if (drop == self.len) {
+            self.len = 0;
+            return;
+        }
+        std.mem.copyForwards(u8, self.buf[0 .. self.len - drop], self.buf[drop..self.len]);
+        self.len -= drop;
+    }
+};
+
+/// lighting 的方法枚举 → `std.http.Method`（`RequestView.method` 保持标准库类型，
+/// 消费方的 `.method == .GET` 之类写法不用改）。`std.http.Method` 多一个 `QUERY`，
+/// lighting 不认（返回 InvalidMethod → 400），属于可接受的行为收窄。
+fn toStdMethod(m: lighting.Method) std.http.Method {
+    return switch (m) {
+        .GET => .GET,
+        .HEAD => .HEAD,
+        .POST => .POST,
+        .PUT => .PUT,
+        .PATCH => .PATCH,
+        .DELETE => .DELETE,
+        .CONNECT => .CONNECT,
+        .OPTIONS => .OPTIONS,
+        .TRACE => .TRACE,
+    };
+}
 
 /// 响应头组装的开关（从 `Options` 拍出来，避免把整个 `*Server` 传给纯函数）。
 const HeaderOptions = struct {
