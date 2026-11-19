@@ -67,6 +67,19 @@ pub const Options = struct {
     keep_alive_requests: usize = 100,
     /// `Keep-Alive: timeout=N` 提示（秒）；**不做硬超时**，空闲超时建议由前置反代管理
     keep_alive_timeout_secs: u32 = 5,
+    /// 是否附加默认安全响应头：
+    /// `x-content-type-options: nosniff`（禁止 MIME 猜测）、
+    /// `x-frame-options: SAMEORIGIN`（防点击劫持）、
+    /// `referrer-policy: no-referrer`（防路径/参数经 referer 外泄）。
+    ///
+    /// 只加这三个「不依赖页面结构」的头；CSP 会打到内联脚本与外链 CDN，
+    /// 必须由业务按自己页面定制，库不默认开。
+    security_headers: bool = true,
+    /// 是否信任反代转发头（**仅当 TCP 对端是回环时**才采纳，符合「只信任紧邻那一跳」口径）：
+    /// `x-real-ip` 优先 → `x-forwarded-for` **末段**。
+    /// 开了它，`RequestView.remote_addr` 才是真实客户端 IP（WAF / 限流 / 审计都靠它）；
+    /// 不开则恒为 TCP 对端（反代后全是 `127.0.0.1`）。
+    trust_forwarded_for: bool = false,
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
@@ -206,8 +219,17 @@ pub const Server = struct {
         }
     }
 
+    /// 本次响应的头组装开关（安全头 / keep-alive 提示）。
+    fn headerOptions(self: *Server, keep: bool) HeaderOptions {
+        return .{
+            .keep_alive = keep,
+            .keep_alive_timeout_secs = self.opts.keep_alive_timeout_secs,
+            .security_headers = self.opts.security_headers,
+        };
+    }
+
     /// 在已就绪的连接上处理**一个**请求；返回 `true` 表示连接可以继续复用。
-    fn handleOne(self: *Server, http: *std.http.Server, remote_addr: ?[]const u8, arena: std.mem.Allocator) !bool {
+    fn handleOne(self: *Server, http: *std.http.Server, tcp_peer: ?[]const u8, arena: std.mem.Allocator) !bool {
         var req = http.receiveHead() catch |e| switch (e) {
             // 客户端主动关闭（或 keep-alive 空闲超时）→ 正常结束
             error.HttpConnectionClosing => return false,
@@ -227,6 +249,21 @@ pub const Server = struct {
             });
         }
 
+        // 真实客户端 IP：反代场景下 TCP 对端恒为回环，需采纳转发头（只信紧邻那一跳）
+        var remote_addr = tcp_peer;
+        if (self.opts.trust_forwarded_for) {
+            if (tcp_peer) |peer| {
+                if (isLoopbackPeer(peer)) {
+                    if (headerValue(header_list.items, "x-real-ip")) |value| {
+                        const trimmed = std.mem.trim(u8, value, " \t");
+                        if (trimmed.len > 0) remote_addr = trimmed;
+                    } else if (headerValue(header_list.items, "x-forwarded-for")) |value| {
+                        if (lastForwardedFor(value)) |ip| remote_addr = ip;
+                    }
+                }
+            }
+        }
+
         // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（不读 body）都不能复用
         const keep = self.opts.keep_alive and req.head.keep_alive and req.head.transfer_encoding == .none;
 
@@ -234,9 +271,11 @@ pub const Server = struct {
         var body: []const u8 = "";
         if (req.head.content_length) |len| {
             if (len > self.opts.max_body) {
-                try req.respond("{\"code\":413,\"msg\":\"request body too large\"}", .{
+                const msg = "{\"code\":413,\"msg\":\"request body too large\"}";
+                try req.respond(msg, .{
                     .status = .payload_too_large,
                     .keep_alive = false,
+                    .extra_headers = try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)),
                 });
                 return false;
             }
@@ -260,9 +299,11 @@ pub const Server = struct {
             .remote_addr = remote_addr,
         }, arena) catch |e| {
             std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.head.method), path, @errorName(e) });
-            req.respond("{\"code\":500,\"msg\":\"internal error\"}", .{
+            const msg = "{\"code\":500,\"msg\":\"internal error\"}";
+            req.respond(msg, .{
                 .status = .internal_server_error,
                 .keep_alive = false,
+                .extra_headers = buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)) catch &.{},
             }) catch {};
             return false;
         };
@@ -277,7 +318,7 @@ pub const Server = struct {
                 .respond_options = .{
                     .status = reply.status,
                     .keep_alive = keep,
-                    .extra_headers = try buildHeaders(arena, reply, keep, self.opts.keep_alive_timeout_secs),
+                    .extra_headers = try buildHeaders(arena, reply, self.headerOptions(keep)),
                 },
             });
 
@@ -333,7 +374,7 @@ pub const Server = struct {
 
         // 无正文但需声明长度（通常 HEAD）：transfer-encoding none + 自填 content-length
         if (reply.content_length) |length| {
-            const headers = try buildHeadersWithLength(arena, reply, length, keep, self.opts.keep_alive_timeout_secs);
+            const headers = try buildHeadersWithLength(arena, reply, length, self.headerOptions(keep));
             try req.respond("", .{
                 .status = reply.status,
                 .transfer_encoding = .none,
@@ -346,35 +387,79 @@ pub const Server = struct {
         try req.respond(reply.body, .{
             .status = reply.status,
             .keep_alive = keep,
-            .extra_headers = try buildHeaders(arena, reply, keep, self.opts.keep_alive_timeout_secs),
+            .extra_headers = try buildHeaders(arena, reply, self.headerOptions(keep)),
         });
         return keep;
     }
 };
 
-/// 组装响应头：`content-type` → 业务附加头（跳过重名）→ `connection/keep-alive`。
+/// 响应头组装的开关（从 `Options` 拍出来，避免把整个 `*Server` 传给纯函数）。
+const HeaderOptions = struct {
+    keep_alive: bool,
+    keep_alive_timeout_secs: u32,
+    security_headers: bool,
+};
+
+/// 组装响应头：`content-type` → 默认安全头 → 业务附加头（跳过重名）→ `keep-alive`。
 fn buildHeaders(
     arena: std.mem.Allocator,
     reply: Reply,
-    keep_alive: bool,
-    keep_alive_timeout_secs: u32,
+    opts: HeaderOptions,
 ) ![]const std.http.Header {
     var headers: std.ArrayList(std.http.Header) = .empty;
     try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
+    if (opts.security_headers) try appendSecurityHeaders(arena, &headers);
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        if (opts.security_headers and isSecurityHeader(header.name)) continue;
         try headers.append(arena, header);
     }
-    if (keep_alive) {
+    if (opts.keep_alive) {
         try headers.append(arena, .{
             .name = "keep-alive",
-            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{keep_alive_timeout_secs}),
+            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{opts.keep_alive_timeout_secs}),
         });
     }
     return headers.items;
+}
+
+/// 默认安全响应头（不依赖页面结构，任何响应都安全）。
+fn appendSecurityHeaders(arena: std.mem.Allocator, headers: *std.ArrayList(std.http.Header)) !void {
+    try headers.append(arena, .{ .name = "x-content-type-options", .value = "nosniff" });
+    try headers.append(arena, .{ .name = "x-frame-options", .value = "SAMEORIGIN" });
+    try headers.append(arena, .{ .name = "referrer-policy", .value = "no-referrer" });
+}
+
+fn isSecurityHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "x-content-type-options") or
+        std.ascii.eqlIgnoreCase(name, "x-frame-options") or
+        std.ascii.eqlIgnoreCase(name, "referrer-policy");
+}
+
+/// 取请求头值（大小写无关；缺失返回 `null`）。
+fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+/// `x-forwarded-for` 取**末段**：左侧各段客户端可凭空追加，只有紧邻我们的那一跳代理写入的末段不可伪造。
+/// （与 dhrust `panel_auth::client_ip_with_proxy_flag` 同一口径。）
+fn lastForwardedFor(value: []const u8) ?[]const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, value, ',') orelse 0;
+    const last = std.mem.trim(u8, if (idx == 0) value else value[idx + 1 ..], " \t");
+    return if (last.len == 0) null else last;
+}
+
+/// TCP 对端是否回环（`127.x.x.x` / `[::1]` / `::1`，含端口）。
+fn isLoopbackPeer(peer: []const u8) bool {
+    if (std.mem.startsWith(u8, peer, "127.")) return true;
+    if (std.mem.startsWith(u8, peer, "[::1]")) return true;
+    return std.mem.eql(u8, peer, "::1");
 }
 
 /// 同上，但额外带上明确的 `content-length`（无正文的 HEAD 响应）。
@@ -382,26 +467,27 @@ fn buildHeadersWithLength(
     arena: std.mem.Allocator,
     reply: Reply,
     length: u64,
-    keep_alive: bool,
-    keep_alive_timeout_secs: u32,
+    opts: HeaderOptions,
 ) ![]const std.http.Header {
     var headers: std.ArrayList(std.http.Header) = .empty;
     try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
+    if (opts.security_headers) try appendSecurityHeaders(arena, &headers);
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        if (opts.security_headers and isSecurityHeader(header.name)) continue;
         try headers.append(arena, header);
     }
     try headers.append(arena, .{
         .name = "content-length",
         .value = try std.fmt.allocPrint(arena, "{d}", .{length}),
     });
-    if (keep_alive) {
+    if (opts.keep_alive) {
         try headers.append(arena, .{
             .name = "keep-alive",
-            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{keep_alive_timeout_secs}),
+            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{opts.keep_alive_timeout_secs}),
         });
     }
     return headers.items;
@@ -654,11 +740,25 @@ fn KeepAliveHarness(comptime requests: usize) type {
         io: std.Io,
         impl: Server,
         served: usize = 0,
+        /// handler 看到的 `req.remote_addr`（固定缓冲，避免借用请求 arena）
+        remote_seen: [64]u8 = undefined,
+        remote_len: usize = 0,
 
         fn handler(raw: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.served += 1;
+            if (req.remote_addr) |addr| {
+                const n = @min(addr.len, self.remote_seen.len);
+                @memcpy(self.remote_seen[0..n], addr[0..n]);
+                self.remote_len = n;
+            } else {
+                self.remote_len = 0;
+            }
             return .{ .body = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{req.path}) };
+        }
+
+        fn remoteSlice(self: *const @This()) []const u8 {
+            return self.remote_seen[0..self.remote_len];
         }
 
         fn serve(self: *@This()) void {
@@ -908,4 +1008,94 @@ test "HTTP 服务端：keep_alive_requests 达到上限即关闭连接" {
     stream.close(io);
     stream_alive = false;
     std.debug.print("[http] 上限 OK：keep_alive_requests=2 时第 3 个请求被拒（服务端已关连接）\n", .{});
+}
+
+test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-Forwarded-For 末段）" {
+    const Ctx = KeepAliveHarness(1);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39430;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39449) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39430-39448 端口均不可用，跳过安全头用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const io = compat.currentIo();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+
+    // 发一个请求，返回原始响应字节数（响应缓冲由调用方给）
+    const Send = struct {
+        fn one(addr: std.Io.net.IpAddress, io2: std.Io, extra: []const u8, buf: []u8) !usize {
+            const stream = try std.Io.net.IpAddress.connect(&addr, io2, .{ .mode = .stream, .protocol = .tcp });
+            defer stream.close(io2);
+            var cw_buf: [1024]u8 = undefined;
+            var cw = stream.writer(io2, &cw_buf);
+            try cw.interface.writeAll("GET /who HTTP/1.1\r\nHost: x\r\n");
+            if (extra.len > 0) try cw.interface.writeAll(extra);
+            try cw.interface.writeAll("\r\n");
+            try cw.interface.flush();
+            var cr_buf: [1024]u8 = undefined;
+            var cr = stream.reader(io2, &cr_buf);
+            return readUntil(&cr.interface, buf, "{\"path\":\"/who\"}");
+        }
+    };
+
+    // 轮 1：默认不信任转发头 → remote_addr 必须是 TCP 对端（127.0.0.1:port）
+    {
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        var resp: [2048]u8 = undefined;
+        const got = Send.one(address, io, "X-Real-IP: 8.8.8.8\r\nX-Forwarded-For: 1.1.1.1, 9.9.9.9\r\n", &resp) catch |e| {
+            th.join();
+            std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+            return;
+        };
+        th.join();
+        const text = resp[0..got];
+        // 默认安全头必须下发
+        try testing.expect(std.mem.indexOf(u8, text, "x-content-type-options: nosniff") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "x-frame-options: SAMEORIGIN") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "referrer-policy: no-referrer") != null);
+        // 默认不信任反代：仍是回环对端
+        try testing.expect(std.mem.startsWith(u8, ctx.remoteSlice(), "127.0.0.1:"));
+    }
+
+    // 轮 2：信任反代 + X-Real-IP 优先
+    {
+        ctx.impl.opts.trust_forwarded_for = true;
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        var resp: [2048]u8 = undefined;
+        _ = try Send.one(address, io, "X-Real-IP: 8.8.8.8\r\nX-Forwarded-For: 1.1.1.1, 9.9.9.9\r\n", &resp);
+        th.join();
+        try testing.expectEqualStrings("8.8.8.8", ctx.remoteSlice());
+    }
+
+    // 轮 3：信任反代 + 只有 XFF → 取**末段**（左侧客户端可伪造）
+    {
+        ctx.impl.opts.trust_forwarded_for = true;
+        const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+        var resp: [2048]u8 = undefined;
+        _ = try Send.one(address, io, "X-Forwarded-For: 1.1.1.1, 9.9.9.9\r\n", &resp);
+        th.join();
+        try testing.expectEqualStrings("9.9.9.9", ctx.remoteSlice());
+    }
+
+    ctx.impl.opts.trust_forwarded_for = false;
+    std.debug.print("[http] 安全头 + 真实 IP OK：默认 nosniff/SAMEORIGIN/no-referrer，XFF 取末段\n", .{});
 }

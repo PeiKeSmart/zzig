@@ -55,6 +55,13 @@ pub const Options = struct {
     gzip: bool = true,
     /// 动态响应压缩的最小体积（小报文压完反而变大，对齐 DH.RustBase 的 256）
     gzip_min_size: usize = 256,
+
+    /// 静态资源的 `Cache-Control`（`null` = 用 `StaticFiles` 默认的 `no-cache`）。
+    ///
+    /// `no-cache` 意味着「每次都要做一次 304 校验」，每个静态资源都多一个 RTT；
+    /// 面板类应用可设 `"public, max-age=600"`（有 ETag 兑底，改版 10 分钟内仍可能拿旧缓存）。
+    /// 带内容哈希指纹的产物可设 `"public, max-age=31536000, immutable"`。
+    static_cache_control: ?[]const u8 = null,
 };
 
 /// Web 应用。
@@ -79,6 +86,7 @@ pub const App = struct {
             statics.spaFallback(true);
             try statics.spaExcludes(options.spa_excludes);
         }
+        if (options.static_cache_control) |cache_control| statics.setCacheControl(cache_control);
         for (options.static_roots) |root| {
             try statics.addRootOptions(root);
         }
