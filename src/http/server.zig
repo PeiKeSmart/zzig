@@ -431,7 +431,7 @@ pub const Server = struct {
         const head = lighting.parseRequestHead(arena, head_bytes) catch |e| {
             std.debug.print("[zzig.http] 请求头解析失败：{s}\n", .{@errorName(e)});
             const msg = "{\"code\":400,\"msg\":\"bad request\"}";
-            try self.sendReply(sw, arena, .bad_request, msg, try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)), null, false);
+            try self.writeReply(sw, .{ .status = .bad_request, .body = msg }, null, self.headerOptions(false), false);
             return false;
         };
         const method = toStdMethod(head.method);
@@ -485,7 +485,7 @@ pub const Server = struct {
         if (head.content_length) |len| {
             if (len > self.opts.max_body) {
                 const msg = "{\"code\":413,\"msg\":\"request body too large\"}";
-                try self.sendReply(sw, arena, .payload_too_large, msg, try buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)), null, false);
+                try self.writeReply(sw, .{ .status = .payload_too_large, .body = msg }, null, self.headerOptions(false), false);
                 return false;
             }
             if (len > 0) body = try self.readBody(stream, cb, @intCast(len), arena);
@@ -507,7 +507,7 @@ pub const Server = struct {
         }, arena) catch |e| {
             std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(method), path, @errorName(e) });
             const msg = "{\"code\":500,\"msg\":\"internal error\"}";
-            self.sendReply(sw, arena, .internal_server_error, msg, buildHeaders(arena, .{ .body = msg }, self.headerOptions(false)) catch &.{}, null, false) catch {};
+            self.writeReply(sw, .{ .status = .internal_server_error, .body = msg }, null, self.headerOptions(false), false) catch {};
             return false;
         };
 
@@ -515,8 +515,7 @@ pub const Server = struct {
         if (reply.file) |file_body| {
             defer file_body.file.close(self.io);
 
-            const headers = try buildHeaders(arena, reply, self.headerOptions(keep));
-            try self.writeHead(sw, reply.status, headers, file_body.length, keep);
+            try self.writeReplyHead(sw, reply, file_body.length, self.headerOptions(keep));
 
             // HEAD：只发头（content-length 已按文件长度声明），不读文件。
             if (method == .HEAD) {
@@ -571,17 +570,15 @@ pub const Server = struct {
 
         // 无正文但需声明长度（通常 HEAD）：自填 content-length，不发 body
         if (reply.content_length) |length| {
-            const headers = try buildHeadersWithLength(arena, reply, length, self.headerOptions(keep));
-            try self.writeHead(sw, reply.status, headers, length, keep);
+            try self.writeReplyHead(sw, reply, length, self.headerOptions(keep));
             return keep;
         }
 
-        const headers = try buildHeaders(arena, reply, self.headerOptions(keep));
         if (method == .HEAD) {
             // HEAD：头里声明 body 长度，但**不写** body
-            try self.writeHead(sw, reply.status, headers, reply.body.len, keep);
+            try self.writeReplyHead(sw, reply, reply.body.len, self.headerOptions(keep));
         } else {
-            try self.sendReply(sw, arena, reply.status, reply.body, headers, null, keep);
+            try self.writeReply(sw, reply, null, self.headerOptions(keep), false);
         }
         return keep;
     }
@@ -592,62 +589,39 @@ pub const Server = struct {
     /// 累积成明显开销：实测 2 executor 时，带 3 个默认安全头 11287 rps，关掉安全头 21211 rps。
     /// 同样的头改成「一次写」后这部分开销直接拿回来。缓冲放栈上（768 B，覆盖十几个常规头），
     /// 溢出（超长 `set-cookie` 等）自动回退到逐段写，不会因为头太大出错。
-    fn writeHead(
+    ///
+    /// 同时**不再建中间的 `[]std.http.Header` 列表**：原先靠 `buildHeaders()` 用 arena
+    /// 组数组（`ArrayList` 多次增长 + `allocPrint("timeout=N")` 一次格式化分配），
+    /// 现在全部内联到这里直接写，每请求省掉那几次分配。
+    fn writeReplyHead(
         self: *Server,
         sw: *std.Io.net.Stream.Writer,
-        status: std.http.Status,
-        headers: []const std.http.Header,
+        reply: Reply,
         content_length: u64,
-        keep: bool,
+        opts: HeaderOptions,
     ) !void {
+        _ = self;
         var buf: [768]u8 = undefined;
         var fw: std.Io.Writer = .fixed(&buf);
-        self.formatHead(&fw, status, headers, content_length, keep) catch {
+        formatReplyHead(&fw, reply, content_length, opts) catch {
             // 小缓冲装不下：直接对着 socket writer 再拼一遍（错误集同口径，不会丢头）
-            try self.formatHead(&sw.interface, status, headers, content_length, keep);
+            try formatReplyHead(&sw.interface, reply, content_length, opts);
             return;
         };
         try sw.interface.writeAll(fw.buffered());
     }
 
-    /// 把状态行 + 全部响应头写进给定 writer（供 `writeHead` 的「小缓冲 / 回退」两条路径复用）。
-    fn formatHead(
-        self: *Server,
-        w: *std.Io.Writer,
-        status: std.http.Status,
-        headers: []const std.http.Header,
-        content_length: u64,
-        keep: bool,
-    ) !void {
-        _ = self;
-        try w.print("HTTP/1.1 {d} {s}\r\n", .{
-            @backingInt(status),
-            status.phrase() orelse "OK",
-        });
-        for (headers) |h| {
-            try w.writeAll(h.name);
-            try w.writeAll(": ");
-            try w.writeAll(h.value);
-            try w.writeAll("\r\n");
-        }
-        try w.print("content-length: {d}\r\n", .{content_length});
-        try w.writeAll(if (keep) "connection: keep-alive\r\n\r\n" else "connection: close\r\n\r\n");
-    }
-
-    /// 写完整响应（头 + body）。
-    fn sendReply(
+    /// 写完整响应（头 + body）；`is_head` 为真时只写头（`content-length` 仍按 body 长度声明）。
+    fn writeReply(
         self: *Server,
         sw: *std.Io.net.Stream.Writer,
-        arena: std.mem.Allocator,
-        status: std.http.Status,
-        body: []const u8,
-        headers: []const std.http.Header,
+        reply: Reply,
         content_length: ?u64,
-        keep: bool,
+        opts: HeaderOptions,
+        is_head: bool,
     ) !void {
-        _ = arena;
-        try self.writeHead(sw, status, headers, content_length orelse body.len, keep);
-        if (body.len > 0) try sw.interface.writeAll(body);
+        try self.writeReplyHead(sw, reply, content_length orelse reply.body.len, opts);
+        if (!is_head and reply.body.len > 0) try sw.interface.writeAll(reply.body);
     }
 
     /// 读固定长度请求体：连接缓冲里已有的先取（管线化场景下后面还可能有下一个请求），
@@ -740,36 +714,47 @@ const HeaderOptions = struct {
 };
 
 /// 组装响应头：`content-type` → 默认安全头 → 业务附加头（跳过重名）→ `keep-alive`。
-fn buildHeaders(
-    arena: std.mem.Allocator,
+/// 把「状态行 + content-type + 默认安全头 + 业务附加头 + content-length + keep-alive/connection」
+/// **直接写进 writer**（`writeReplyHead` 的小缓冲与回退两条路径共用）。
+///
+/// 这里刻意不建中间的 `[]std.http.Header`：原先走 `buildHeaders()` 时，每请求要在 arena 里
+/// 组一次数组（`ArrayList` 增长）并 `allocPrint` 出 `timeout=N` 字符串，2 万 rps 下是可见开销。
+fn formatReplyHead(
+    w: *std.Io.Writer,
     reply: Reply,
+    content_length: u64,
     opts: HeaderOptions,
-) ![]const std.http.Header {
-    var headers: std.ArrayList(std.http.Header) = .empty;
-    try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
-    if (opts.security_headers) try appendSecurityHeaders(arena, &headers);
+) !void {
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{
+        @backingInt(reply.status),
+        reply.status.phrase() orelse "OK",
+    });
+    try w.writeAll("content-type: ");
+    try w.writeAll(reply.content_type);
+    try w.writeAll("\r\n");
+    if (opts.security_headers) {
+        try w.writeAll("x-content-type-options: nosniff\r\n" ++
+            "x-frame-options: SAMEORIGIN\r\n" ++
+            "referrer-policy: no-referrer\r\n");
+    }
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         if (opts.security_headers and isSecurityHeader(header.name)) continue;
-        try headers.append(arena, header);
+        try w.writeAll(header.name);
+        try w.writeAll(": ");
+        try w.writeAll(header.value);
+        try w.writeAll("\r\n");
     }
+    try w.print("content-length: {d}\r\n", .{content_length});
     if (opts.keep_alive) {
-        try headers.append(arena, .{
-            .name = "keep-alive",
-            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{opts.keep_alive_timeout_secs}),
-        });
+        try w.print("keep-alive: timeout={d}\r\n", .{opts.keep_alive_timeout_secs});
+        try w.writeAll("connection: keep-alive\r\n\r\n");
+    } else {
+        try w.writeAll("connection: close\r\n\r\n");
     }
-    return headers.items;
-}
-
-/// 默认安全响应头（不依赖页面结构，任何响应都安全）。
-fn appendSecurityHeaders(arena: std.mem.Allocator, headers: *std.ArrayList(std.http.Header)) !void {
-    try headers.append(arena, .{ .name = "x-content-type-options", .value = "nosniff" });
-    try headers.append(arena, .{ .name = "x-frame-options", .value = "SAMEORIGIN" });
-    try headers.append(arena, .{ .name = "referrer-policy", .value = "no-referrer" });
 }
 
 fn isSecurityHeader(name: []const u8) bool {
@@ -806,37 +791,6 @@ fn stripPort(addr: []const u8) []const u8 {
     const first = std.mem.indexOfScalar(u8, addr, ':') orelse return addr;
     if (std.mem.lastIndexOfScalar(u8, addr, ':').? != first) return addr; // 裸 IPv6
     return addr[0..first];
-}
-
-/// 同上，但额外带上明确的 `content-length`（无正文的 HEAD 响应）。
-fn buildHeadersWithLength(
-    arena: std.mem.Allocator,
-    reply: Reply,
-    length: u64,
-    opts: HeaderOptions,
-) ![]const std.http.Header {
-    var headers: std.ArrayList(std.http.Header) = .empty;
-    try headers.append(arena, .{ .name = "content-type", .value = reply.content_type });
-    if (opts.security_headers) try appendSecurityHeaders(arena, &headers);
-    for (reply.headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "keep-alive")) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
-        if (opts.security_headers and isSecurityHeader(header.name)) continue;
-        try headers.append(arena, header);
-    }
-    try headers.append(arena, .{
-        .name = "content-length",
-        .value = try std.fmt.allocPrint(arena, "{d}", .{length}),
-    });
-    if (opts.keep_alive) {
-        try headers.append(arena, .{
-            .name = "keep-alive",
-            .value = try std.fmt.allocPrint(arena, "timeout={d}", .{opts.keep_alive_timeout_secs}),
-        });
-    }
-    return headers.items;
 }
 
 const testing = std.testing;
