@@ -114,6 +114,12 @@ pub const Options = struct {
     /// 是否关闭 Nagle（`TCP_NODELAY`）。小包交互默认关掉：否则 header+body 两个小包
     /// 会等前一个的 ACK，与对端延迟 ACK 叠加出 10~200ms 的随机尾部延迟。
     tcp_nodelay: bool = true,
+    /// 每连接的**接收缓冲**（字节，堆分配）。决定「一次 read 能拿回多少请求」。
+    ///
+    /// 这是每连接的固定内存开销：上万连接时把它调小（如 4 KiB）能省很多。
+    conn_recv_buf_size: usize = 16 * 1024,
+    /// 每连接的**发送缓冲**（字节，堆分配），同时是延迟 flush 的批量上限。
+    conn_send_buf_size: usize = 16 * 1024,
     /// 单个请求允许的**头数量上限**（超限回 431）。
     ///
     /// `std.http.Server` 的 head buffer 只限制**总字节**、不限制**个数**，
@@ -287,10 +293,18 @@ pub const Server = struct {
 
     /// 连接主循环：在同一连接上服务最多 `max_requests` 个请求（keep-alive）。
     fn serveWithLimit(self: *Server, stream: std.Io.net.Stream, max_requests: usize) !void {
-        var recv_buf: [16 * 1024]u8 = undefined;
-        var send_buf: [16 * 1024]u8 = undefined;
-        var sr = stream.reader(self.io, &recv_buf);
-        var sw = stream.writer(self.io, &send_buf);
+        // **收发缓冲必须放堆上，不能是栈数组**。
+        //
+        // 实测（2026-11-19，zio 协程后端 + 2 executor）：原来这两个 16 KiB 数组在栈上，
+        // 合计 32 KiB，而协程栈只提交了 16 KiB → 强制扩容（16→32→64→128…），
+        // 5000 连接实际吃掉 **562 MB（~112 KB/连接）**；改成堆分配后降到 ~80 MB。
+        // 32 executor 时因为栈复用率高看不出问题，小规格机器上直接是 5 倍内存差距。
+        const recv_buf = self.gpa.alloc(u8, self.opts.conn_recv_buf_size) catch return error.OutOfMemory;
+        defer self.gpa.free(recv_buf);
+        const send_buf = self.gpa.alloc(u8, self.opts.conn_send_buf_size) catch return error.OutOfMemory;
+        defer self.gpa.free(send_buf);
+        var sr = stream.reader(self.io, recv_buf);
+        var sw = stream.writer(self.io, send_buf);
         var http = std.http.Server.init(&sr.interface, &sw.interface);
 
         // 对端地址（accept 返回的 socket 地址即远端，Windows/POSIX 同口径）：
