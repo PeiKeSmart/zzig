@@ -217,7 +217,26 @@ pub const Server = struct {
         var served: usize = 0;
         while (served < max_requests) : (served += 1) {
             _ = arena_state.reset(.retain_capacity);
-            const keep = try self.handleOne(&http, tcp_peer, arena_state.allocator());
+            const keep = self.handleOne(&http, tcp_peer, arena_state.allocator()) catch |e| switch (e) {
+                // 请求头超出 std 的 head buffer：std 已放弃这条连接（不再解析），
+                // 这里补一个 431 让客户端/反向代理拿到明确原因（否则只看到连接被重置）。
+                error.HttpHeadersOversize => {
+                    const body = "{\"code\":431,\"msg\":\"request headers too large\"}";
+                    const raw = std.fmt.allocPrint(
+                        arena_state.allocator(),
+                        "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
+                            "content-type: application/json; charset=utf-8\r\n" ++
+                            "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+                        .{ body.len, body },
+                    ) catch return;
+                    sw.interface.writeAll(raw) catch {};
+                    sw.interface.flush() catch {};
+                    // 先关写方向再返回：直接 close 会让 Windows 发 RST，客户端可能读不到这 431
+                    stream.shutdown(self.io, .send) catch {};
+                    return;
+                },
+                else => return e,
+            };
             // keep-alive 时必须立即把响应刷给客户端：否则数据滞留在写缓冲里，
             // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
             try sw.interface.flush();
@@ -808,7 +827,6 @@ fn readUntil(reader: *std.Io.Reader, buf: []u8, needle: []const u8) !usize {
 }
 
 test "HTTP 服务端：keep-alive 在同一连接上复用（连发两个请求）" {
-    std.debug.print("[trace] === 用例A 开始 ===\n", .{});
     const Ctx = KeepAliveHarness(2);
 
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -853,13 +871,10 @@ test "HTTP 服务端：keep-alive 在同一连接上复用（连发两个请求�
     var cr = stream.reader(io, &cr_buf);
 
     // 请求 1 + 请求 2 一次性发出（HTTP pipelining），验证同一连接能连续服务两个请求
-    std.debug.print("[trace] 客户端：写请求 1+2\n", .{});
     try cw.interface.writeAll("GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n");
     try cw.interface.flush();
-    std.debug.print("[trace] 客户端：已 flush，开始读\n", .{});
     var resp1: [4096]u8 = undefined;
     const got1 = try readUntil(&cr.interface, &resp1, "{\"path\":\"/two\"}");
-    std.debug.print("[trace] 客户端：共收到 {d} 字节\n", .{got1});
     try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/one\"}") != null);
     try testing.expect(std.mem.indexOf(u8, resp1[0..got1], "{\"path\":\"/two\"}") != null);
     // 复用提示头必须出现（客户端 / 反代据此判断这条连接还能不能继续用）
@@ -1130,4 +1145,67 @@ test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-F
     }
 
     std.debug.print("[http] 安全头 + 真实 IP OK：默认信任回环反代，XFF 取末段，可关可加网段\n", .{});
+}
+
+test "HTTP 服务端：请求头超限返回 431（而不是只断连接）" {
+    const Ctx = KeepAliveHarness(1);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const sio = threaded.io();
+
+    var port: u16 = 39450;
+    var bound: ?std.Io.net.Server = null;
+    while (port < 39469) : (port += 1) {
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
+        bound = addr.listen(sio, .{ .reuse_address = true }) catch continue;
+        break;
+    }
+    const listener = bound orelse {
+        std.debug.print("[SKIP] 39450-39468 端口均不可用，跳过 431 用例\n", .{});
+        return;
+    };
+
+    var ctx = Ctx{
+        .server = listener,
+        .io = sio,
+        .impl = .{ .gpa = testing.allocator, .io = sio, .ctx = undefined, .handler = Ctx.handler },
+    };
+    ctx.impl.ctx = @ptrCast(&ctx);
+    defer ctx.server.deinit(sio);
+
+    const th = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+
+    const io = compat.currentIo();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const stream = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream, .protocol = .tcp }) catch |e| {
+        th.join();
+        std.debug.print("[SKIP] 本机回环 TCP 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer stream.close(io);
+
+    var cw_buf: [4096]u8 = undefined;
+    var cw = stream.writer(io, &cw_buf);
+    // 单个 20 KB 的请求头：必然超过 std 的 head buffer
+    try cw.interface.writeAll("GET /x HTTP/1.1\r\nHost: x\r\nX-Big: ");
+    var chunk: [1024]u8 = undefined;
+    @memset(&chunk, 'a');
+    var sent: usize = 0;
+    while (sent < 20 * 1024) : (sent += chunk.len) {
+        try cw.interface.writeAll(&chunk);
+    }
+    try cw.interface.writeAll("\r\n\r\n");
+    try cw.interface.flush();
+
+    var cr_buf: [1024]u8 = undefined;
+    var cr = stream.reader(io, &cr_buf);
+    var resp: [512]u8 = undefined;
+    const got = try readUntil(&cr.interface, &resp, "431");
+    th.join();
+
+    try testing.expect(got > 0);
+    try testing.expect(std.mem.indexOf(u8, resp[0..got], "431") != null);
+    try testing.expectEqual(@as(usize, 0), ctx.served); // 没进业务 handler
+    std.debug.print("[http] 431 OK：超长请求头收到 {d} 字节（含 431）\n", .{got});
 }
