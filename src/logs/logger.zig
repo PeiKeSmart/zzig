@@ -470,6 +470,25 @@ var bad_config_backed: bool = false;
 /// 配置重载/关闭的互斥：`reloadNow()` 与热加载线程可能并发
 var reload_mutex: compat.Mutex = .{};
 
+/// 相对 `LogPath` 的基准目录（空 = 相对进程工作目录，保持既有行为）。
+///
+/// **为什么需要**：`LogPath = "Log"` 是相对**进程工作目录**的，而服务被星尘/WSL/计划任务拉起时 cwd
+/// 往往不是程序目录 —— 日志就落到意想不到的地方（部署目录里“看不到 Log/”）。
+/// 消费方应在 `init` 前把这里设成**数据/程序根目录**（如 `--data-dir`）。
+///
+/// 只存切片不拷贝：**必须在 `init`/`applyConfig` 前设置一次，之后不再改**（生命周期与进程一致）。
+var log_base_dir: []const u8 = "";
+
+/// 设置相对 `LogPath` 的基准目录（空字符串 = 相对 cwd）。必须在 `init` 前调用。
+pub fn setLogBaseDir(dir: []const u8) void {
+    log_base_dir = dir;
+}
+
+/// 当前基准目录（空 = 相对 cwd）。
+pub fn logBaseDir() []const u8 {
+    return log_base_dir;
+}
+
 /// 应用一份配置（不涉及文件），顺序：级别 → 行格式 → 控制台 → 队列 → 文件。
 ///
 /// 任何一项值非法都**保持原值并告警**，不会因为一个字段配错就整体回退。
@@ -497,8 +516,22 @@ pub fn applyConfig(io: std.Io, gpa: std.mem.Allocator, cfg: Config) !void {
     if (cfg.LogPath.len == 0) {
         closeFile();
     } else {
+        // 相对路径按基准目录解析（绝对路径原样使用）；失败只告警，不影响其它配置生效
+        var joined: ?[]u8 = null;
+        defer {
+            if (joined) |j| gpa.free(j);
+        }
+        var dir = cfg.LogPath;
+        if (log_base_dir.len > 0 and !std.fs.path.isAbsolute(cfg.LogPath)) {
+            if (std.fs.path.join(gpa, &.{ log_base_dir, cfg.LogPath })) |j| {
+                joined = j;
+                dir = j;
+            } else |e| {
+                err("日志目录拼接失败（{s} + {s}）：{s}，本次按相对路径 {s} 打开", .{ log_base_dir, cfg.LogPath, @errorName(e), cfg.LogPath });
+            }
+        }
         try useFile(io, gpa, .{
-            .dir = cfg.LogPath,
+            .dir = dir,
             .use_console = false, // 控制台由 console_enabled 统一控制，避免重复输出
             .max_file_bytes = cfg.LogFileMaxBytes,
             .backups = cfg.LogFileBackups,
