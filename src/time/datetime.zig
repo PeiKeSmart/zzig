@@ -153,6 +153,18 @@ pub const DateTime = struct {
             if (ticks < epoch_diff) return 0;
             return @intCast((ticks - epoch_diff) / 10_000_000);
         }
+        // Linux / 其它 POSIX：走 `clock_gettime(REALTIME)`（musl 静态下也有效）。
+        //
+        // 2026-11-22 修：这里原先直接 `return 0` —— 于是 Linux 上 `nowUnix()` **恒为 0**，
+        // 依赖「时间戳推进」的逻辑全部失效：`hot_config` 的 2 秒节流把 `next` 设成 2 之后
+        // `0 < 2` 永远成立 → **配置热加载在 Linux 上永不触发**（Windows 正常，冒烟才暴露）。
+        if (builtin.os.tag == .linux) {
+            var ts: std.posix.timespec = undefined;
+            if (std.os.linux.clock_gettime(std.posix.CLOCK.REALTIME, &ts) == 0) {
+                return @intCast(ts.sec);
+            }
+            return 0;
+        }
         return 0;
     }
 
