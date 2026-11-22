@@ -119,8 +119,12 @@ pub const Lib = struct {
 
     /// 按既定顺序加载；全部失败返回 `error.SqliteNotAvailable`。
     ///
-    /// 顺序：程序目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`。
-    /// 想固定用某个版本，把 `sqlite3.dll` 放到 exe 同目录即可（覆盖替换即升级）。
+    /// - Windows：程序目录 `sqlite3.dll` → 当前目录 → 系统 `sqlite3.dll` → `winsqlite3.dll`；
+    ///   想固定版本就把 `sqlite3.dll` 放 exe 同目录（覆盖替换即升级）。
+    /// - Linux/macOS：当前目录 `libsqlite3.so`（随包附带）→ 系统 `libsqlite3.so.0` / `libsqlite3.so`。
+    ///
+    /// 2026-11-22 修：原先只枚举 Windows 的 dll，Linux 上**永远** `SqliteNotAvailable`
+    /// （与系统是否装了 sqlite 无关），后台账号/会话因此退回内存、重启即丢。
     pub fn load(gpa: std.mem.Allocator) !Lib {
         var candidates: std.ArrayList([]const u8) = .empty;
         defer {
@@ -128,18 +132,26 @@ pub const Lib = struct {
             candidates.deinit(gpa);
         }
 
-        // 程序目录 sqlite3.dll
-        if (exeDirAlloc(gpa)) |dir| {
-            defer gpa.free(dir);
-            if (std.fs.path.join(gpa, &.{ dir, "sqlite3.dll" })) |path| {
-                try candidates.append(gpa, path);
+        const os_tag = @import("builtin").os.tag;
+        if (os_tag == .windows) {
+            // 程序目录 sqlite3.dll
+            if (exeDirAlloc(gpa)) |dir| {
+                defer gpa.free(dir);
+                if (std.fs.path.join(gpa, &.{ dir, "sqlite3.dll" })) |path| {
+                    try candidates.append(gpa, path);
+                } else |_| {}
             } else |_| {}
-        } else |_| {}
 
-        // 独立进程（测试/工具）没有 exe 目录下的 dll 时回退当前目录
-        try candidates.append(gpa, try std.fs.path.join(gpa, &.{ ".", "sqlite3.dll" }));
-        try candidates.append(gpa, try gpa.dupe(u8, "sqlite3.dll"));
-        try candidates.append(gpa, try gpa.dupe(u8, "winsqlite3.dll"));
+            // 独立进程（测试/工具）没有 exe 目录下的 dll 时回退当前目录
+            try candidates.append(gpa, try std.fs.path.join(gpa, &.{ ".", "sqlite3.dll" }));
+            try candidates.append(gpa, try gpa.dupe(u8, "sqlite3.dll"));
+            try candidates.append(gpa, try gpa.dupe(u8, "winsqlite3.dll"));
+        } else {
+            // 先看随包/当前目录（运维可自行升级），再走系统 soname
+            try candidates.append(gpa, try gpa.dupe(u8, "./libsqlite3.so"));
+            try candidates.append(gpa, try gpa.dupe(u8, "libsqlite3.so.0"));
+            try candidates.append(gpa, try gpa.dupe(u8, "libsqlite3.so"));
+        }
 
         for (candidates.items) |path| {
             const dyn = loadModule(path) orelse continue;
