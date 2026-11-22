@@ -290,6 +290,21 @@ const Parser = struct {
             if (c == '}' and stop_at_rbrace) break;
 
             if (c != '@') {
+                // Razor `<text>…</text>`：**包裹标记本身不输出**，只输出里面的内容。
+                //
+                // C# 里专门用它解决「属性位置要输出一段内容」：
+                //   `<input type="radio" @if (Model.enable) {<text>checked</text>}>`
+                // 缺了这条规则就会把 `<text>checked</text>` 原样打进 HTML，
+                // 浏览器把 `checked>` 当文本显示（2026-11-23 后台多个编辑页因此错版）。
+                // `<text>` 不是合法 HTML 元素，全站视图也没有 SVG `<text>`，所以全局剥离是安全的。
+                if (std.mem.startsWith(u8, self.src[self.pos..], "<text>")) {
+                    self.pos += "<text>".len;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, self.src[self.pos..], "</text>")) {
+                    self.pos += "</text>".len;
+                    continue;
+                }
                 try text.append(self.arena, c);
                 self.pos += 1;
                 continue;
@@ -2545,5 +2560,49 @@ test "view：分部视图/组件内定义分区显式报错" {
     switch (renderSourceWith(arena, &renderer, "home", "@Html.Partial(\"_Part\")", value.ofNull())) {
         .html => return error.TestUnexpectedResult,
         .fail => |message| try testing.expect(std.mem.indexOf(u8, message, "不能定义分区") != null),
+    }
+}
+
+test "view：`<text>…</text>` 只输出内容，标记本身不输出" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-text-block");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Home/Radio.cshtml", .{dir}), std.mem.concat(arena, u8, &.{
+        "<input id=\"a\" name=\"a\" value=\"1\" type=\"radio\" @if (Model.on) {<text>checked</text>}>",
+        "<label class=\"cb @if (Model.on) {<text>selected</text>}\"><span>启用</span></label>",
+        "<td>@if (Model.on) { <text>是</text> } else { <text>否</text> }</td>",
+    }) catch unreachable);
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    renderer.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir}));
+
+    var obj = value.ObjectBuilder.init(arena);
+    try obj.boolean("on", true);
+    const model = obj.finish();
+
+    switch (renderSourceWith(arena, &renderer, "home", "@Html.Partial(\"Radio\")", model)) {
+        .html => |html| {
+            // 关键：`<text>` / `</text>` 一个字都不能出现在输出里
+            try testing.expect(std.mem.indexOf(u8, html, "<text>") == null);
+            try testing.expect(std.mem.indexOf(u8, html, "</text>") == null);
+            // 属性位置的条件输出要落在标签内
+            try testing.expect(std.mem.indexOf(u8, html, "type=\"radio\" checked>") != null);
+            try testing.expect(std.mem.indexOf(u8, html, "class=\"cb selected\"") != null);
+            // 块内文本按条件选分支
+            try testing.expect(std.mem.indexOf(u8, html, "是") != null);
+            try testing.expect(std.mem.indexOf(u8, html, "否") == null);
+        },
+        .fail => |message| {
+            std.debug.print("渲染失败：{s}\n", .{message});
+            return error.TestUnexpectedResult;
+        },
     }
 }
