@@ -162,6 +162,8 @@ pub const wecom = @import("wecom/wecom.zig");
 /// 配置：TOML 子集解析 + 文本热加载（版本戳 / 原子写 / 缺失生成）
 pub const config = struct {
     pub const toml = @import("config/toml.zig");
+    /// TOML 模板渲染（带注释；声明表驱动，注释与键值写在同一处）
+    pub const toml_template = @import("config/toml_template.zig");
     pub const FileText = @import("config/file.zig").FileText;
     pub const FileOptions = @import("config/file.zig").Options;
     pub const getStamp = @import("config/file.zig").getStamp;
@@ -411,6 +413,7 @@ test {
     _ = @import("net/url.zig");
     _ = @import("net/socket_timeout.zig");
     _ = @import("config/toml.zig");
+    _ = @import("config/toml_template.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
     _ = @import("threading/pool.zig");
