@@ -1011,7 +1011,7 @@ fn renderNodes(
 
     for (nodes) |node| {
         switch (node) {
-            .text => |text| try writer.writeAll(text),
+            .text => |text| try writeStatic(rc, writer, text),
             .write => |expr| {
                 const v = try eval(rc, expr, head);
                 const text = try v.textAlloc(rc.allocator);
@@ -1023,7 +1023,8 @@ fn renderNodes(
                 const text = try v.textAlloc(rc.allocator);
                 try writer.writeAll(text);
                 rc.allocator.free(text);
-            },            .if_node => |node_ptr| {
+            },
+            .if_node => |node_ptr| {
                 var matched = false;
                 for (node_ptr.branches) |branch| {
                     const cond = try eval(rc, branch.cond, head);
@@ -1349,11 +1350,25 @@ pub const ViewRenderer = struct {
     fallback_area: ?[]const u8 = null,
     max_bytes: usize = 4 * 1024 * 1024,
 
+    /// 应用根（对应 ASP.NET Core 的 `~`）：模板静态片段里 `"~/x"` 会展开成 `{path_base}/x`。
+    ///
+    /// 默认 `""` → `~/x` 展开为 `/x`（部署在域名根时的行为，与 C# 一致）；
+    /// 部署在子目录时设成 `/pek` → 展开为 `/pek/x`，视图里的写法不用改。
+    path_base: []const u8 = "",
+
     cache: std.StringHashMapUnmanaged(CacheEntry) = .empty,
     arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
     mutex: std.Io.Mutex = .init,
     /// 组件注册表（由 App 注入；`null` 时模板里的组件调用会报错）
     components: ?*ComponentRegistry = null,
+    /// 内置视图源（编译进二进制的默认模板）：相对路径 → 源码。
+    ///
+    /// 语义**对齐 ASP.NET Core 把 Razor 视图预编译进程序集**：磁盘上有同名文件就用磁盘的（项目覆盖），
+    /// 没有就直接渲染内置源。所以部署目录不需要先落地一份副本，也就不存在
+    /// 「老部署留着旧副本 → 库升级改了视图却不生效」这类问题。
+    ///
+    /// key 是**相对根**的路径：`Shared/_Layout.cshtml`、`Admin/Views/Home/Index.cshtml`。
+    fallback_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// 创建渲染器（`io` 用于读模板，跨线程安全）。
     pub fn init(allocator: std.mem.Allocator, io: std.Io) ViewRenderer {
@@ -1366,11 +1381,54 @@ pub const ViewRenderer = struct {
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.cache.deinit(self.allocator);
 
+        self.clearFallbackSources();
+        self.fallback_sources.deinit(self.allocator);
+
         for (self.arenas.items) |arena| {
             arena.deinit();
             self.allocator.destroy(arena);
         }
         self.arenas.deinit(self.allocator);
+    }
+
+    /// 注册内置视图源（`relative` 相对根的路径，如 `Shared/_Layout.cshtml`）。
+    ///
+    /// 同名 key 重复注册时后者覆盖（区域名热切换就是这么用的）。
+    /// `source` 必须比渲染器活得久（通常是 `@embedFile` 的常量）。
+    pub fn addFallbackSource(self: *ViewRenderer, relative: []const u8, source: []const u8) !void {
+        const key = try self.allocator.dupe(u8, normalizeRelativePath(relative));
+        if (self.fallback_sources.getEntry(key)) |existing| {
+            self.allocator.free(existing.key_ptr.*);
+            existing.key_ptr.* = key;
+            existing.value_ptr.* = source;
+            return;
+        }
+        errdefer self.allocator.free(key);
+        try self.fallback_sources.put(self.allocator, key, source);
+    }
+
+    /// 清空内置视图源（区域名变化后重新注册用）。
+    pub fn clearFallbackSources(self: *ViewRenderer) void {
+        var it = self.fallback_sources.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.fallback_sources.clearRetainingCapacity();
+    }
+
+    /// 候选路径 → 内置源（磁盘缺失时使用）。
+    pub fn lookupFallback(self: *const ViewRenderer, path: []const u8) ?[]const u8 {
+        const key = self.fallbackKey(path) orelse return null;
+        return self.fallback_sources.get(key);
+    }
+
+    /// 把候选路径剥成「相对根」的 key：
+    /// `{areas_root}/Admin/Views/Home/Index.cshtml` → `Admin/Views/Home/Index.cshtml`；
+    /// `{root}/Shared/_Layout.cshtml` → `Shared/_Layout.cshtml`。
+    fn fallbackKey(self: *const ViewRenderer, path: []const u8) ?[]const u8 {
+        if (stripPathPrefix(path, self.areas_root)) |rest| return rest;
+        if (stripPathPrefix(path, self.root)) |rest| return rest;
+        const normalized = normalizeRelativePath(path);
+        if (self.fallback_sources.contains(normalized)) return normalized;
+        return null;
     }
 
     /// 设置视图根（默认 `Views`）。
@@ -1386,6 +1444,16 @@ pub const ViewRenderer = struct {
     /// 设置默认（回退）区域：区域视图缺失时回退到该区域的同名视图。
     pub fn setFallbackArea(self: *ViewRenderer, area: ?[]const u8) void {
         self.fallback_area = area;
+    }
+
+    /// 设置应用根（对应 ASP.NET Core 的 `~`）：`""` = 域名根，`"/pek"` = 子目录。
+    ///
+    /// 约定：传已带前导斜杠的路径（尾斜杠会被去掉，`"/"` 等价于 `""`）。
+    pub fn setPathBase(self: *ViewRenderer, base: []const u8) void {
+        var text = std.mem.trim(u8, base, " \t\r\n");
+        while (text.len > 1 and text[text.len - 1] == '/') text = text[0 .. text.len - 1];
+        if (text.len == 1 and text[0] == '/') text = "";
+        self.path_base = text;
     }
 
     /// 注入组件注册表（`null` = 禁用组件调用）。
@@ -1497,6 +1565,8 @@ pub const ViewRenderer = struct {
         for (candidates.items) |candidate| {
             if (!isCandidateSafe(candidate)) continue;
             if (fsio.exists(self.io, candidate)) return .{ .path = candidate };
+            // 磁盘没有 → 有内置源也能渲染（对齐「视图编译进程序集」）
+            if (self.lookupFallback(candidate) != null) return .{ .path = candidate };
             try tried.append(arena, candidate);
         }
 
@@ -1604,26 +1674,50 @@ pub const ViewRenderer = struct {
     }
 
     /// 读取并编译模板（按「修改时间 + 长度」缓存；命中零文件读取）。
+    ///
+    /// 磁盘上不存在时回退到内置源（[`addFallbackSource`]），缓存按 `mtime = 0` 记。
     pub fn loadTemplate(self: *ViewRenderer, arena: std.mem.Allocator, path: []const u8) LoadOutcome {
-        const stat = fsio.statFile(self.io, path) catch |e| {
-            return .{ .fail = std.fmt.allocPrint(arena, "读取视图失败：{s}（{s}）", .{ path, @errorName(e) }) catch "读取视图失败" };
-        };
-        const mtime_ms = stat.mtime.toMilliseconds();
+        var mtime_ms: i64 = 0;
+        var size: u64 = 0;
+        var source: []const u8 = undefined;
+        var owned_source = false;
 
-        self.mutex.lockUncancelable(self.io);
-        if (self.cache.get(path)) |entry| {
-            if (entry.mtime_ms == mtime_ms and entry.size == stat.size) {
-                const template = entry.template;
-                self.mutex.unlock(self.io);
-                return .{ .ok = template };
+        if (fsio.statFile(self.io, path)) |stat| {
+            mtime_ms = stat.mtime.toMilliseconds();
+            size = stat.size;
+
+            self.mutex.lockUncancelable(self.io);
+            if (self.cache.get(path)) |entry| {
+                if (entry.mtime_ms == mtime_ms and entry.size == stat.size) {
+                    const template = entry.template;
+                    self.mutex.unlock(self.io);
+                    return .{ .ok = template };
+                }
             }
-        }
-        self.mutex.unlock(self.io);
+            self.mutex.unlock(self.io);
 
-        const source = fsio.readFileAlloc(self.io, self.allocator, path, self.max_bytes) catch |e| {
-            return .{ .fail = std.fmt.allocPrint(arena, "读取视图失败：{s}（{s}）", .{ path, @errorName(e) }) catch "读取视图失败" };
-        };
-        defer self.allocator.free(source);
+            source = fsio.readFileAlloc(self.io, self.allocator, path, self.max_bytes) catch |e| {
+                return .{ .fail = std.fmt.allocPrint(arena, "读取视图失败：{s}（{s}）", .{ path, @errorName(e) }) catch "读取视图失败" };
+            };
+            owned_source = true;
+        } else |stat_err| {
+            // 磁盘没有 → 用内置源；两者都没有才是真错
+            source = self.lookupFallback(path) orelse {
+                return .{ .fail = std.fmt.allocPrint(arena, "读取视图失败：{s}（磁盘不存在：{s}；也没有内置源）", .{ path, @errorName(stat_err) }) catch "读取视图失败" };
+            };
+            size = source.len;
+
+            self.mutex.lockUncancelable(self.io);
+            if (self.cache.get(path)) |entry| {
+                if (entry.mtime_ms == 0 and entry.size == size) {
+                    const template = entry.template;
+                    self.mutex.unlock(self.io);
+                    return .{ .ok = template };
+                }
+            }
+            self.mutex.unlock(self.io);
+        }
+        defer if (owned_source) self.allocator.free(source);
 
         const template_arena = self.allocator.create(std.heap.ArenaAllocator) catch {
             return .{ .fail = "视图编译失败：内存不足" };
@@ -1651,17 +1745,65 @@ pub const ViewRenderer = struct {
         if (self.cache.getEntry(path)) |existing| {
             self.allocator.free(existing.key_ptr.*);
             existing.key_ptr.* = key;
-            existing.value_ptr.* = .{ .mtime_ms = mtime_ms, .size = stat.size, .template = template };
+            existing.value_ptr.* = .{ .mtime_ms = mtime_ms, .size = size, .template = template };
         } else {
             self.cache.put(self.allocator, key, .{
                 .mtime_ms = mtime_ms,
-                .size = stat.size,
+                .size = size,
                 .template = template,
             }) catch return .{ .fail = "视图缓存失败：内存不足" };
         }
         return .{ .ok = template };
     }
 };
+
+/// 去掉前导 `./` 与首尾空白（内置源的 key 统一口径）。
+fn normalizeRelativePath(relative: []const u8) []const u8 {
+    var text = std.mem.trim(u8, relative, " \t\r\n");
+    while (std.mem.startsWith(u8, text, "./")) text = text[2..];
+    return text;
+}
+
+/// 去掉路径尾部斜杠。
+fn trimTrailingSlashes(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '/' or text[end - 1] == '\\')) end -= 1;
+    return text[0..end];
+}
+
+/// `path` 以 `prefix/` 开头时返回剩余部分（否则 `null`）。
+fn stripPathPrefix(path: []const u8, prefix: []const u8) ?[]const u8 {
+    const clean = trimTrailingSlashes(prefix);
+    if (clean.len == 0) return null;
+    if (!std.mem.startsWith(u8, path, clean)) return null;
+    const rest = path[clean.len..];
+    if (rest.len == 0) return null;
+    if (rest[0] != '/' and rest[0] != '\\') return null;
+    return rest[1..];
+}
+
+/// 输出模板静态片段，并按 ASP.NET 约定展开 `~/`（应用根）。
+///
+/// 只展开**属性值**里的写法（`href="~/x"`、`src='~/x'`、`action="~/x"`），
+/// 与 Razor 一致：正文里出现的 `~/` 原样输出（不当路径处理）。
+fn writeStatic(rc: *RenderCtx, writer: *std.Io.Writer, text: []const u8) !void {
+    const base = rc.renderer.path_base;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, "~/")) |pos| {
+        // 只在属性值开头展开：前面紧跟 `="` 或 `='`（与 Razor 一致，正文里的 `~/` 原样输出）
+        const at_attr_start = pos >= 2 and text[pos - 2] == '=' and (text[pos - 1] == '"' or text[pos - 1] == '\'');
+        if (!at_attr_start) {
+            try writer.writeAll(text[index .. pos + 2]);
+            index = pos + 2;
+            continue;
+        }
+        try writer.writeAll(text[index..pos]);
+        if (base.len > 0) try writer.writeAll(base);
+        try writer.writeAll("/");
+        index = pos + 2;
+    }
+    try writer.writeAll(text[index..]);
+}
 
 fn renderOnce(rc: *RenderCtx, template: *Template, arena: std.mem.Allocator) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -1924,6 +2066,102 @@ test "view：区域视图 Areas/{Area}/Views 与回退区域" {
             return error.RenderFailed;
         },
     }
+}
+
+test "view：内置源兜底（磁盘无副本也能渲染，磁盘优先）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-builtin");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    const views_root = try std.fmt.allocPrint(arena, "{s}/Views", .{dir});
+    const areas_root = try std.fmt.allocPrint(arena, "{s}/Areas", .{dir});
+    renderer.setRoot(views_root);
+    renderer.setAreasRoot(areas_root);
+    renderer.setFallbackArea("Admin");
+
+    // 磁盘上什么都没写
+    try renderer.addFallbackSource("Home/Index.cshtml", "<p>BUILTIN-@Model.Title</p>");
+    try renderer.addFallbackSource("Shared/_Layout.cshtml", "<html>@RenderBody()</html>");
+    try renderer.addFallbackSource("Admin/Views/Home/Dashboard.cshtml", "<div>BUILTIN-DASH</div>");
+
+    const fields = [_]value.Field{value.field("Title", value.ofString("内置"))};
+    switch (renderer.render(arena, "home", "index", value.ofObject(&fields))) {
+        .html => |html| try testing.expectEqualStrings("<p>BUILTIN-内置</p>", html),
+        .fail => |message| {
+            std.debug.print("内置源渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+
+    // 区域视图：`Admin` 走内置源（回退区域同样生效）
+    switch (renderer.render(arena, "admin/home", "dashboard", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("<div>BUILTIN-DASH</div>", html),
+        .fail => |message| {
+            std.debug.print("内置区域视图渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+
+    // 磁盘上放同名文件 → 磁盘优先
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Home/Index.cshtml", .{dir}), "<p>DISK</p>");
+    switch (renderer.render(arena, "home", "index", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("<p>DISK</p>", html),
+        .fail => |message| {
+            std.debug.print("磁盘优先渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+}
+
+test "view：`~/` 应用根展开（默认 → `/`，配 pathBase → 子目录）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const source =
+        \\<link rel="stylesheet" href="~/static/a.css"><img src='~/static/b.png'><a href="~/">首页</a>
+        \\<p>正文里的 ~/ 原样输出</p><a href="@Model.Home">x</a>
+    ;
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+
+    // 默认：`~/` → `/`
+    const fields = [_]value.Field{value.field("Home", value.ofString("/home"))};
+    const first = try renderStatic(&renderer, arena, source, value.ofObject(&fields));
+    try testing.expect(std.mem.indexOf(u8, first, "href=\"/static/a.css\"") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "src='/static/b.png'") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "href=\"/\"") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "正文里的 ~/ 原样输出") != null);
+
+    // 子目录部署：`~/` → `/pek/`
+    renderer.setPathBase("/pek/");
+    const second = try renderStatic(&renderer, arena, source, value.ofObject(&fields));
+    try testing.expect(std.mem.indexOf(u8, second, "href=\"/pek/static/a.css\"") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "src='/pek/static/b.png'") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "href=\"/pek/\"") != null);
+}
+
+fn renderStatic(renderer: *ViewRenderer, arena: std.mem.Allocator, source: []const u8, model: value.Value) ![]const u8 {
+    const template = switch (compile(arena, source)) {
+        .ok => |t| t,
+        .fail => |message| {
+            std.debug.print("编译失败：{s}\n", .{message});
+            return error.CompileFailed;
+        },
+    };
+    var rc = RenderCtx{ .allocator = arena, .renderer = renderer, .controller = "home", .model = model };
+    return renderOnce(&rc, template, arena);
 }
 
 test "view：模板缓存按修改时间失效" {
