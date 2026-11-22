@@ -145,6 +145,11 @@ const Node = union(enum) {
     text: []const u8,
     write: Expr,
     write_raw: Expr,
+    /// `@T("中文键")`：按**语言包键**取文案（与 C# `T(...)` / `@Html.Lang(...)` 同口径）。
+    ///
+    /// 求值规则（渲染期，见 `renderTranslate`）：取 `Model.lang` 对象里的同名键；
+    /// 取不到就用**键本身**（C# 语义：没翻译时直接用键名）。
+    translate: []const u8,
     if_node: *const IfNode,
     foreach_node: *const ForeachNode,
     set_var: struct { name: []const u8, expr: Expr },
@@ -390,6 +395,27 @@ const Parser = struct {
                 self.skipSpace();
                 try self.expect(')');
                 try nodes.append(self.arena, .{ .write_raw = expr });
+                return;
+            }
+        }
+        // `@T("中文键")`：C# 同款翻译调用（2026-11-23 用户要求，视图不再写 `@Model.lang.menu_console`）
+        if (std.mem.eql(u8, name, "T")) {
+            if (self.peekAt(name.len) == '(') {
+                self.pos += name.len;
+                self.skipSpace();
+                try self.expect('(');
+                self.skipSpace();
+                if (self.peek() != '"') {
+                    return self.fail("`@T(...)` 只支持字符串字面量，写法：@T(\"控制台\")", .{});
+                }
+                const lit = try self.parseStringLiteral();
+                const key = switch (lit) {
+                    .str_lit => |text| text,
+                    else => return self.fail("`@T(...)` 只支持字符串字面量", .{}),
+                };
+                self.skipSpace();
+                try self.expect(')');
+                try nodes.append(self.arena, .{ .translate = key });
                 return;
             }
         }
@@ -1024,6 +1050,10 @@ fn renderNodes(
                 try writer.writeAll(text);
                 rc.allocator.free(text);
             },
+            .translate => |key| {
+                const text = try renderTranslate(rc, key);
+                try value.writeEscapedHtml(writer, text);
+            },
             .if_node => |node_ptr| {
                 var matched = false;
                 for (node_ptr.branches) |branch| {
@@ -1165,6 +1195,26 @@ fn renderSubTemplate(rc: *RenderCtx, template: *Template, model: Value, writer: 
     }
     var ignored: ?[]const u8 = null;
     try renderNodes(rc, template.nodes, null, writer, &ignored);
+}
+
+/// `@T("中文键")` 的求值：在 `Model.lang` 里按键取文案，取不到就用键本身。
+///
+/// 为什么不用方法调用实现：zzig 是 Razor **子集**，不支持任意方法调用（`@T(...)` 是唯一特例，
+/// 与 `Raw(...)` 同级），所以这里直接读 `Model.lang` 对象的同名键 —— 与 C# `T(key)` 的
+/// 「有翻译用翻译、没翻译用键名」语义完全一致，且不需要在模型上挂函数。
+fn renderTranslate(rc: *RenderCtx, key: []const u8) ![]const u8 {
+    if (rc.model == .object) {
+        for (rc.model.object) |field| {
+            if (!std.mem.eql(u8, field.name, "lang")) continue;
+            if (field.value != .object) break;
+            for (field.value.object) |entry| {
+                if (!std.mem.eql(u8, entry.name, key)) continue;
+                if (entry.value == .string) return entry.value.string;
+            }
+            break;
+        }
+    }
+    return key;
 }
 
 fn eval(rc: *RenderCtx, expr: Expr, scope: ?*const Scope) anyerror!Value {
@@ -2303,6 +2353,50 @@ test "view：组件式调用（返回 HTML / 名称大小写不敏感）" {
     // 简写 `@Component(...)` 也可用
     switch (renderSourceWith(arena, &renderer, "home", "@Component(\"HELLO\")", value.ofString("x"))) {
         .html => |html| try testing.expectEqualStrings("<em>x</em>", html),
+        .fail => return error.RenderFailed,
+    }
+}
+
+test "view：@T(\"中文键\") 按 Model.lang 取文案，缺省回退键本身" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var renderer = ViewRenderer.init(testing.allocator, compat.currentIo());
+    defer renderer.deinit();
+
+    // 模型就是 C# 那种 `{ lang: { 中文键: 文案 } }`：视图写 @T("控制台")
+    var lang_builder = value.ObjectBuilder.init(arena);
+    try lang_builder.str("控制台", "Console");
+    try lang_builder.str("设置", "Settings");
+
+    var model_builder = value.ObjectBuilder.init(arena);
+    try model_builder.put("lang", lang_builder.finish());
+
+    switch (renderSourceWith(
+        arena,
+        &renderer,
+        "home",
+        "<h3>@T(\"控制台\")</h3><p>@T(\"设置\")</p><i>@T(\"未翻译\")</i>",
+        model_builder.finish(),
+    )) {
+        // 取不到时回退**键本身**（与 C# `T(key)` 同口径）
+        .html => |html| try testing.expectEqualStrings("<h3>Console</h3><p>Settings</p><i>未翻译</i>", html),
+        .fail => |message| {
+            std.debug.print("@T 渲染失败：{s}\n", .{message});
+            return error.RenderFailed;
+        },
+    }
+
+    // 非字符串字面量显式报错（C# 里 `@T('x')` 是 char、非法；这里也不支持）
+    switch (renderSourceWith(arena, &renderer, "home", "@T(Model.Key)", value.ofNull())) {
+        .html => return error.ExpectedFailure,
+        .fail => {},
+    }
+
+    // 没有 lang 字段（或不是对象）时，@T 原样输出键，不报错 —— 视图不会因为缺语言数据而白屏
+    switch (renderSourceWith(arena, &renderer, "home", "@T(\"控制台\")", value.ofNull())) {
+        .html => |html| try testing.expectEqualStrings("控制台", html),
         .fail => return error.RenderFailed,
     }
 }
