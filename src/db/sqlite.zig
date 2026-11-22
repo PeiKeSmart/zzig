@@ -125,7 +125,36 @@ pub const Lib = struct {
     ///
     /// 2026-11-22 修：原先只枚举 Windows 的 dll，Linux 上**永远** `SqliteNotAvailable`
     /// （与系统是否装了 sqlite 无关），后台账号/会话因此退回内存、重启即丢。
+    ///
+    /// **进程内只真正加载一次**（见 [`LibShared`]）：后续调用复用同一句柄，只增引用计数。
     pub fn load(gpa: std.mem.Allocator) !Lib {
+        lib_shared.mutex.lock();
+        defer lib_shared.mutex.unlock();
+
+        if (lib_shared.loaded) {
+            lib_shared.refs += 1;
+            return lib_shared.lib;
+        }
+
+        var lib = try loadFresh(gpa);
+
+        // `source` 常驻化：`loadFresh` 里的候选路径缓冲会被释放，不能让 `Lib.source` 指着它。
+        // 用 page_allocator：常驻内存不该依附调用方的（可能是 arena / 短命的）分配器。
+        const owned = std.heap.page_allocator.dupe(u8, lib.source) catch |e| {
+            closeModule(lib.dyn);
+            return e;
+        };
+        lib.source = owned;
+
+        lib_shared.lib = lib;
+        lib_shared.source_owned = owned;
+        lib_shared.loaded = true;
+        lib_shared.refs = 1;
+        return lib;
+    }
+
+    /// 真正去磁盘上找并加载模块（只在首次 `load` 时执行）。
+    fn loadFresh(gpa: std.mem.Allocator) !Lib {
         var candidates: std.ArrayList([]const u8) = .empty;
         defer {
             for (candidates.items) |c| gpa.free(c);
@@ -191,13 +220,40 @@ pub const Lib = struct {
     }
 
     pub fn deinit(self: *Lib) void {
-        closeModule(self.dyn);
+        // 只减引用计数，**不卸载模块**：句柄是进程级共享的（见 `LibShared`），
+        // 某个组件先关掉自己的 `Lib` 不能把别的组件正在用的句柄拔掉。
+        _ = self;
+        lib_shared.mutex.lock();
+        defer lib_shared.mutex.unlock();
+        if (lib_shared.refs > 0) lib_shared.refs -= 1;
     }
 
     pub fn version(self: *const Lib) []const u8 {
         return std.mem.span(self.libversion());
     }
 };
+
+/// `Lib` 的**进程级共享状态**：`sqlite3.dll` / `libsqlite3.so` 全局只加载一次，之后只增减速引用。
+///
+/// 为什么必须在驱动层解决（2026-11-22 实测）：
+/// 「先用 `Pek.ZCode` 同步表结构，再建运行期连接」是典型用法，两个组件各自 `Lib.load` / `deinit`
+/// 时，Windows 上同一模块的「加载 → 卸载 → 再加载」会让后一次 `sqlite3_open_v2` 失败——
+/// 症状是建表日志正常、紧接着运行期连接报 `Sqlite` 并回退内存（后台账号/设置全丢）。
+/// 这不是调用方该各自写重试兜底的事，所以在驱动层做成常驻单例：
+/// **首次加载成功后不再卸载**（进程退出由系统回收），调用方照旧 `load`/`deinit`。
+///
+/// 性能：`load` 只发生在启动期，之后每次只是加锁 + 一次结构体拷贝（几十字节），运行期零开销；
+/// 相比原来还省掉了重复的 `LoadLibrary`。
+const LibShared = struct {
+    mutex: @import("../compat.zig").Mutex = .{},
+    loaded: bool = false,
+    lib: Lib = undefined,
+    source_owned: []u8 = &.{},
+    /// 引用计数：用于诊断；当前策略是常驻，不因归零而卸载。
+    refs: usize = 0,
+};
+
+var lib_shared: LibShared = .{};
 
 /// 一个打开的数据库连接（后续 `Session` 直接持有它）。
 pub const Db = struct {
