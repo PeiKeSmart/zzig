@@ -95,6 +95,55 @@ pub fn writeAll(
     try fsio.writeFileAtomic(io, allocator, path, current);
 }
 
+/// 把键 `old_key` 改名为 `new_key`：**值、行尾注释、行首缩进原样保留**。
+///
+/// 用途：配置项改名迁移（旧名 → 与框架/规范统一的新名）。规矩：
+/// - `new_key` 已存在 → 返回 `null`（**不覆盖**新名，哪怕值是空的）；
+/// - `old_key` 不存在 → 返回 `null`；
+/// - 返回 `null` 时调用方**不要写文件**（幂等，二次启动零写入）。
+pub fn rename(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    old_key: []const u8,
+    new_key: []const u8,
+) !?[]u8 {
+    // 注意：不能用 `get` 判断存在性 —— 它对**空值**（`Key = ""`）返回 null，
+    // 而空值键同样需要改名（刚开始就是空的，后面才填）。这里只看「有没有这个键行」。
+    if (findKeyLine(text, new_key) != null) return null;
+    if (findKeyLine(text, old_key) == null) return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var renamed = false;
+    var iterator = std.mem.splitScalar(u8, text, '\n');
+    while (iterator.next()) |line| {
+        if (renamed or !isKeyLine(line, old_key)) {
+            try lines.append(a, line);
+            continue;
+        }
+        var i: usize = 0;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        const rest = line[i + old_key.len ..];
+        try lines.append(a, try std.fmt.allocPrint(a, "{s}{s}{s}", .{ line[0..i], new_key, rest }));
+        renamed = true;
+    }
+    if (!renamed) return null;
+    return try std.mem.join(allocator, "\n", lines.items);
+}
+
+/// 找 `key` 的键行号（0 基）；不存在返回 `null`。**与值是否为空无关**。
+pub fn findKeyLine(text: []const u8, key: []const u8) ?usize {
+    var index: usize = 0;
+    var iterator = std.mem.splitScalar(u8, text, '\n');
+    while (iterator.next()) |line| : (index += 1) {
+        if (isKeyLine(line, key)) return index;
+    }
+    return null;
+}
+
 /// 该行是否是 `key` 的键行（行首空白后可跟 `=` 或空白；`#` 开头的注释行不算）。
 pub fn isKeyLine(line: []const u8, key: []const u8) bool {
     var i: usize = 0;
@@ -148,4 +197,37 @@ test "text_keys：注释里出现键名不算命中" {
     ;
     try testing.expect(get(text, "SiteName") == null);
     try testing.expectEqualStrings("Admin", get(text, "AdminArea").?);
+}
+
+test "text_keys：改名保留值与行尾注释，新名已存在则不动" {
+    const text =
+        \\# 头部
+        \\SiteUrl = "https://x.example"  # 对外地址
+        \\AdminArea = "Admin"
+    ;
+    const renamed = (try rename(testing.allocator, text, "SiteUrl", "CurDomainUrl")).?;
+    defer testing.allocator.free(renamed);
+    try testing.expectEqualStrings("https://x.example", get(renamed, "CurDomainUrl").?);
+    try testing.expect(get(renamed, "SiteUrl") == null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "# 对外地址") != null);
+    try testing.expect(std.mem.indexOf(u8, renamed, "# 头部") != null);
+
+    // 新名已存在 → 不覆盖、返回 null
+    const both =
+        \\SiteUrl = "old"
+        \\CurDomainUrl = "keep"
+    ;
+    try testing.expect((try rename(testing.allocator, both, "SiteUrl", "CurDomainUrl")) == null);
+    // 旧名不存在 → 返回 null（幂等）
+    try testing.expect((try rename(testing.allocator, text, "NoSuchKey", "X")) == null);
+
+    // 空值键也要能改名（`get` 对空值返回 null，rename 不能据此判断存在性）
+    const empty =
+        \\SiteUrl = ""
+        \\AdminArea = "Admin"
+    ;
+    const renamed_empty = (try rename(testing.allocator, empty, "SiteUrl", "CurDomainUrl")).?;
+    defer testing.allocator.free(renamed_empty);
+    try testing.expect(findKeyLine(renamed_empty, "CurDomainUrl") != null);
+    try testing.expect(findKeyLine(renamed_empty, "SiteUrl") == null);
 }
