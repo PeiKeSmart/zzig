@@ -164,6 +164,8 @@ pub const config = struct {
     pub const toml = @import("config/toml.zig");
     /// TOML 模板渲染（带注释；声明表驱动，注释与键值写在同一处）
     pub const toml_template = @import("config/toml_template.zig");
+    /// 文本级键读写（保留注释与其它行；面板回写单个开关用）
+    pub const text_keys = @import("config/text_keys.zig");
     pub const FileText = @import("config/file.zig").FileText;
     pub const FileOptions = @import("config/file.zig").Options;
     pub const getStamp = @import("config/file.zig").getStamp;
@@ -414,6 +416,7 @@ test {
     _ = @import("net/socket_timeout.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
+    _ = @import("config/text_keys.zig");
     _ = @import("config/file.zig");
     _ = @import("logs/text_file_log.zig");
     _ = @import("threading/pool.zig");

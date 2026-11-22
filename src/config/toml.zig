@@ -27,6 +27,53 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) Error!*Table {
     return p.parseRoot();
 }
 
+/// 按 key 取值（**大小写不敏感**：TOML 本身区分大小写，但手写配置常有 `siteName` / `SiteName` 混用）。
+///
+/// 先哈希精确查找（常见路径），未命中再线性扫描做 `eqlIgnoreCase` 兜底——
+/// 兜底只在「键名大小写写错」时走，不会拖慢正常配置。
+pub fn lookup(table: *const Table, key: []const u8) ?Value {
+    if (table.get(key)) |value| return value;
+    var iterator = table.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, key)) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+/// 取布尔值；键不存在或类型不是布尔时返回 `null`（调用方保留默认值）。
+pub fn getBool(table: *const Table, key: []const u8) ?bool {
+    const value = lookup(table, key) orelse return null;
+    return if (std.meta.activeTag(value) == .boolean) value.boolean else null;
+}
+
+/// 取整数；键不存在或类型不是整数时返回 `null`。
+pub fn getInt(table: *const Table, key: []const u8) ?i64 {
+    const value = lookup(table, key) orelse return null;
+    return if (std.meta.activeTag(value) == .integer) value.integer else null;
+}
+
+/// 取字符串（借用解析结果，生命周期同配置文本）；不存在或类型不符返回 `null`。
+pub fn getStr(table: *const Table, key: []const u8) ?[]const u8 {
+    const value = lookup(table, key) orelse return null;
+    return if (std.meta.activeTag(value) == .string) value.string else null;
+}
+
+/// 取字符串数组；不存在或类型不符返回 `null`。
+///
+/// 数组里非字符串元素**跳过**（手写配置容错：`[\/api", 123]` 不应整份配置失效）。
+/// 返回的切片由 `a` 分配、元素借用配置文本。
+pub fn getStrList(a: std.mem.Allocator, table: *const Table, key: []const u8) !?[]const []const u8 {
+    const value = lookup(table, key) orelse return null;
+    if (std.meta.activeTag(value) != .array) return null;
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
+    for (value.array) |item| {
+        if (std.meta.activeTag(item) != .string) continue;
+        try out.append(a, item.string);
+    }
+    return try out.toOwnedSlice(a);
+}
+
 pub fn decode(comptime T: type, allocator: std.mem.Allocator, table: *Table) !T {
     return decodeValue(T, allocator, .{ .table = table });
 }
