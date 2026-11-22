@@ -1814,11 +1814,21 @@ fn renderOnce(rc: *RenderCtx, template: *Template, arena: std.mem.Allocator) ![]
     return out.toOwnedSlice();
 }
 
+/// 候选路径：**先 `.zshtml` 再 `.cshtml`**。
+///
+/// 2026-11-23 起 Zig 生态的模板统一用 **`.zshtml`**（用户要求：「zig里的.cshtml全部改用.zshtml」）：
+/// - 语义正确：它是 zzig 的模板子集，不是 ASP.NET Core Razor；
+/// - 编辑器友好：`.cshtml` 会被 C# Dev Kit 的 Razor 语言服务接管，`@Model.x` 满屏报错（纯误报）。
+///
+/// 仍保留 `.cshtml` 作为**回退**：未迁移的 Zig 项目照样能跑（改名是渐进式的）。
 fn pushCandidate(candidates: *std.ArrayList([]const u8), arena: std.mem.Allocator, dir: []const u8, view: []const u8) !void {
     const pascal_view = try pascalPath(arena, view);
-    try candidates.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}.cshtml", .{ dir, pascal_view }));
-    if (!std.mem.eql(u8, pascal_view, view)) {
-        try candidates.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}.cshtml", .{ dir, view }));
+    const extensions = [_][]const u8{ ".zshtml", ".cshtml" };
+    for (extensions) |ext| {
+        try candidates.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ dir, pascal_view, ext }));
+        if (!std.mem.eql(u8, pascal_view, view)) {
+            try candidates.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ dir, view, ext }));
+        }
     }
 }
 
@@ -1992,6 +2002,47 @@ fn writeView(path: []const u8, content: []const u8) !void {
     const io = compat.currentIo();
     try fsio.ensureParent(io, path);
     try fsio.writeFile(io, path, content);
+}
+
+test "view：.zshtml 优先于 .cshtml（同目录两个文件都在时）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    const dir = try makeTempDir("views-zshtml");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        testing.allocator.free(dir);
+    }
+
+    // 同一个视图名，两种扩展名都存在：必须选 `.zshtml`
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Home/Index.zshtml", .{dir}), "<p>ZS</p>");
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Home/Index.cshtml", .{dir}), "<p>CS</p>");
+
+    var renderer = ViewRenderer.init(testing.allocator, io);
+    defer renderer.deinit();
+    renderer.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir}));
+
+    switch (try renderer.resolve(arena, "Home", "Index")) {
+        .path => |p| try testing.expect(std.mem.endsWith(u8, p, "Index.zshtml")),
+        .missing => return error.TestUnexpectedResult,
+    }
+
+    // 只有 `.cshtml` 时仍能解析（未迁移的项目照旧可用）
+    const dir2 = try makeTempDir("views-cshtml-only");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir2) catch {};
+        testing.allocator.free(dir2);
+    }
+    try writeView(try std.fmt.allocPrint(arena, "{s}/Views/Home/Index.cshtml", .{dir2}), "<p>CS</p>");
+    var r2 = ViewRenderer.init(testing.allocator, io);
+    defer r2.deinit();
+    r2.setRoot(try std.fmt.allocPrint(arena, "{s}/Views", .{dir2}));
+    switch (try r2.resolve(arena, "Home", "Index")) {
+        .path => |p| try testing.expect(std.mem.endsWith(u8, p, "Index.cshtml")),
+        .missing => return error.TestUnexpectedResult,
+    }
 }
 
 test "view：布局 / 分区 / RenderBody / Shared（文件系统）" {
