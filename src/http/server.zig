@@ -138,6 +138,32 @@ pub const Options = struct {
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
 pub const HandlerFn = *const fn (ctx: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply;
 
+/// 头阶段视图：**只含请求头**，`body` 尚未读取（早拒用）。
+pub const HeadView = struct {
+    method: []const u8,
+    target: []const u8,
+    path: []const u8,
+    query: []const u8,
+    /// 已解析的请求头（名称小写）；`content-length` 在这个列表里（未从 header 里剥离）
+    headers: []const std.http.Header,
+    /// 纯 IP（反代场景已按 `trust_forwarded_for` 换成真实客户端 IP）
+    remote_addr: ?[]const u8 = null,
+    /// 声明的请求体长度（无则 `null`；`Transfer-Encoding: chunked` 时为 `null`）
+    content_length: ?u64 = null,
+};
+
+/// 头阶段早拒钩子：**读完请求头、读 body 之前**调用。
+///
+/// 返回非 `null` 即直接回复并**关闭本次连接**（不读 body）—— 所以只能返回
+/// 「拒绝型」响应（403 / 413 / 414 / 405 / 429…），不要在这里做正常响应。
+pub const HeadGuardFn = *const fn (ctx: *anyopaque, head: HeadView, arena: std.mem.Allocator) anyerror!?Reply;
+
+/// 头阶段钩子的注册项。
+pub const HeadGuard = struct {
+    ctx: *anyopaque,
+    call: HeadGuardFn,
+};
+
 /// 连接调度方式（对齐 `zgrpc.grpc.ConnDispatch`；`.pool` 需外部线程池，本库不内建）。
 pub const Dispatch = enum {
     /// 每连接一独立线程（默认；几百连接以内吞吐最好）
@@ -154,6 +180,8 @@ pub const Server = struct {
     opts: Options = .{},
     active: std.atomic.Value(usize) = .init(0),
     stopped: std.atomic.Value(bool) = .init(false),
+    /// 头阶段早拒钩子（`null` = 不启用，行为与之前完全一致）
+    head_guard: ?HeadGuard = null,
     /// 监听口生命周期保护（`run` 与 `stop` 都可能看它）
     listener_guard: std.Io.Mutex = .init,
     /// `run` 里创建的监听口（仅用于可观测；**不在 `stop` 里关闭**，见下）
@@ -481,6 +509,24 @@ pub const Server = struct {
 
         // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（body 流未读完）
         const keep = self.opts.keep_alive and head.keep_alive and !head.is_chunked;
+
+        // 早拒（钩子）：读完头、**读 body 之前**拦扫描器 / 超大声明 / 超长 URL。
+        // 返回非 null 就回包并关连接（body 未读，不能复用）。
+        if (self.head_guard) |hg| {
+            const maybe = hg.call(hg.ctx, .{
+                .method = @tagName(head.method),
+                .target = head.target,
+                .path = path,
+                .query = query,
+                .headers = header_list.items,
+                .remote_addr = remote_addr,
+                .content_length = head.content_length,
+            }, arena) catch null;
+            if (maybe) |reply| {
+                try self.writeReply(sw, reply, null, self.headerOptions(false), false);
+                return false;
+            }
+        }
 
         // 早拒：声明长度超上限就不读 body
         var body: []const u8 = "";
