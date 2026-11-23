@@ -279,6 +279,9 @@ pub const App = struct {
             },
             .not_found => {
                 if (try self.statics.serveRequest(arena, req)) |response| return response;
+                // 兜底（站点自己的 404 页）必须在**静态资源也没命中**之后才跑：
+                // 否则真实存在的 `/static/xx.css` 会被兜底抢走（见 `Router.fallbackAfterStatics`）。
+                if (try self.router.runFallback(&ctx)) |response| return response;
                 return Response.notFound();
             },
         }

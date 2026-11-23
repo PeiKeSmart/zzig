@@ -427,6 +427,8 @@ pub const Router = struct {
     routes: std.ArrayList(Route) = .empty,
     middlewares: std.ArrayList(Middleware) = .empty,
     fallback_handler: ?Handler = null,
+    /// 兜底是否延后到「静态资源也没命中」之后（见 [`fallbackAfterStatics`]）。
+    fallback_after_statics: bool = false,
     /// 伪静态后缀（如 `.html`）：**原路径未命中时**再去掉后缀匹配一次。
     ///
     /// 官网/门户类站点常用：`/about.html` → 命中 `/about`，`/news/123.html` → 命中 `/news/{id}`
@@ -495,6 +497,25 @@ pub const Router = struct {
     /// 注册兜底处理器（全不命中时执行；仍走中间件链）。
     pub fn fallback(self: *Router, h: Handler) void {
         self.fallback_handler = h;
+    }
+
+    /// 把兜底**延后到静态资源也没命中之后**（默认 `false` = 路由没命中就直接调兜底）。
+    ///
+    /// 为什么需要：`App` 的处理顺序是「路由 → 静态资源 → 404」，但路由若无条件先调兜底，
+    /// 兜底就会**抢在静态文件前面**——真实存在的 `/static/site.css` 也会落进兜底变成 404
+    /// （2026-11-23 在 Pek.ZTools 上踩到：整站样式全 404）。
+    /// 站点要自己的 404 页时：`router.fallback(h); router.fallbackAfterStatics(true);`
+    pub fn fallbackAfterStatics(self: *Router, enabled: bool) void {
+        self.fallback_after_statics = enabled;
+    }
+
+    /// 直接调用兜底处理器（含中间件链）；没设兜底返回 `null`。
+    /// `App` 在「静态资源也没命中」时用它，配合 [`fallbackAfterStatics`]。
+    pub fn runFallback(self: *Router, c: *Ctx) anyerror!?Response {
+        const h = self.fallback_handler orelse return null;
+        c.pattern = "(fallback)";
+        var chain = Chain{ .mws = self.middlewares.items, .handler = h, .ctx = c };
+        return try chain.next();
     }
 
     /// 注册路由。
@@ -675,9 +696,11 @@ pub const Router = struct {
             .method_not_allowed => |allow| return .{ .method_not_allowed = allow },
             .not_found => {
                 if (self.fallback_handler) |h| {
-                    c.pattern = "(fallback)";
-                    var chain = Chain{ .mws = self.middlewares.items, .handler = h, .ctx = c };
-                    return .{ .response = try chain.next() };
+                    if (!self.fallback_after_statics) {
+                        c.pattern = "(fallback)";
+                        var chain = Chain{ .mws = self.middlewares.items, .handler = h, .ctx = c };
+                        return .{ .response = try chain.next() };
+                    }
                 }
                 return .not_found;
             },
