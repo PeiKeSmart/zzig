@@ -18,6 +18,7 @@
 //! 这类带检查的非线程安全分配器，会在 accept 相关的内部路径上直接 panic。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const head_parser = @import("head_parser.zig");
 const body_reader = @import("body_reader.zig");
 const compat = @import("../compat.zig");
@@ -118,7 +119,18 @@ pub const Options = struct {
     /// 所以**不把它作为默认防线**：Slowloris 靠 `max_connections` + `keep_alive_requests`
     /// 与前置 nginx 的 `client_header_timeout` 兜。确实要在 POSIX 上试，可显式设 >0
     /// （建议 ReleaseFast 构建，避免 Debug 下的 panic 路径）。
+    ///
+    /// ★ 设了它 = 打开「三阶段超时」（对齐 Go `ReadHeaderTimeout` / `IdleTimeout`）：
+    /// 本项**只作用于读请求头**，读完头立刻切到 [`body_idle_timeout_ms`]，
+    /// keep-alive 等下一个请求切到 [`keep_alive_timeout_secs`]。
+    /// 这样就不会出现「连接级一个超时罩住上传」的误伤（Go 官方对 `Server.ReadTimeout` 的警告）。
     header_timeout_ms: u32 = 0,
+    /// body 阶段的**空闲**读超时（毫秒），默认 0 = 读完请求头后**清除**读超时。
+    ///
+    /// 语义 = 「两次读之间」的间隔上限（同 nginx `client_body_timeout`），**不是总时长**：
+    /// 大文件持续上传不会触发，只有卡住超过阈值才回 408。
+    /// 仅当 `header_timeout_ms > 0` 时生效（后者是三阶段超时的总开关）。
+    body_idle_timeout_ms: u32 = 0,
     /// 是否关闭 Nagle（`TCP_NODELAY`）。小包交互默认关掉：否则 header+body 两个小包
     /// 会等前一个的 ACK，与对端延迟 ACK 叠加出 10~200ms 的随机尾部延迟。
     tcp_nodelay: bool = true,
@@ -334,19 +346,73 @@ pub const Server = struct {
     ///
     /// 失败只降级不报错：某些平台/被包装的 socket 不支持这些选项，但服务必须能继续。
     fn applySocketOptions(self: *Server, stream: std.Io.net.Stream) void {
-        if (self.opts.header_timeout_ms > 0) {
-            socket_timeout.setRecvTimeout(self.io, stream, self.opts.header_timeout_ms) catch |e| {
-                // 只提示一次：Windows 上 AFD 不支持 SO_RCVTIMEO（实测 STATUS_NOT_SUPPORTED），
-                // 每连接打一条会把日志变成负担。生产部署走 Linux（POSIX 生效）。
-                if (!self.timeout_warned.swap(true, .acq_rel)) {
-                    std.debug.print(
-                        "[zzig.http] 原生读超时不可用（{s}）：该平台请靠 max_connections + keep_alive_requests + 反代 client_header_timeout 兜住 Slowloris\n",
-                        .{@errorName(e)},
-                    );
-                }
-            };
-        }
+        // 建连时先按**头阶段**设一次（`handleOne` 每轮读头前还会重设）。
+        self.applyHeaderTimeout(stream);
         if (self.opts.tcp_nodelay) socket_timeout.setNoDelay(self.io, stream, true) catch {};
+    }
+
+    /// 读超时的三个阶段（对齐 Go `ReadHeaderTimeout` / `IdleTimeout` 的分工）。
+    pub const TimeoutPhase = enum { header, body, idle };
+
+    /// 某阶段应设置的读超时（毫秒）；`null` = **不碰**连接上的超时设置。
+    ///
+    /// `header_timeout_ms == 0`（默认）是「三阶段超时」的**总开关**：关闭时三个阶段
+    /// 都返回 null，一个 syscall 都不发，行为与旧版完全一致。
+    ///
+    /// - `header` → `header_timeout_ms`（防 Slowloris：连上不发头）
+    /// - `body` → `body_idle_timeout_ms`（「两次读之间」的空闲上限；0 = 清除，大文件不受影响）
+    /// - `idle` → `keep_alive_timeout_secs × 1000`（keep-alive 等下一个请求；0 = 不限）
+    pub fn phaseTimeoutMs(opts: Options, phase: TimeoutPhase) ?u32 {
+        if (opts.header_timeout_ms == 0) return null;
+        return switch (phase) {
+            .header => opts.header_timeout_ms,
+            .body => opts.body_idle_timeout_ms,
+            .idle => if (opts.keep_alive_timeout_secs == 0)
+                0
+            else
+                opts.keep_alive_timeout_secs *| 1000,
+        };
+    }
+
+    /// 头阶段超时（防 Slowloris）。
+    fn applyHeaderTimeout(self: *Server, stream: std.Io.net.Stream) void {
+        if (phaseTimeoutMs(self.opts, .header)) |ms| self.setRecvTimeout(stream, ms);
+    }
+
+    /// body 阶段超时：**读完请求头后**把读超时切成 body 值（默认 0 = 清除）。
+    ///
+    /// 这是与「连接级一个超时罩到底」的关键差别：上传 64 MB 文件时，头阶段的短阈值
+    /// 不能继续生效（Go 官方文档对 `Server.ReadTimeout` 的警告就是这一点）。
+    /// body 值语义 = 「两次读之间的空闲上限」，持续传输不会触发（同 nginx `client_body_timeout`）。
+    fn applyBodyTimeout(self: *Server, stream: std.Io.net.Stream) void {
+        if (phaseTimeoutMs(self.opts, .body)) |ms| self.setRecvTimeout(stream, ms);
+    }
+
+    /// keep-alive 空闲阶段超时：等下一个请求头的时间上限（对齐 Go `IdleTimeout`）。
+    ///
+    /// 以前 `keep_alive_timeout_secs` **只写进响应头** `Keep-Alive: timeout=N`，
+    /// 服务端自己并不执行 —— 空闲连接能一直挂着。现在它真正生效（仅在超时总开关打开时）。
+    fn applyIdleTimeout(self: *Server, stream: std.Io.net.Stream) void {
+        if (phaseTimeoutMs(self.opts, .idle)) |ms| self.setRecvTimeout(stream, ms);
+    }
+
+    /// 设置读超时（`ms == 0` = 不限）。平台不支持时只提示一次，不打断服务。
+    fn setRecvTimeout(self: *Server, stream: std.Io.net.Stream, ms: u32) void {
+        // **Debug / ReleaseSafe 不设**：POSIX 到点是 `EAGAIN`，`std.Io` 在带安全检查的构建里
+        // 会把它当 programmer bug **panic**（实测 “programmer bug caused syscall error: AGAIN”）。
+        // 超时是生产加固；开发/测试构建宁可没有，也不能崩。
+        // （Zig 0.17：`builtin.mode` 的枚举值是小写 `.debug / .safe / .fast / .small`）
+        if (builtin.mode != .fast and builtin.mode != .small) return;
+        socket_timeout.setRecvTimeout(self.io, stream, ms) catch |e| {
+            // 只提示一次：Windows 上 AFD 不支持 SO_RCVTIMEO（实测 STATUS_NOT_SUPPORTED），
+            // 每连接打一条会把日志变成负担。
+            if (!self.timeout_warned.swap(true, .acq_rel)) {
+                std.debug.print(
+                    "[zzig.http] 原生读超时不可用（{s}）：该平台请靠 max_connections + keep_alive_requests + 反代 client_header_timeout 兜住 Slowloris\n",
+                    .{@errorName(e)},
+                );
+            }
+        };
     }
 
     /// 处理**一条**连接上的一个请求（单线程可用，便于测试）。
@@ -417,6 +483,9 @@ pub const Server = struct {
             // 客户端会一直等到连接关闭（多请求复用场景直接死锁）。
             try sw.interface.flush();
             if (!keep) return;
+            // 空闲阶段：等下一个请求头也有上限（`keep_alive_timeout_secs` 不再只是响应头里的提示）。
+            // 到点后下一次 `readHeadBytes` 会超时 → 回 408 并关闭连接。
+            self.applyIdleTimeout(stream);
         }
     }
 
@@ -490,7 +559,17 @@ pub const Server = struct {
         arena: std.mem.Allocator,
     ) !bool {
         // 1) 读头 → **立即拷进 arena**：下一步读 body 会覆盖连接缓冲。
+        //
+        // 超时分**三阶段**（对齐 Go `ReadHeaderTimeout` / nginx `client_header_timeout`
+        // 与 `client_body_timeout` 的分工；只在显式设了 `header_timeout_ms` 时启用）：
+        //   头阶段 → `header_timeout_ms`（防 Slowloris：连上不发头）
+        //   body 阶段 → `body_idle_timeout_ms`（「两次读之间」的空闲上限，0 = 清除）
+        //   空闲阶段 → `keep_alive_timeout_secs`（keep-alive 等下一个请求，见 serveWithLimit）
+        // keep-alive 复用连接时上一轮已切到 body/空闲阶段，所以**每次读头前都要重设**。
+        self.applyHeaderTimeout(stream);
         const head_raw = try self.readHeadBytes(stream, cb);
+        // 读完头立刻切到 body 阶段（默认清除）：否则上传大文件会被头阶段的短阈值误伤。
+        self.applyBodyTimeout(stream);
         const head_len = head_raw.len;
         const head_bytes = try arena.dupe(u8, head_raw);
         cb.consume(head_len);
@@ -1764,4 +1843,28 @@ test "HTTP 服务端：请求头数量超限回 431（std 只限总字节，不�
     try testing.expect(std.mem.indexOf(u8, resp[0..total], "431") != null);
     try testing.expectEqual(@as(usize, 0), ctx.served); // 没进业务 handler
     std.debug.print("[http] 头数量上限 OK：100 个小头 → 431（{d} 字节）\n", .{total});
+}
+
+test "HTTP 服务端：读超时三阶段（对齐 Go ReadHeaderTimeout / IdleTimeout）" {
+    // 总开关关闭（默认）：三个阶段一个都不碰，行为与旧版完全一致。
+    const off: Options = .{};
+    try std.testing.expectEqual(@as(?u32, null), Server.phaseTimeoutMs(off, .header));
+    try std.testing.expectEqual(@as(?u32, null), Server.phaseTimeoutMs(off, .body));
+    try std.testing.expectEqual(@as(?u32, null), Server.phaseTimeoutMs(off, .idle));
+
+    // 打开头超时：头阶段用它；body 默认 0 = 读完头**清除**（大文件不被短阈值误伤）；
+    // keep-alive 空闲用 keep_alive_timeout_secs（以前它只写响应头，现在真正生效）。
+    const on: Options = .{ .header_timeout_ms = 10_000, .keep_alive_timeout_secs = 5 };
+    try std.testing.expectEqual(@as(?u32, 10_000), Server.phaseTimeoutMs(on, .header));
+    try std.testing.expectEqual(@as(?u32, 0), Server.phaseTimeoutMs(on, .body));
+    try std.testing.expectEqual(@as(?u32, 5_000), Server.phaseTimeoutMs(on, .idle));
+
+    // body 空闲超时可单独设（同 nginx client_body_timeout）：与头阶段互不影响。
+    const upload: Options = .{ .header_timeout_ms = 10_000, .body_idle_timeout_ms = 60_000 };
+    try std.testing.expectEqual(@as(?u32, 10_000), Server.phaseTimeoutMs(upload, .header));
+    try std.testing.expectEqual(@as(?u32, 60_000), Server.phaseTimeoutMs(upload, .body));
+
+    // keep_alive_timeout_secs = 0 → 空闲阶段不限（0 = 清除）。
+    const no_idle: Options = .{ .header_timeout_ms = 1_000, .keep_alive_timeout_secs = 0 };
+    try std.testing.expectEqual(@as(?u32, 0), Server.phaseTimeoutMs(no_idle, .idle));
 }
