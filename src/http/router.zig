@@ -564,6 +564,19 @@ pub const Router = struct {
         try self.map("*", pattern, h);
     }
 
+    /// 是否已注册「该方法 + 该路径」的**字面量**路由（`*` 通配也算命中）。
+    ///
+    /// 用于「框架内置路由」这类**不该覆盖业务**的自动注册：`map` 按注册顺序先到先得，
+    /// 重复注册会让后来者静默失效，所以先问一句再决定要不要注册。
+    pub fn has(self: *const Router, method: []const u8, pattern: []const u8) bool {
+        for (self.routes.items) |r| {
+            if (!std.mem.eql(u8, r.pattern, pattern)) continue;
+            if (std.mem.eql(u8, r.method, "*")) return true;
+            if (std.ascii.eqlIgnoreCase(r.method, method)) return true;
+        }
+        return false;
+    }
+
     /// 只做匹配（不执行处理器、不跑中间件）；命中时写入 `c.params` 与 `c.pattern`。
     ///
     /// 三阶段（伪静态友好，且不破坏既有语义）：

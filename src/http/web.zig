@@ -130,6 +130,25 @@ pub const App = struct {
         try self.router.useMiddleware(mw);
     }
 
+    /// 探活路由的规范路径（`/healthz`，Google z-pages 约定，也是本项目统一口径）。
+    pub const HEALTH_PATH = "/healthz";
+    /// 探活路由的别名（`/health`，监控工具与其它框架最常见写法；与 `/healthz` 同响应）。
+    pub const HEALTH_ALIAS = "/health";
+
+    /// 注册标准探活路由（`GET` / `HEAD` → `200 {"ok":true}`），返回是否真的注册。
+    ///
+    /// **刻意只回最小信息**：不带应用名、版本、启动时长、依赖状态 —— 版本号是扫描器挑漏洞的入口，
+    /// 依赖细节是信息泄露。要「依赖就绪」级别自检请自己注册同路径路由（`has` 会拦住内置的重复注册）。
+    ///
+    /// `run()` 会自动尝试注册 `/healthz`；已有同名路由时**跳过**（不覆盖业务实现）。
+    pub fn enableHealth(self: *App, pattern: []const u8) !bool {
+        if (self.router.has("GET", pattern)) return false;
+        try self.router.get(pattern, .{ .call = healthCall });
+        // HEAD 也接：负载均衡 / uptime 监控常用 HEAD 探活，不接会拿到 405 被判下线
+        if (!self.router.has("HEAD", pattern)) try self.router.map("HEAD", pattern, .{ .call = healthCall });
+        return true;
+    }
+
     /// 挂载控制器（统一使用本应用的视图根/区域根/组件注册表）。
     pub fn mountController(self: *App, ctrl: *controller.Controller) !void {
         ctrl.setViewsRoot(self.options.views_root);
@@ -305,7 +324,14 @@ pub const App = struct {
     }
 
     /// 创建底层服务端（需要自己控制 `run`/`stop` 时使用）。
+    ///
+    /// 内置探活在**这里**补：两条启动路径（`App.run` 与 `makeServer + server.run`）都会经过它，
+    /// 放在 `run()` 里会让自己管 `server` 的项目拿不到 `/healthz`（Pek.ZTools 2026-11-23 实测 404）。
     pub fn makeServer(self: *App, server_options: server.Options) server.Server {
+        // 业务没占这个路径就自动补上（占了则原样保留，绝不覆盖）。
+        // 两个路径同响应：`/healthz`（本项目口径）+ `/health`（通用写法），防止对接方各猜一个。
+        _ = self.enableHealth(HEALTH_PATH) catch {};
+        _ = self.enableHealth(HEALTH_ALIAS) catch {};
         return .{
             .gpa = self.allocator,
             .io = self.io,
@@ -322,6 +348,11 @@ pub const App = struct {
         try srv.run(host, port);
     }
 };
+
+/// 内置探活处理器：`200 {"ok":true}`（最小信息，见 `App.enableHealth`）。
+fn healthCall(_: ?*anyopaque, _: *Ctx) anyerror!Response {
+    return Response.json("{\"ok\":true}");
+}
 
 const testing = std.testing;
 const compat = @import("../compat.zig");
@@ -381,6 +412,54 @@ fn responseBody(io: std.Io, arena: std.mem.Allocator, response: Response) ![]con
         got += n;
     }
     return out[0..got];
+}
+
+test "web：内置探活 /healthz，重复注册不覆盖业务实现" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = compat.currentIo();
+
+    var app = try App.init(testing.allocator, io, .{ .wwwroot = null });
+    defer app.deinit();
+
+    // 第一次注册生效；第二次报告「已存在」而不是覆盖
+    try testing.expect(try app.enableHealth(App.HEALTH_PATH));
+    try testing.expect(!try app.enableHealth(App.HEALTH_PATH));
+    // 别名 `/health` 也能用（同一个 handler）
+    try testing.expect(try app.enableHealth(App.HEALTH_ALIAS));
+
+    const ok = try app.dispatch(arena, buildRequest("GET", "/healthz"));
+    try testing.expectEqual(std.http.Status.ok, ok.status);
+    try testing.expectEqualStrings("{\"ok\":true}", ok.body);
+    // 只回最小信息（不泄露版本 / 应用名）
+    try testing.expect(std.mem.indexOf(u8, ok.body, "version") == null);
+
+    // HEAD 也能探活（uptime 监控常用 HEAD，405 会被判下线）
+    const head = try app.dispatch(arena, buildRequest("HEAD", "/healthz"));
+    try testing.expectEqual(std.http.Status.ok, head.status);
+
+    // 别名 `/health` 与 `/healthz` 完全一致
+    const alias = try app.dispatch(arena, buildRequest("GET", "/health"));
+    try testing.expectEqual(std.http.Status.ok, alias.status);
+    try testing.expectEqualStrings("{\"ok\":true}", alias.body);
+
+    // 业务自己注册了同路径 → 内置的让位
+    var app2 = try App.init(testing.allocator, io, .{ .wwwroot = null });
+    defer app2.deinit();
+    var hits: u32 = 0;
+    const S = struct {
+        fn custom(counter: ?*anyopaque, _: *Ctx) anyerror!Response {
+            const p: *u32 = @ptrCast(@alignCast(counter.?));
+            p.* += 1;
+            return Response.json("{\"custom\":true}");
+        }
+    };
+    try app2.get("/healthz", .{ .ctx = @ptrCast(&hits), .call = S.custom });
+    try testing.expect(!try app2.enableHealth("/healthz"));
+    const mine = try app2.dispatch(arena, buildRequest("GET", "/healthz"));
+    try testing.expectEqualStrings("{\"custom\":true}", mine.body);
+    try testing.expectEqual(@as(u32, 1), hits);
 }
 
 test "web：路由优先、静态兜底、404" {
