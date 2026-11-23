@@ -79,9 +79,10 @@ pub const Options = struct {
     /// 是否附加默认安全响应头：
     /// `x-content-type-options: nosniff`（禁止 MIME 猜测）、
     /// `x-frame-options: SAMEORIGIN`（防点击劫持）、
-    /// `referrer-policy: no-referrer`（防路径/参数经 referer 外泄）。
+    /// `referrer-policy: no-referrer`（防路径/参数经 referer 外泄）、
+    /// `permissions-policy`（默认关掉定位/麦克风/摄像头/支付等强权限；同源页面仍可用）。
     ///
-    /// 只加这三个「不依赖页面结构」的头；CSP 会打到内联脚本与外链 CDN，
+    /// 只加这些「不依赖页面结构」的头；CSP 会打到内联脚本与外链 CDN，
     /// 必须由业务按自己页面定制，库不默认开。
     security_headers: bool = true,
     /// 是否信任反代转发头：**只当 TCP 对端是回环或命中 `trusted_proxy_prefixes` 时才采纳**，
@@ -133,6 +134,33 @@ pub const Options = struct {
     /// 600 个 13 字节的小头（总量 < 8 KB）能正常通过 —— 这类请求会白白消耗解析与复制开销。
     /// 正常浏览器 10~20 个头，反代叠加也到不了 100，所以默认 100 足够宽松。
     max_header_count: usize = 100,
+
+    // ————— 协议层边界（都在**读 body 之前**判定，属于传输层职责，与业务 WAF 无关）—————
+
+    /// URL（`target`：path + `?` + query）长度上限，超限 **414**；`0` = 不限制。
+    ///
+    /// 浏览器与反代普遍 8 KB 上限，取 4 KB 有余量。不设这层时超长 URL 会先撑爆连接缓冲，
+    /// 只能拿到含糊的 431（头过大），监控无法区分「URL 太长」与「头太多」。
+    max_url_length: usize = 4096,
+
+    /// 允许的 HTTP 方法（**大小写敏感**）；不在表内回 **405**。空数组 = 不限制。
+    ///
+    /// 默认不含 `TRACE` / `TRACK`（XST 跨站追踪）与 WebDAV 系方法；
+    /// 保留 `OPTIONS`：CORS 预检与部分反代探活要用。
+    allowed_methods: []const []const u8 = &.{ "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" },
+
+    /// 上传路径前缀：该前缀下体积上限用 `max_body_upload`（而不是 `max_body`）。
+    ///
+    /// 为什么需要：`max_body` 常被设成 64 MB 给上传用，但**非上传路径也就跟着能收 64 MB** ——
+    /// 256 连接 × 64 MB = 16 GB 的潜在内存，慢速 body 还能长时间占着连接。
+    ///
+    /// 默认包含 `/upload` 与 `/Upload`（生态里两套上传路由都有：小写是工具库口径，
+    /// 大写是 ZDsMallUI 的上传控制器）。
+    upload_prefixes: []const []const u8 = &.{ "/upload", "/Upload", "/fileuploader", "/api/upload" },
+
+    /// 上传前缀下的体积上限（字节）；`0` = 与 `max_body` 相同（不收紧）。
+    /// 典型摆法：`max_body = 1 MB`（普通表单）+ `max_body_upload = 64 MB`（上传）。
+    max_body_upload: usize = 0,
 };
 
 /// 处理函数：`reply.body` 必须自己分配，或借用 `arena`。
@@ -433,6 +461,16 @@ pub const Server = struct {
         };
     }
 
+    /// 本次请求的体积上限：上传前缀用 `max_body_upload`（>0 时），其余用 `max_body`。
+    fn bodyLimitFor(self: *const Server, path: []const u8) usize {
+        if (self.opts.max_body_upload > 0) {
+            for (self.opts.upload_prefixes) |prefix| {
+                if (prefix.len > 0 and std.mem.startsWith(u8, path, prefix)) return self.opts.max_body_upload;
+            }
+        }
+        return self.opts.max_body;
+    }
+
     /// TCP 对端是否可信代理（回环，或命中 `trusted_proxy_prefixes`）。
     fn isTrustedProxy(self: *const Server, peer: []const u8) bool {
         if (isLoopbackPeer(peer)) return true;
@@ -510,7 +548,21 @@ pub const Server = struct {
         // 连接能否复用：客户端没要求 close、没启用 keep-alive 开关、或用了分块传输（body 流未读完）
         const keep = self.opts.keep_alive and head.keep_alive and !head.is_chunked;
 
-        // 早拒（钩子）：读完头、**读 body 之前**拦扫描器 / 超大声明 / 超长 URL。
+        // ————— 协议层边界（比 head_guard 更基础；都在读 body 之前判完）—————
+        // 1) 方法白名单 → 405
+        if (self.opts.allowed_methods.len > 0 and !methodAllowed(self.opts.allowed_methods, head.method)) {
+            const msg = "{\"code\":405,\"msg\":\"method not allowed\"}";
+            try self.writeReply(sw, .{ .status = .method_not_allowed, .body = msg }, null, self.headerOptions(false), false);
+            return false;
+        }
+        // 2) URL 长度 → 414
+        if (self.opts.max_url_length > 0 and head.target.len > self.opts.max_url_length) {
+            const msg = "{\"code\":414,\"msg\":\"uri too long\"}";
+            try self.writeReply(sw, .{ .status = .uri_too_long, .body = msg }, null, self.headerOptions(false), false);
+            return false;
+        }
+
+        // 早拒（钩子）：读完头、**读 body 之前**拦扫描器 / 注入特征。
         // 返回非 null 就回包并关连接（body 未读，不能复用）。
         if (self.head_guard) |hg| {
             const maybe = hg.call(hg.ctx, .{
@@ -528,17 +580,18 @@ pub const Server = struct {
             }
         }
 
-        // 早拒：声明长度超上限就不读 body
+        // 早拒：声明长度超上限就不读 body（上限按路径取：上传前缀可放宽）
+        const body_limit = self.bodyLimitFor(path);
         var body: []const u8 = "";
         if (head.content_length) |len| {
-            if (len > self.opts.max_body) {
+            if (len > body_limit) {
                 const msg = "{\"code\":413,\"msg\":\"request body too large\"}";
                 try self.writeReply(sw, .{ .status = .payload_too_large, .body = msg }, null, self.headerOptions(false), false);
                 return false;
             }
             if (len > 0) body = try self.readBody(stream, cb, @intCast(len), arena);
         } else if (head.is_chunked) {
-            body = self.readChunkedBody(stream, cb, arena) catch |e| {
+            body = self.readChunkedBody(stream, cb, body_limit, arena) catch |e| {
                 std.debug.print("[zzig.http] 读分块请求体失败：{s}\n", .{@errorName(e)});
                 return false;
             };
@@ -710,10 +763,11 @@ pub const Server = struct {
         self: *Server,
         stream: std.Io.net.Stream,
         cb: *ConnBuf,
+        limit: usize,
         arena: std.mem.Allocator,
     ) ![]const u8 {
         var br = body_reader.BodyReader.init(stream, self.io, cb.buf[0..cb.len], null, true);
-        const body = try br.readAllAlloc(arena, self.opts.max_body);
+        const body = try br.readAllAlloc(arena, limit);
         // BodyReader 直接消费 socket 流，连接缓冲里的字节已由它接管
         cb.len = 0;
         return body;
@@ -783,7 +837,8 @@ fn formatReplyHead(
     if (opts.security_headers) {
         try w.writeAll("x-content-type-options: nosniff\r\n" ++
             "x-frame-options: SAMEORIGIN\r\n" ++
-            "referrer-policy: no-referrer\r\n");
+            "referrer-policy: no-referrer\r\n" ++
+            "permissions-policy: geolocation=(), microphone=(), camera=(), payment=(), usb=()\r\n");
     }
     for (reply.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
@@ -808,7 +863,17 @@ fn formatReplyHead(
 fn isSecurityHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "x-content-type-options") or
         std.ascii.eqlIgnoreCase(name, "x-frame-options") or
-        std.ascii.eqlIgnoreCase(name, "referrer-policy");
+        std.ascii.eqlIgnoreCase(name, "referrer-policy") or
+        std.ascii.eqlIgnoreCase(name, "permissions-policy");
+}
+
+/// 方法是否在白名单内（HTTP 方法大小写敏感，不做忽略大小写匹配）。
+fn methodAllowed(allowed: []const []const u8, method: head_parser.Method) bool {
+    const name = @tagName(method);
+    for (allowed) |item| {
+        if (std.mem.eql(u8, item, name)) return true;
+    }
+    return false;
 }
 
 /// 取请求头值（大小写无关；缺失返回 `null`）。
@@ -1416,6 +1481,7 @@ test "HTTP 服务端：默认安全响应头 + 反代真实 IP（X-Real-IP / X-F
         try testing.expect(std.mem.indexOf(u8, text, "x-content-type-options: nosniff") != null);
         try testing.expect(std.mem.indexOf(u8, text, "x-frame-options: SAMEORIGIN") != null);
         try testing.expect(std.mem.indexOf(u8, text, "referrer-policy: no-referrer") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "permissions-policy: geolocation=()") != null);
         // 默认信任回环反代：采纳 X-Real-IP
         try testing.expectEqualStrings("8.8.8.8", ctx.remoteSlice());
     }
