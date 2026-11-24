@@ -733,7 +733,15 @@ pub const Server = struct {
                         error.EndOfStream => break,
                         else => return e,
                     };
-                    if (n == 0) break;
+                    if (n == 0) {
+                        // 有些 `std.Io` 后端（zio 的 Windows IOCP / Linux io_uring）对
+                        // 「文件 → socket」的零拷贝**不报 `Unimplemented`，而是返回 0**。
+                        // 以前这里直接 `break`，结果 `content-length` 已声明、body 一个字节都没发 ——
+                        // 2026-11-24 线上表现为「静态资源 200 但内容为空」（登录页无样式）。
+                        // 改为切到读-写循环再试一次；回退路径也读到 0 才是真的文件被截断。
+                        zero_copy = false;
+                        continue;
+                    }
                     remaining -= n;
                     continue;
                 }
