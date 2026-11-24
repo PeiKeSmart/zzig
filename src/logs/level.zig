@@ -143,6 +143,7 @@ pub fn colorCode(level: Level, thread_id: u64) []const u8 {
 /// 注意：`P`/`IO`/`L` 不在这里 —— 它们是 **`Name` 列**的取值（线程名映射），见 `currentThreadName()`。
 pub const kind_pool = "Y";
 pub const kind_web = "W";
+pub const kind_timer = "T";
 pub const kind_normal = "N";
 
 /// `Name` 列的特殊取值（C# `WriteLogEventArgs` 对线程名的三条映射）。

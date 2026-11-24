@@ -373,7 +373,13 @@ pub const Scheduler = struct {
         const trace_name = if (t.tracer_name.len > 0) t.tracer_name else "timer";
         if (t.tracer) |tr| span = tr.begin(tr.ctx, trace_name);
 
-        t.callback(t.ctx);
+        // 日志维度：回调执行期间 `Kind=T`（与 C# `TimerX` 的 IsWeb/定时标记对齐）。
+        // 放在 callback 前后（块级），回调内再 push 会嵌套在 T 之上（栈顶优先）。
+        {
+            level.pushKind(level.kind_timer[0]);
+            defer level.popKind();
+            t.callback(t.ctx);
+        }
 
         const cost = nowTickMs(self.io) - t0;
         if (t.tracer) |tr| tr.end(tr.ctx, span, cost * 1000, false);
@@ -616,6 +622,37 @@ fn waitRuns(c: *TickCounter, target: u32, max_ms: u32) bool {
         compat.sleep(1 * std.time.ns_per_ms);
     }
     return c.runs.load(.acquire) >= target;
+}
+
+/// 记录回调里看到的日志维度（Kind 必须是 T）
+const KindProbe = struct {
+    runs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    kind: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+};
+
+fn onKindProbe(ctx: ?*anyopaque) void {
+    const p: *KindProbe = @ptrCast(@alignCast(ctx.?));
+    const k = level.currentKind();
+    if (k.len > 0) p.kind.store(k[0], .release);
+    _ = p.runs.fetchAdd(1, .acq_rel);
+}
+
+test "timer：回调执行期间日志 Kind=T（真有注入，不是摆设）" {
+    const sched = try Scheduler.start(timer_testing.io, timer_testing.allocator);
+    defer sched.deinit();
+
+    var p = KindProbe{};
+    var t = try Timer.period(onKindProbe, &p, 10, 0); // once
+    try sched.add(&t);
+
+    var waited: u32 = 0;
+    while (waited < 3000 and p.runs.load(.acquire) == 0) : (waited += 1) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try timer_testing.expectEqual(@as(u32, 1), p.runs.load(.acquire));
+    try timer_testing.expectEqual(@as(u8, 'T'), p.kind.load(.acquire));
+    // 回调结束后必须恢复（不能把 T 泄漏给后续代码）
+    try timer_testing.expect(!std.mem.eql(u8, level.currentKind(), level.kind_timer));
 }
 
 test "timer：周期定时器按周期重复触发" {

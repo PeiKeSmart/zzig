@@ -298,7 +298,11 @@ pub const TextFileLog = struct {
         // `#字段` 与 C# 原文逐字一致（说明每一列的含义，是列语义的权威描述）。
         w.writeAll("#字段: 时间 线程ID 线程池Y/网页W/普通N 线程名/任务ID/定时T/线程池P/长任务L 消息内容\r\n") catch {};
         // Zig 侧的各值来源写清楚：谁注入、什么条件下出现（全部为真实来源，非占位）。
-        w.writeAll("#字段说明: Kind: W=Web请求(由 http 注入) T=定时回调(由 timer 注入) Y=线程池线程 P=池内任务 IO=IO线程池 L=长任务(由线程池或宿主 pushKind 标注) N=其余(默认)\r\n") catch {};
+        // 说明必须与实现一致（不能写“承诺”）：
+        //   Kind 只会是 W/T/Y/N —— 全部有真实注入点（http / timer / pool worker / 默认）；
+        //   P / IO / L 是 **Name 列** 的取值（线程名映射），不是 Kind。
+        w.writeAll("#字段说明: Kind: W=Web请求(由 http 注入) T=定时回调(由 timer 注入) Y=当前线程是线程池 worker N=其余(默认)\r\n") catch {};
+        w.writeAll("#          Name: P=池线程 IO=IO 线程池 L=长任务(宿主 markAsLongTask) 其余为线程名原文；未设置线程名时为 `-`\r\n") catch {};
 
         // `#Fields` 由行格式决定：`Time|ThreadId|Kind|Name|Message` → 空格分隔；
         // 若配置里含 Level，这里也会带出 Level（与正文列数严格一致）。

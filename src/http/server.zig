@@ -23,6 +23,8 @@ const head_parser = @import("head_parser.zig");
 const body_reader = @import("body_reader.zig");
 const compat = @import("../compat.zig");
 const socket_timeout = @import("../net/socket_timeout.zig");
+// 日志维度注入（Kind=W）：只读 threadlocal，开销可忽略
+const level = @import("../logs/level.zig");
 
 /// 业务回调看到的请求视图（只在本次调用内有效）。
 pub const RequestView = struct {
@@ -558,6 +560,12 @@ pub const Server = struct {
         tcp_peer: ?[]const u8,
         arena: std.mem.Allocator,
     ) !bool {
+        // 日志维度：**整个请求处理期间** `Kind=W` —— 包括头解析失败、协议边界（405/414）、
+        // 早拒（head_guard / WAF 拦截日志）、handler、写响应。
+        // ★ 只在 handler 调用处注入是错的：2026-11-24 实测 WAF 拦截日志仍是 `N`，
+        //   因为早拒发生在 handler 之前。`handleOne` 恰好处理「一个请求」，所以放函数级 defer 最准。
+        level.pushKind(level.kind_web[0]);
+        defer level.popKind();
         // 1) 读头 → **立即拷进 arena**：下一步读 body 会覆盖连接缓冲。
         //
         // 超时分**三阶段**（对齐 Go `ReadHeaderTimeout` / nginx `client_header_timeout`
@@ -676,6 +684,7 @@ pub const Server = struct {
             };
         }
 
+        // 日志维度已在 `handleOne` 入口置为 W（含早拒），这里直接调用。
         const reply = self.handler(self.ctx, .{
             .method = method,
             .target = head.target,
@@ -1002,9 +1011,12 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
         ok: bool = false,
         /// 对端地址断言结果（在 handler 内算，避免借用请求 arena 的切片）
         remote_ok: bool = false,
+        /// handler 执行期间看到的日志维度必须是 `W`（撤掉注入就会悬）
+        kind_web_ok: bool = false,
 
         fn handler(raw: *anyopaque, req: RequestView, arena: std.mem.Allocator) anyerror!Reply {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.kind_web_ok = std.mem.eql(u8, level.currentKind(), level.kind_web);
             if (req.remote_addr) |addr| {
                 self.remote_ok = std.mem.eql(u8, addr, "127.0.0.1");
             }
@@ -1086,6 +1098,8 @@ test "HTTP 服务端：真 socket 端到端（子线程监听，本线程发请�
     try testing.expect(ctx.ok);
     // 对端地址必须拿到（WAF / 限流 / IP 名单全靠它）
     try testing.expect(ctx.remote_ok);
+    // 日志 Kind 必须是 W（不是“说明里写着 W、实际永远是 N”）
+    try testing.expect(ctx.kind_web_ok);
     std.debug.print("[http] 端到端 OK：收到 {d} 字节响应\n", .{got});
 }
 
