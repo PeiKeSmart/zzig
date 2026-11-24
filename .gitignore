@@ -16,6 +16,8 @@ LogCheck/
 *.db-wal
 *.db-shm
 artifacts/
+# 调试 / 验证时的临时输出散落在仓库根（如 artifacts_on_http.txt）——2026-11-24 清理后补规则
+artifacts*.txt
 logger_config.json
 .arts/settings.json
 .codeartsdoer/.codebaseignore
