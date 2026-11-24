@@ -65,6 +65,9 @@ const ModuleHandle = struct {
     }
 };
 
+/// 「静态链接版」函数表用的空句柄（见 `registerStatic`）。
+pub const no_module: ModuleHandle = .{ .handle = null };
+
 fn loadModule(path: []const u8) ?ModuleHandle {
     const builtin = @import("builtin");
     if (builtin.os.tag != .windows) return null;
@@ -248,12 +251,35 @@ const LibShared = struct {
     mutex: @import("../compat.zig").Mutex = .{},
     loaded: bool = false,
     lib: Lib = undefined,
-    source_owned: []u8 = &.{},
+    source_owned: []const u8 = &.{},
     /// 引用计数：用于诊断；当前策略是常驻，不因归零而卸载。
     refs: usize = 0,
 };
 
 var lib_shared: LibShared = .{};
+
+/// 由**消费方**注入「静态链接版」函数表。必须在任何 `Lib.load()` 之前调用。
+///
+/// 背景（2026-11-24 实测）：`x86_64-linux-musl` 的全静态二进制**没有动态加载器**，
+/// `dlopen` 必然返回失败 → 业务层只能拿到 `SqliteNotAvailable` → 后台账号/密码无法落盘。
+/// 正确做法是把官方 amalgamation 的 `sqlite3.c` **编进最终可执行文件**，
+/// 再由消费方用 `db/sqlite_static.zig` 构造 `Lib` 并在此注册。
+///
+/// 注册后 `load()` 直接复用该表（引用计数仍由本模块管理），不再尝试 dlopen。
+pub fn registerStatic(lib: Lib) void {
+    lib_shared.mutex.lock();
+    defer lib_shared.mutex.unlock();
+    // 已加载（dlopen 成功或其它组件先注册）→ 保持现有句柄，不覆盖。
+    if (lib_shared.loaded) return;
+
+    const owned = std.heap.page_allocator.dupe(u8, lib.source) catch lib.source;
+    var copy = lib;
+    copy.source = owned;
+    lib_shared.lib = copy;
+    lib_shared.source_owned = owned;
+    lib_shared.loaded = true;
+    lib_shared.refs = 1;
+}
 
 /// 一个打开的数据库连接（后续 `Session` 直接持有它）。
 pub const Db = struct {

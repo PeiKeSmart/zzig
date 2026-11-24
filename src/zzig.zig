@@ -314,6 +314,9 @@ pub const db = struct {
     pub const Value = @import("db/value.zig").Value;
     /// SQLite 驱动（动态加载 `sqlite3.dll` / `winsqlite3.dll`，不链 libc）
     pub const sqlite = @import("db/sqlite.zig");
+    /// SQLite **静态链接**函数表（消费方把 `sqlite3.c` 编进可执行文件后用 `sqlite.registerStatic(…)` 注册）。
+    /// 用途：musl 全静态二进制没有动态加载器，`dlopen` 必然失败。
+    pub const sqlite_static = @import("db/sqlite_static.zig");
     /// MySQL 驱动（纯 wire protocol，不依赖 libmysqlclient）
     pub const mysql = @import("db/mysql.zig");
     /// PostgreSQL 驱动（协议 3.0，纯 wire protocol，不依赖 libpq）
