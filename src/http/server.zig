@@ -37,19 +37,30 @@ const logger = @import("../logs/logger.zig");
 // 1. 信号处理器只做**async-signal-safe** 的事：往 self-pipe 写 1 字节；
 // 2. 专用线程醒来后 **记日志** + `Server.stop()`（停止 accept，在途请求继续跑完）；
 // 3. 主流程从 `group.await` 返回，defer 清理（关库/刷日志）后进程退出。
-var shutdown_wake_fd: std.os.linux.fd_t = -1;
+// 写端给信号处理器、读端给监视线程。★ 2026-11-25 实测根因：旧实现只存一个 fd
+// 并把它（写端）交给了 `read` → 返回 EBADF，而代码没判返回值就当成“被唤醒”
+// → 进程启动后毫秒级自己退出（线上「启动就收到退出指令」就是这个）。
+var shutdown_write_fd: std.os.linux.fd_t = -1;
+var shutdown_read_fd: std.os.linux.fd_t = -1;
 
 fn shutdownSignalHandler(sig: std.os.linux.SIG) callconv(.c) void {
     _ = sig;
-    if (shutdown_wake_fd < 0) return;
+    if (shutdown_write_fd < 0) return;
     var byte: [1]u8 = .{1};
     // `write` 是 async-signal-safe 的；不要在这里加锁/分配/格式化日志。
-    _ = std.os.linux.write(shutdown_wake_fd, &byte, byte.len);
+    _ = std.os.linux.write(shutdown_write_fd, &byte, byte.len);
 }
 
 fn shutdownWaitLoop(server: *Server) void {
     var buf: [1]u8 = undefined;
-    _ = std.os.linux.read(shutdown_wake_fd, &buf, buf.len);
+    while (true) {
+        const raw = std.os.linux.read(shutdown_read_fd, &buf, buf.len);
+        const rc: isize = @bitCast(raw);
+        if (rc > 0) break; // 真正读到字节 = 收到信号
+        if (rc == -4) continue; // EINTR：被其它信号打断，继续等
+        // 其它错误（如 EBADF）不能当成退出指令：直接退出等待循环，保持进程存活。
+        return;
+    }
     logger.warn("[zzig.http] 收到退出指令（SIGTERM/SIGINT）：停止监听，等待在途请求完成", .{});
     server.stop();
 }
@@ -57,14 +68,15 @@ fn shutdownWaitLoop(server: *Server) void {
 /// 安装优雅退出：SIGTERM / SIGINT → 记日志 + 停止监听（幂等；仅 Linux 生效）。
 pub fn installGracefulShutdown(server: *Server) void {
     if (comptime builtin.os.tag != .linux) return;
-    if (shutdown_wake_fd >= 0) return;
+    if (shutdown_write_fd >= 0) return;
 
     var fds: [2]std.os.linux.fd_t = undefined;
     if (@as(isize, @bitCast(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) < 0) {
         logger.warn("[zzig.http] 优雅退出安装失败（pipe）：SIGTERM 将按系统默认方式终止（无退出日志）", .{});
         return;
     }
-    shutdown_wake_fd = fds[1];
+    shutdown_read_fd = fds[0];
+    shutdown_write_fd = fds[1];
 
     const act = std.posix.Sigaction{
         .handler = .{ .handler = shutdownSignalHandler },
@@ -80,6 +92,97 @@ pub fn installGracefulShutdown(server: *Server) void {
     };
     thread.detach();
     logger.info("[zzig.http] 已安装优雅退出：SIGTERM/SIGINT → 记日志并停止监听", .{});
+}
+
+// ————— 轻量退出日志（不等待在途请求）—————
+//
+// 与 `installGracefulShutdown` 的区别：**不等在途请求**。
+// 收到 SIGTERM/SIGINT → 记一条**带信号值**的日志 → 刷写队列 → 立即退出（128+sig）。
+//
+// 为什么两者并存：星尘 / 容器重启时发的是 TERM，等待在途请求会拖长停机窗口；
+// 但「退出时到底是谁让我退出的」必须留在日志里（2026-11-25 用户要求）。
+// 信号值语义：15 = SIGTERM（星尘 / systemd / `kill` 默认），2 = SIGINT（Ctrl+C）。
+var exit_logged_write_fd: std.os.linux.fd_t = -1;
+var exit_logged_read_fd: std.os.linux.fd_t = -1;
+
+/// 信号处理器只做 async-signal-safe 的事：写 self-pipe。
+/// 信号值用**固定常量**记录，不去解枚举：实测 `@backingInt(sig)`
+/// 在这里读到 0，导致日志写成 `sig=0`、退出码变 128。
+fn exitSignalCommon(code: u8) void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (exit_logged_write_fd < 0) return;
+    // 信号值**直接当字节写进 self-pipe**（不走共享变量：实测原子变量在这条路径上读到 0）。
+    var byte = [1]u8{code};
+    _ = std.os.linux.write(exit_logged_write_fd, &byte, byte.len);
+}
+
+fn exitTermHandler(_: std.os.linux.SIG) callconv(.c) void {
+    exitSignalCommon(15);
+}
+
+fn exitIntHandler(_: std.os.linux.SIG) callconv(.c) void {
+    exitSignalCommon(2);
+}
+
+fn exitLogWaitLoop() void {
+    if (comptime builtin.os.tag != .linux) return;
+    var buf = [1]u8{0};
+    var sig: u8 = 0;
+    while (true) {
+        const raw = std.os.linux.read(exit_logged_read_fd, &buf, buf.len);
+        const rc: isize = @bitCast(raw);
+        if (rc > 0) {
+            sig = buf[0];
+            break;
+        }
+        // EINTR(-4)：被其它信号（典型是 SIGCHLD）打断，**不是**退出指令 -> 继续等。
+        if (rc == -4) continue;
+        // 其它错误（如 EBADF）绝不能当成退出指令：直接结束监视，进程继续运行。
+        return;
+    }
+    switch (sig) {
+        15 => logger.warn("[zzig.http] 收到退出信号 SIGTERM(15)：刷写日志后退出（星尘 / systemd / kill 停服务发的就是它）", .{}),
+        2 => logger.warn("[zzig.http] 收到退出信号 SIGINT(2)：刷写日志后退出（终端 Ctrl+C）", .{}),
+        else => logger.warn("[zzig.http] 收到退出信号（值 {d}）：刷写日志后退出", .{sig}),
+    }
+    logger.flush();
+    std.process.exit(128 +| sig);
+}
+
+/// 安装「退出日志」：SIGTERM / SIGINT → 记信号值 + 刷盘 + **立即退出**（不等待在途请求）。
+///
+/// 幂等；仅 Linux 生效。想让在途请求跑完再退，用 `installGracefulShutdown`。
+pub fn installExitLogging() void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (exit_logged_write_fd >= 0) return;
+
+    var fds: [2]std.os.linux.fd_t = undefined;
+    if (@as(isize, @bitCast(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) < 0) {
+        logger.warn("[zzig.http] 退出日志安装失败（pipe）：SIGTERM 将按系统默认方式终止（无退出日志）", .{});
+        return;
+    }
+    exit_logged_read_fd = fds[0];
+    exit_logged_write_fd = fds[1];
+
+    const act_term = std.posix.Sigaction{
+        .handler = .{ .handler = exitTermHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    const act_int = std.posix.Sigaction{
+        .handler = .{ .handler = exitIntHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act_term, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act_int, null);
+
+    const thread = std.Thread.spawn(.{}, exitLogWaitLoop, .{}) catch {
+        logger.warn("[zzig.http] 退出日志监视线程启动失败：SIGTERM 将按系统默认方式终止（无退出日志）", .{});
+        return;
+    };
+    thread.detach();
+    logger.info("[zzig.http] 退出日志已启用：收到 SIGTERM/SIGINT 记录信号值并刷写日志后立即退出", .{});
 }
 
 /// 业务回调看到的请求视图（只在本次调用内有效）。
