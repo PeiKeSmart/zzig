@@ -636,11 +636,10 @@ fn migratedMarkerPath(buf: []u8) ?[]const u8 {
 }
 
 /// 是否已完成一次性迁移（无基准目录时视为已完成 = 不做任何自动修改）。
-fn logPathMigrated() bool {
+fn logPathMigrated(io: std.Io) bool {
     var buf: [512]u8 = undefined;
     const marker = migratedMarkerPath(&buf) orelse return true;
-    std.fs.cwd().access(marker, .{}) catch return false;
-    return true;
+    return fsio.exists(io, marker);
 }
 
 fn markLogPathMigrated(io: std.Io, gpa: std.mem.Allocator) void {
@@ -741,7 +740,7 @@ pub fn loadConfigFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !voi
         backupBadConfig(io, gpa, path, file.current(), @errorName(e));
         return e;
     };
-    const migrated = logPathMigrated();
+    const migrated = logPathMigrated(io);
     const path_fix = if (migrated) LogPathFix{} else sanitizeLogPath(&cfg);
     if (path_fix.fixed) {
         warn("日志配置 LogPath=\"{s}\" 越出数据目录（基准 {s}），已一次性改为 \"Log\"（原文件备份 .old；以后手工/在线改的值不会再重置）", .{ path_fix.original, log_base_dir });
@@ -796,7 +795,7 @@ pub fn reloadIfChanged(io: std.Io) !bool {
         return false;
     };
     // 热加载同样只迁移一次（标记存在后，人工/在线配置改成什么都不再被改写）
-    const migrated = logPathMigrated();
+    const migrated = logPathMigrated(src.io);
     const path_fix = if (migrated) LogPathFix{} else sanitizeLogPath(&cfg);
     if (path_fix.fixed) {
         warn("日志配置 LogPath=\"{s}\" 越出数据目录（基准 {s}），已一次性改为 \"Log\"（以后手工/在线改的值不会再重置）", .{ path_fix.original, log_base_dir });
