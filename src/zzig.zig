@@ -77,6 +77,8 @@ pub const web = struct {
     pub const argInt = @import("http/controller.zig").argInt;
     pub const argBool = @import("http/controller.zig").argBool;
     pub const jsonResult = @import("http/controller.zig").jsonResult;
+    /// C# `DGResult` 兼容输出（PascalCase + `WriteIndented` + 非 ASCII 转义）。
+    pub const DGResult = @import("http/dg_result.zig");
     pub const viewResult = @import("http/controller.zig").viewResult;
     pub const viewNamed = @import("http/controller.zig").viewNamed;
 
@@ -301,7 +303,9 @@ pub const Buf = @import("text/buf.zig").Buf;
 
 /// GUID / UUID（RFC 4122 v4 文本；`guidAlloc` / `guidInto` / `isValid`）
 pub const Guid = @import("string/guid.zig");
-
+/// C# `DGResult` 兼容输出（PascalCase + `WriteIndented` + 非 ASCII 转义）；
+/// **要让 C# 老调用方继续能解析时才用**，普通新接口用 `web.jsonResult` 即可。
+pub const DGResult = @import("http/dg_result.zig");
 /// 通用十进制（尾数 + 缩放因子；解析/格式化/精确比较，不含算术）
 pub const Decimal = @import("number/decimal.zig").Decimal;
 
@@ -411,6 +415,8 @@ test {
     _ = @import("http/view.zig");
     _ = @import("http/controller.zig");
     _ = @import("http/web.zig");
+    // C# `DGResult` 兼容输出（字段名/缩进/转义与 System.Text.Json 逐字节对齐）
+    _ = @import("http/dg_result.zig");
     _ = @import("crypto/rsa.zig");
     _ = @import("crypto/hash_util.zig");
     _ = @import("file/glob.zig");
