@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const compat = @import("../compat.zig");
 const levels = @import("level.zig");
 const text_log = @import("text_file_log.zig");
+const DateTime = @import("../time/datetime.zig").DateTime;
 
 /// 文件日志实现（按天滚动 + 大小拆分 + 备份清理），供需要直接使用的场景。
 pub const TextFileLog = text_log.TextFileLog;
@@ -255,7 +256,8 @@ fn emitBatch(items: []const PendingLine) void {
     }
 
     if (builtin.os.tag != .windows) {
-        std.debug.print("{s}", .{out.written()});
+        // 与 `emitText` 同一口径：控制台走 stdout 一次 write（不走 stderr 管道，避免文件重复与额外开销）
+        printUtf8Stack(out.written());
         return;
     }
     // Windows：批量已在堆上，直接走一次 UTF-16 转换 + WriteConsoleW
@@ -500,33 +502,73 @@ pub fn logDir() []const u8 {
     return log_dir_owned orelse "";
 }
 
-/// 把 **stderr** 落一份到日志目录（`stderr_<pid>.log`，每次启动新建）。
+/// stderr 泵：把 stderr 管道里的内容**同时**写到主日志文件与 stdout。
 ///
-/// **为什么必须**：`std.debug.print`（包括 **panic 栈**）直接写 stderr，而服务被星环 /
-/// systemd / 容器拉起时 stderr 通常没人采集 —— 出问题就变成「日志里什么都没有，去哪里找」。
-/// 在 `Logger.init` 之后调一次即可：之后所有漏网的 stderr 输出（含 panic）都会落在
-/// 日志目录里，与主日志同一个目录。
+/// 这样「控制台看到的」与「文件里存的」内容一致（对齐 C#：控制台 + 文件双写）：
+/// `std.debug.print`、框架层错误、panic 栈两边都有。
+fn stderrPump(read_fd: std.os.linux.fd_t, file_fd: std.os.linux.fd_t) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n_rc = std.os.linux.read(read_fd, &buf, buf.len);
+        const n_signed: isize = @bitCast(n_rc);
+        if (n_signed <= 0) break;
+        const n: usize = @intCast(n_signed);
+        _ = std.os.linux.write(file_fd, buf[0..n].ptr, n); // 主日志文件（O_APPEND）
+        _ = std.os.linux.write(1, buf[0..n].ptr, n); // 控制台（stdout）
+    }
+}
+
+/// 把 **stderr 接到主日志同一个文件**，并**同时回显到控制台**（POSIX）。
 ///
-/// 仅 POSIX 生效（Windows 开发机终端可见，不重定向）；返回是否成功。
+/// **为什么**：`std.debug.print`（包括 **panic 栈**）直接写 stderr，而服务被星尘 /
+/// systemd / 容器拉起时 stderr 通常没人采集 —— 出问题就变成「日志里什么都没有」。
+/// 这里用管道 + 泵线程实现 tee：
+/// - 文件侧：追加到当天的 `<日志目录>/yyyy_MM_dd.log`（与 `Logger` 同一个文件）；
+/// - 控制台侧：回显到 stdout —— 保证「控制台看到的就是文件里的」（对齐 C# 的双写行为）。
+///
+/// 仅 Linux 生效（Windows 开发机终端本来就能看到，不重定向）；返回是否成功。
 pub fn teeStderr(io: std.Io) bool {
-    if (builtin.os.tag == .windows) return false;
+    _ = io;
+    if (builtin.os.tag != .linux) return false;
     const dir = logDir();
     if (dir.len == 0) return false;
 
-    var path_buf: [512]u8 = undefined;
-    const pid = std.os.linux.getpid();
-    const path = std.fmt.bufPrint(&path_buf, "{s}/stderr_{d}.log", .{ dir, pid }) catch return false;
-    var file = fsio.cwd().createFile(io, path, .{ .truncate = true }) catch return false;
-    defer file.close(io);
+    // 文件名与 `TextFileLog` 完全一致：`yyyy_MM_dd.log`
+    var date_buf: [10]u8 = undefined;
+    const stamp_ms = DateTime.nowUnix() * 1000;
+    text_log.formatDate(&date_buf, stamp_ms) catch return false;
 
-    // stderr 固定是 fd 2（POSIX）；`dup2` 后原 fd 可以关，进程仍能继续写。
-    if (builtin.os.tag == .linux) {
-        // `std.os.linux.dup2` 返回**内核返回值**：成功是新 fd（= 2），失败是负的 errno（bitCast 成 isize 才准）。
-        const rc = std.os.linux.dup2(file.handle, 2);
-        const signed: isize = @bitCast(rc);
-        return signed >= 0;
+    var path_buf: [560]u8 = undefined;
+    const path_slice = std.fmt.bufPrint(&path_buf, "{s}/{s}.log", .{ dir, date_buf }) catch return false;
+    if (path_slice.len + 1 >= path_buf.len) return false;
+    path_buf[path_slice.len] = 0;
+    const path: [*:0]const u8 = path_buf[0..path_slice.len :0];
+
+    const fd_rc = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o644);
+    const fd_signed: isize = @bitCast(fd_rc);
+    if (fd_signed < 0) return false;
+    const file_fd: std.os.linux.fd_t = @intCast(fd_signed);
+
+    var pipe_fds: [2]std.os.linux.fd_t = undefined;
+    if (@as(isize, @bitCast(std.os.linux.pipe2(&pipe_fds, .{}))) < 0) {
+        _ = std.os.linux.close(file_fd);
+        return false;
     }
-    return false;
+
+    const thread = std.Thread.spawn(.{}, stderrPump, .{ pipe_fds[0], file_fd }) catch {
+        _ = std.os.linux.close(pipe_fds[0]);
+        _ = std.os.linux.close(pipe_fds[1]);
+        _ = std.os.linux.close(file_fd);
+        return false;
+    };
+    thread.detach();
+
+    // stderr 固定是 fd 2；dup2 后我们的写端副本可以关，进程仍能继续写。
+    const rc = std.os.linux.dup2(pipe_fds[1], 2);
+    const ok = @as(isize, @bitCast(rc)) >= 0;
+    _ = std.os.linux.close(pipe_fds[1]);
+    if (!ok) _ = std.os.linux.close(file_fd);
+    return ok;
 }
 
 /// 应用一份配置（不涉及文件），顺序：级别 → 行格式 → 控制台 → 队列 → 文件。
@@ -1159,31 +1201,13 @@ fn getLocalTimezoneOffset() i64 {
     }
 }
 
-/// 跨平台打印函数：Windows 使用 WriteConsoleW 确保中文正确显示
-/// alloc 由调用方传入（复用外层 arena），避免 Windows 路径下的二次 arena 创建
+/// 跨平台打印函数（保留历史签名）：面板/控制台输出统一转发到 [`printUtf8Stack`]。
+///
+/// 非 Windows 走 **stdout** —— stderr 已被 `teeStderr` 接到日志文件，
+/// 再写 stderr 会让同一条日志在文件里重复一份并多一次管道往返。
 fn printUtf8(alloc: std.mem.Allocator, text: []const u8) void {
-    if (builtin.os.tag != .windows) {
-        std.debug.print("{s}", .{text});
-        return;
-    }
-
-    // Windows 平台：使用 WriteConsoleW 保证中文显示
-    const w = std.os.windows;
-    const h = compat.windows.getStdHandle(compat.windows.STD_OUTPUT_HANDLE);
-    if (h == null or h == w.INVALID_HANDLE_VALUE) {
-        // 降级到普通打印
-        std.debug.print("{s}", .{text});
-        return;
-    }
-
-    // 转换为 UTF-16LE，复用调用方的 arena，无额外年算层开销
-    const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch {
-        std.debug.print("{s}", .{text});
-        return;
-    };
-
-    var written: w.DWORD = 0;
-    _ = compat.windows.writeConsoleW(h.?, utf16, &written);
+    _ = alloc;
+    printUtf8Stack(text);
 }
 
 /// 生成日志行前缀（不含消息）。
@@ -1272,6 +1296,12 @@ pub const build_options = struct {
 /// 无堆环境（嵌入式 / 分配失败）下工作，所以统一走这里。
 fn printUtf8Stack(text: []const u8) void {
     if (builtin.os.tag != .windows) {
+        // 控制台走 **stdout**：`teeStderr` 把 stderr 指向主日志文件，
+        // 若这里继续写 stderr，同一条日志会在主日志里出现两次（带前缀的 + 无前缀的）。
+        if (builtin.os.tag == .linux) {
+            _ = std.os.linux.write(1, text.ptr, text.len);
+            return;
+        }
         std.debug.print("{s}", .{text});
         return;
     }
@@ -1307,18 +1337,13 @@ fn emitText(level: Level, thread_id: u64, text: []const u8) void {
     if (!consoleEnabledRaw()) return;
     const code = colorCode(level, thread_id);
 
-    if (builtin.os.tag != .windows) {
-        std.debug.print("\x1b[{s}m{s}\n\x1b[0m", .{ code, text });
-        return;
-    }
-
-    // Windows：整行一次 UTF-16 转换再 WriteConsoleW，避免逐段转换产生交错。
-    // 用定长栈缓冲（不开 arena）：日志路径不该在堆上分配。
-    var buf: [build_options.max_line_bytes + 32]u8 = undefined;
-    var fw: std.Io.Writer = .fixed(&buf);
-    fw.print("\x1b[{s}m", .{code}) catch {};
-    fw.writeAll(text) catch {};
-    fw.writeAll("\n\x1b[0m") catch {};
+    // **性能口径**：控制台一律走 stdout 的**一次裸 write**（不加锁、不走 stderr 管道）。
+    // 为什么不能再用 `std.debug.print`：它写 stderr，而 `teeStderr` 已把 stderr 接到日志文件
+    // —— 每条日志会在文件里重复一份（带颜色转义）；同时多一次管道往返 + 泵线程唤醒。
+    // 现在：文件 = `sink.writeRawLine`（一次），控制台 = `write(1)`（一次），结果一致且没有多余开销。
+    var line_buf: [build_options.max_line_bytes + 32]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&line_buf);
+    fw.print("\x1b[{s}m{s}\n\x1b[0m", .{ code, text }) catch {};
     printUtf8Stack(fw.buffered());
 }
 

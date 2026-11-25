@@ -28,6 +28,7 @@ const view = @import("view.zig");
 const value = @import("value.zig");
 const http = @import("http.zig");
 const strings = @import("../string/strings.zig");
+const logger = @import("../logs/logger.zig");
 
 /// 请求上下文。
 pub const Ctx = router.Ctx;
@@ -298,8 +299,9 @@ pub const App = struct {
             .headers = req.headers,
             .remote_addr = req.remote_addr,
         }) catch |e| {
-            // 失败必须可定位：方法 + 路径 + 具体错误（不接受只有"服务器错误"的笼统文案）
-            std.debug.print("[zzig.web] 处理 {s} {s} 失败：{s}\n", .{ @tagName(req.method), req.path, @errorName(e) });
+            // 失败必须可定位：方法 + 路径 + 具体错误；且**必须进日志组件**（对齐 C# 全局异常过滤器），
+            // 不能只写 stderr（星尘/systemd 不采集 stderr 时就是「日志里什么都没有」）。
+            logger.err("[zzig.web] 处理 {s} {s} 失败：{s}", .{ @tagName(req.method), req.path, @errorName(e) });
             const body = try std.fmt.allocPrint(
                 arena,
                 "{{\"code\":500,\"message\":\"Internal Server Error\",\"detail\":\"{s}\"}}",

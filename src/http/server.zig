@@ -25,6 +25,62 @@ const compat = @import("../compat.zig");
 const socket_timeout = @import("../net/socket_timeout.zig");
 // 日志维度注入（Kind=W）：只读 threadlocal，开销可忽略
 const level = @import("../logs/level.zig");
+const logger = @import("../logs/logger.zig");
+
+// ————— 优雅退出（POSIX / Linux）—————
+//
+// 运维停止服务（星尘、systemd、`kill`）默认发 SIGTERM；默认行为是**立即终止**，
+// 日志里既没有「收到退出指令」，也来不及刷写队列/落盘（2026-11-25 用户要求：
+// 「ziglang 应用退出时最好也能有相应的日志，比如收到退出指令，能优雅退出」）。
+//
+// 口径（对齐 C# 的 `IHostApplicationLifetime` / `ApplicationStopping`）：
+// 1. 信号处理器只做**async-signal-safe** 的事：往 self-pipe 写 1 字节；
+// 2. 专用线程醒来后 **记日志** + `Server.stop()`（停止 accept，在途请求继续跑完）；
+// 3. 主流程从 `group.await` 返回，defer 清理（关库/刷日志）后进程退出。
+var shutdown_wake_fd: std.os.linux.fd_t = -1;
+
+fn shutdownSignalHandler(sig: std.os.linux.SIG) callconv(.c) void {
+    _ = sig;
+    if (shutdown_wake_fd < 0) return;
+    var byte: [1]u8 = .{1};
+    // `write` 是 async-signal-safe 的；不要在这里加锁/分配/格式化日志。
+    _ = std.os.linux.write(shutdown_wake_fd, &byte, byte.len);
+}
+
+fn shutdownWaitLoop(server: *Server) void {
+    var buf: [1]u8 = undefined;
+    _ = std.os.linux.read(shutdown_wake_fd, &buf, buf.len);
+    logger.warn("[zzig.http] 收到退出指令（SIGTERM/SIGINT）：停止监听，等待在途请求完成", .{});
+    server.stop();
+}
+
+/// 安装优雅退出：SIGTERM / SIGINT → 记日志 + 停止监听（幂等；仅 Linux 生效）。
+pub fn installGracefulShutdown(server: *Server) void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (shutdown_wake_fd >= 0) return;
+
+    var fds: [2]std.os.linux.fd_t = undefined;
+    if (@as(isize, @bitCast(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true }))) < 0) {
+        logger.warn("[zzig.http] 优雅退出安装失败（pipe）：SIGTERM 将按系统默认方式终止（无退出日志）", .{});
+        return;
+    }
+    shutdown_wake_fd = fds[1];
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+
+    const thread = std.Thread.spawn(.{}, shutdownWaitLoop, .{server}) catch {
+        logger.warn("[zzig.http] 优雅退出监视线程启动失败：SIGTERM 将按系统默认方式终止（无退出日志）", .{});
+        return;
+    };
+    thread.detach();
+    logger.info("[zzig.http] 已安装优雅退出：SIGTERM/SIGINT → 记日志并停止监听", .{});
+}
 
 /// 业务回调看到的请求视图（只在本次调用内有效）。
 pub const RequestView = struct {
@@ -694,7 +750,9 @@ pub const Server = struct {
             .headers = header_list.items,
             .remote_addr = remote_addr,
         }, arena) catch |e| {
-            std.debug.print("[zzig.http] 处理 {s} {s} 失败：{s}\n", .{ @tagName(method), path, @errorName(e) });
+            // 全局错误必须进日志组件（对齐 C# 的全局异常过滤器）：文件 + 控制台双写，
+            // 而不是只写 stderr —— 服务被星尘/systemd 拉起时 stderr 没人采集（2026-11-25 事故）。
+            logger.err("[zzig.http] 处理 {s} {s} 失败：{s}", .{ @tagName(method), path, @errorName(e) });
             const msg = "{\"code\":500,\"msg\":\"internal error\"}";
             self.writeReply(sw, .{ .status = .internal_server_error, .body = msg }, null, self.headerOptions(false), false) catch {};
             return false;
