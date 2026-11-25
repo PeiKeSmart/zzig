@@ -489,6 +489,45 @@ pub fn logBaseDir() []const u8 {
     return log_base_dir;
 }
 
+/// 最近一次 `applyConfig` 实际使用的日志目录（已按基准目录解析；空 = 未启用文件日志）。
+///
+/// **为什么要记住**：热加载会换 `LogPath`，而运维只需要知道「日志到底在哪」。
+/// 启动日志与 `teeStderr` 都用它，不再各自拼一遍。
+var log_dir_owned: ?[]u8 = null;
+
+/// 实际日志目录（未启用文件日志时返回空串）。
+pub fn logDir() []const u8 {
+    return log_dir_owned orelse "";
+}
+
+/// 把 **stderr** 落一份到日志目录（`stderr_<pid>.log`，每次启动新建）。
+///
+/// **为什么必须**：`std.debug.print`（包括 **panic 栈**）直接写 stderr，而服务被星环 /
+/// systemd / 容器拉起时 stderr 通常没人采集 —— 出问题就变成「日志里什么都没有，去哪里找」。
+/// 在 `Logger.init` 之后调一次即可：之后所有漏网的 stderr 输出（含 panic）都会落在
+/// 日志目录里，与主日志同一个目录。
+///
+/// 仅 POSIX 生效（Windows 开发机终端可见，不重定向）；返回是否成功。
+pub fn teeStderr(io: std.Io) bool {
+    if (builtin.os.tag == .windows) return false;
+    const dir = logDir();
+    if (dir.len == 0) return false;
+
+    var path_buf: [512]u8 = undefined;
+    const pid = std.os.linux.getpid();
+    const path = std.fmt.bufPrint(&path_buf, "{s}/stderr_{d}.log", .{ dir, pid }) catch return false;
+    var file = fsio.cwd().createFile(io, path, .{ .truncate = true }) catch return false;
+    defer file.close(io);
+
+    // stderr 固定是 fd 2（POSIX）；`dup2` 后原 fd 可以关，进程仍能继续写。
+    if (builtin.os.tag == .linux) {
+        // `std.os.linux.dup2` 在 0.17 仍可用；失败只降级（不能因为日志辅助功能把服务坑死）。
+        const rc = std.os.linux.dup2(file.handle, 2);
+        return rc == 0;
+    }
+    return false;
+}
+
 /// 应用一份配置（不涉及文件），顺序：级别 → 行格式 → 控制台 → 队列 → 文件。
 ///
 /// 任何一项值非法都**保持原值并告警**，不会因为一个字段配错就整体回退。
@@ -536,6 +575,9 @@ pub fn applyConfig(io: std.Io, gpa: std.mem.Allocator, cfg: Config) !void {
             .max_file_bytes = cfg.LogFileMaxBytes,
             .backups = cfg.LogFileBackups,
         });
+        // 记住解析后的目录：启动日志与 stderr 落盘都用它（热加载会刷新）
+        if (log_dir_owned) |old| gpa.free(old);
+        log_dir_owned = gpa.dupe(u8, dir) catch null;
     }
 }
 
@@ -554,6 +596,59 @@ fn isKnownConfigKey(name: []const u8) bool {
         if (std.mem.eql(u8, name, known)) return true;
     }
     return false;
+}
+
+/// `LogPath` 纠正结果。
+const LogPathFix = struct {
+    /// 是否被修正过
+    fixed: bool = false,
+    /// 原值（指向配置 arena，只在本次加载内有效）
+    original: []const u8 = "",
+};
+
+/// 把「越出基准目录」的 `LogPath` 收敛为 `Log`（返回是否发生修正）。
+///
+/// **只在一次性迁移时调用**（见 `logPathMigrated`）：
+/// 旧配置 `LogPath = "../../Log"` 会相对数据目录上溯两级，日志落到 `/Log` 或 `/opt/Log`，
+/// 于是「程序目录下怎么找都没有」。迁移一次后写标记，之后**任何**值（含手工 / 在线配置）
+/// 都原样使用，**绝不再重置**（2026-11-25 用户要求：后面改了就不能再重置）。
+fn sanitizeLogPath(cfg: *Config) LogPathFix {
+    if (cfg.LogPath.len == 0 or std.fs.path.isAbsolute(cfg.LogPath)) return .{};
+    if (log_base_dir.len == 0) return .{};
+
+    var it = std.mem.tokenizeAny(u8, cfg.LogPath, "/\\");
+    while (it.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) {
+            const original = cfg.LogPath;
+            cfg.LogPath = "Log";
+            return .{ .fixed = true, .original = original };
+        }
+    }
+    return .{};
+}
+
+/// 迁移标记文件名（放数据目录根）。存在 = 「旧日志路径已迁移过一次」。
+const migrated_marker_name = ".logger-path-migrated";
+
+fn migratedMarkerPath(buf: []u8) ?[]const u8 {
+    if (log_base_dir.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ log_base_dir, migrated_marker_name }) catch null;
+}
+
+/// 是否已完成一次性迁移（无基准目录时视为已完成 = 不做任何自动修改）。
+fn logPathMigrated() bool {
+    var buf: [512]u8 = undefined;
+    const marker = migratedMarkerPath(&buf) orelse return true;
+    std.fs.cwd().access(marker, .{}) catch return false;
+    return true;
+}
+
+fn markLogPathMigrated(io: std.Io, gpa: std.mem.Allocator) void {
+    var buf: [512]u8 = undefined;
+    const marker = migratedMarkerPath(&buf) orelse return;
+    fsio.writeFileAtomic(io, gpa, marker, "1\n") catch |e| {
+        warn("日志路径迁移标记写入失败（{s}）：{s}；下次启动会再迁移一次", .{ marker, @errorName(e) });
+    };
 }
 
 /// 审计配置文本：缺了哪些键、有没有注释、多出哪些未知键。
@@ -641,16 +736,22 @@ pub fn loadConfigFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !voi
         }
     }
 
-    const cfg = toml_config.decode(Config, aa, table) catch |e| {
+    var cfg = toml_config.decode(Config, aa, table) catch |e| {
         // 同上：清理由 `errdefer` 负责，避免重复释放
         backupBadConfig(io, gpa, path, file.current(), @errorName(e));
         return e;
     };
+    const migrated = logPathMigrated();
+    const path_fix = if (migrated) LogPathFix{} else sanitizeLogPath(&cfg);
+    if (path_fix.fixed) {
+        warn("日志配置 LogPath=\"{s}\" 越出数据目录（基准 {s}），已一次性改为 \"Log\"（原文件备份 .old；以后手工/在线改的值不会再重置）", .{ path_fix.original, log_base_dir });
+    }
 
     try applyConfig(io, gpa, cfg);
+    if (!migrated) markLogPathMigrated(io, gpa);
 
-    // 自愈：缺项 / 无注释 / 多余项都修掉（失败只告警，绝不影响已生效的配置）
-    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0) {
+    // 自愈：缺项 / 无注释 / 多余项 / LogPath 被纠正 都重写（失败只告警，绝不影响已生效的配置）
+    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0 or path_fix.fixed) {
         repairConfigFile(io, gpa, &file, cfg, audit) catch |e| {
             warn("日志配置自愈失败（{s}），继续使用当前生效配置：{s}", .{ path, @errorName(e) });
         };
@@ -689,18 +790,25 @@ pub fn reloadIfChanged(io: std.Io) !bool {
         err("日志配置 {s} 解析失败（{s}），继续使用上一份生效配置", .{ src.file.path, @errorName(e) });
         return false;
     };
-    const cfg = toml_config.decode(Config, aa, table) catch |e| {
+    var cfg = toml_config.decode(Config, aa, table) catch |e| {
         backupBadConfig(src.io, src.gpa, src.file.path, src.file.current(), @errorName(e));
         err("日志配置 {s} 字段解码失败（{s}），继续使用上一份生效配置", .{ src.file.path, @errorName(e) });
         return false;
     };
+    // 热加载同样只迁移一次（标记存在后，人工/在线配置改成什么都不再被改写）
+    const migrated = logPathMigrated();
+    const path_fix = if (migrated) LogPathFix{} else sanitizeLogPath(&cfg);
+    if (path_fix.fixed) {
+        warn("日志配置 LogPath=\"{s}\" 越出数据目录（基准 {s}），已一次性改为 \"Log\"（以后手工/在线改的值不会再重置）", .{ path_fix.original, log_base_dir });
+    }
 
     try applyConfig(src.io, src.gpa, cfg);
+    if (!migrated) markLogPathMigrated(src.io, src.gpa);
 
-    // 热加载同样自愈：外部编辑把键删了/拼错了/注释删了，也一并补齐
+    // 热加载同样自愈：外部编辑把键删了/拼错了/注释删了/LogPath 写回旧值，都一并纠正
     // （`file.save` 会刷新版本戳，所以不会因为自己这次重写又触发下一轮重载）
     const audit = auditConfigText(aa, src.file.current(), table);
-    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0) {
+    if (audit.missing > 0 or !audit.has_comment or audit.unknown.items.len > 0 or path_fix.fixed) {
         repairConfigFile(src.io, src.gpa, &src.file, cfg, audit) catch |e| {
             warn("日志配置自愈失败（{s}），继续使用当前生效配置：{s}", .{ src.file.path, @errorName(e) });
         };

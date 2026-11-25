@@ -79,11 +79,38 @@ pub const Options = struct {
     ///
     /// 要与 C# 中国服务器输出一致时显式传 `8 * 3600`。
     utc_offset_seconds: ?i64 = null,
+    /// `Id` 的随机源所在 io（**建议传**：与 `main.zig` 生成密钥同一份 `init.io`）。
+    ///
+    /// ★ 不传时退化为「时间戳 + 进程内计数器」的 GUID，**不要用在安全场景**。
+    /// 为什么不能默认用 `Guid.guidAlloc`：它内部用 `std.Io.Threaded.global_single_threaded`，
+    /// 而 HTTP 请求跑在工作线程/协程上 —— `http/server.zig:1012` 明确写着
+    /// 「global_single_threaded 跨线程会 panic」。2026-11-25 线上（Linux musl）
+    /// 症状就是：一请求 `/api/client-ip` 连接立刻被关（nginx 502）。
+    io: ?std.Io = null,
     /// 覆盖 `OperationTime` 文本（一般只在测试里用）。
     operation_time: ?[]const u8 = null,
     /// 覆盖 `Id`（一般只在测试里用）。
     id: ?[]const u8 = null,
 };
+
+/// 进程内兜底计数器（无 io 时保证 Id 在本进程内唯一）。
+var fallback_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// 生成 `Id`。
+///
+/// - 有 `io` → 真随机 GUID v4（`std.Random.IoSource`）；
+/// - 无 `io` → 纳秒时间戳 + 进程内计数器，仍是 GUID v4 文本，仅作标识。
+fn idAlloc(arena: std.mem.Allocator, io: ?std.Io) ![]u8 {
+    if (io) |handle| {
+        const source = std.Random.IoSource{ .io = handle };
+        return guid.guidWithRandomAlloc(arena, source.interface());
+    }
+    var bytes: [16]u8 = undefined;
+    const stamp: i64 = @intCast(@max(compat.nanoTimestamp(), 0));
+    std.mem.writeInt(u64, bytes[0..8], @bitCast(stamp), .little);
+    std.mem.writeInt(u64, bytes[8..16], fallback_id.fetchAdd(1, .monotonic), .little);
+    return guid.formatAlloc(arena, bytes);
+}
 
 /// 按 `JavaScriptEncoder.Default` 的规则写一个 JSON 字符串（含首尾引号）。
 pub fn writeString(w: *std.Io.Writer, text: []const u8) !void {
@@ -253,7 +280,7 @@ pub fn response(arena: std.mem.Allocator, code: i64, message: ?[]const u8, data:
 pub fn responseWith(arena: std.mem.Allocator, code: i64, message: ?[]const u8, data: []const u8, options: Options) !router.Response {
     const operation_time = options.operation_time orelse
         try operationTimeAlloc(arena, options.utc_offset_seconds orelse localOffsetSeconds());
-    const id = options.id orelse try guid.guidAlloc(arena);
+    const id = options.id orelse try idAlloc(arena, options.io);
     return router.Response.json(try build(arena, code, message, data, operation_time, id));
 }
 
