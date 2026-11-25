@@ -521,9 +521,10 @@ pub fn teeStderr(io: std.Io) bool {
 
     // stderr 固定是 fd 2（POSIX）；`dup2` 后原 fd 可以关，进程仍能继续写。
     if (builtin.os.tag == .linux) {
-        // `std.os.linux.dup2` 在 0.17 仍可用；失败只降级（不能因为日志辅助功能把服务坑死）。
+        // `std.os.linux.dup2` 返回**内核返回值**：成功是新 fd（= 2），失败是负的 errno（bitCast 成 isize 才准）。
         const rc = std.os.linux.dup2(file.handle, 2);
-        return rc == 0;
+        const signed: isize = @bitCast(rc);
+        return signed >= 0;
     }
     return false;
 }
