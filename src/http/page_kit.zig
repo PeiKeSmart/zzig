@@ -81,14 +81,52 @@ pub const front_csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; st
 /// `no-cache` 的语义是「可以存、但每次使用前必须回源验证」，比 `no-store` 温和；
 /// 缺了它浏览器会按启发式缓存自己做主 —— 改完页面用户刷新还是旧的（现象很像「没生效」）。
 pub fn withHtmlHeaders(arena: std.mem.Allocator, resp: router.Response) router.Response {
+    return withHtmlHeadersExt(arena, resp, "");
+}
+
+/// 同 [`withHtmlHeaders`]，但允许在 `connect-src` 后面追加额外的源（如前端要直连探测接口）。
+///
+/// `extra_connect_src` 是**已拼好的串**（每项带前导空格，如 `" https://a.example.com"`），
+/// 一般由 [`connectSrcExtra`] 从 URL 列表生成；空串 = 行为与 [`withHtmlHeaders`] 完全一致。
+pub fn withHtmlHeadersExt(arena: std.mem.Allocator, resp: router.Response, extra_connect_src: []const u8) router.Response {
     // 样式表以外的类型（JSON / XML / 纯文本）不加 CSP：它们不是被当作 HTML 解析的。
     if (std.mem.indexOf(u8, resp.content_type, "text/html") == null) return resp;
     var out = resp;
+    var csp: []const u8 = front_csp;
+    if (extra_connect_src.len > 0) {
+        const marker = "connect-src 'self'";
+        if (std.mem.indexOf(u8, front_csp, marker)) |at| {
+            csp = std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{
+                front_csp[0..at], marker, extra_connect_src, front_csp[at + marker.len ..],
+            }) catch front_csp;
+        }
+    }
     const headers = arena.alloc(std.http.Header, 2) catch return out;
     headers[0] = .{ .name = "cache-control", .value = "no-cache, max-age=0, must-revalidate" };
-    headers[1] = .{ .name = "content-security-policy", .value = front_csp };
+    headers[1] = .{ .name = "content-security-policy", .value = csp };
     out.headers = headers;
     return out;
+}
+
+/// 把一串 URL 收敛成 CSP 的 `connect-src` 追加串（`" https://a https://b"`，去重、跳过非绝对地址）。
+pub fn connectSrcExtra(arena: std.mem.Allocator, urls: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    for (urls) |url| {
+        const origin = @import("../net/url.zig").origin(url) orelse continue;
+        var seen = false;
+        var it = std.mem.splitScalar(u8, out.items, ' ');
+        while (it.next()) |item| {
+            if (std.mem.eql(u8, item, origin)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        try out.append(arena, ' ');
+        try out.appendSlice(arena, origin);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// 简版错误页的参数。

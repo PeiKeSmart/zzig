@@ -56,6 +56,30 @@ pub fn queryRaw(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// 取 `scheme://host[:port]` 这一段（**原样切片，不分配**）；不是 http/https 绝对地址就返回 `null`。
+///
+/// 用途：CSP 里只写 origin（`connect-src https://api.example.com`），
+/// 以及「把配置里的探测地址收敛成同源白名单」这类场景。
+pub fn origin(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const scheme_len: usize = if (std.ascii.startsWithIgnoreCase(trimmed, "https://"))
+        8
+    else if (std.ascii.startsWithIgnoreCase(trimmed, "http://"))
+        7
+    else
+        return null;
+    const rest = trimmed[scheme_len..];
+    var end: usize = rest.len;
+    for (rest, 0..) |ch, i| {
+        if (ch == '/' or ch == '?' or ch == '#' or ch == ' ' or ch == ';') {
+            end = i;
+            break;
+        }
+    }
+    if (end == 0) return null;
+    return trimmed[0 .. scheme_len + end];
+}
+
 const testing = std.testing;
 
 test "url: 编解码往返" {
@@ -72,4 +96,13 @@ test "url: 编解码往返" {
 test "url: queryRaw" {
     try testing.expectEqualStrings("x%2Fy", queryRaw("a=1&p=x%2Fy&z=2", "p").?);
     try testing.expect(queryRaw("a=1", "p") == null);
+}
+
+test "url: origin 只取 scheme://host[:port]，非绝对地址返回 null" {
+    try testing.expectEqualStrings("https://a.example.com", origin("https://a.example.com/x?y=1").?);
+    try testing.expectEqualStrings("http://127.0.0.1:18090", origin("  http://127.0.0.1:18090/ipv4  ").?);
+    // 大小写**原样保留**（切片不分配）；CSP 的 scheme/host 本就大小写不敏感
+    try testing.expectEqualStrings("HTTPS://a.example.com", origin("HTTPS://a.example.com").?);
+    try testing.expect(origin("/relative/path") == null);
+    try testing.expect(origin("https://") == null);
 }
