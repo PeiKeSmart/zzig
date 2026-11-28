@@ -134,15 +134,15 @@ pub fn Hot(comptime T: type) type {
             self.hooks.on_change = func;
         }
 
-        /// 按节流周期检查一次；有变化则应用并回调。
-        pub fn maybeReload(self: *Self) void {
+        /// 按节流周期检查一次；有变化则应用并回调。**返回是否真的换了配置**（供只关心结果的调用方用）。
+        pub fn maybeReload(self: *Self) bool {
             const now = DateTime.nowUnix();
             const next = self.next_check_at.load(.monotonic);
             // `now == 0` 说明平台时钟不可用（历史 bug：Linux 上 nowUnix 恒为 0）——
             // 此时**不做节流**，否则 `0 < next` 永远成立，热加载会被静默关死。
-            if (now > 0 and now < next) return;
+            if (now > 0 and now < next) return false;
             if (now > 0) {
-                if (self.next_check_at.cmpxchgStrong(next, now + self.retry_seconds, .monotonic, .monotonic) != null) return;
+                if (self.next_check_at.cmpxchgStrong(next, now + self.retry_seconds, .monotonic, .monotonic) != null) return false;
             }
 
             self.mutex.lockUncancelable(self.io);
@@ -150,13 +150,13 @@ pub fn Hot(comptime T: type) type {
 
             const changed = self.file.reloadIfChanged(.{}) catch |err| {
                 Logger.err("{s} 配置检查失败（继续使用当前配置）：{s}（{s}）", .{ self.log_tag, self.path, @errorName(err) });
-                return;
+                return false;
             };
-            if (!changed) return;
+            if (!changed) return false;
 
             const next_value = self.hooks.parse(self.hooks.ctx, self.allocator, self.file.current()) catch |err| {
                 Logger.err("{s} 配置解析失败（保持当前配置）：{s}（{s}）", .{ self.log_tag, self.path, @errorName(err) });
-                return;
+                return false;
             };
 
             self.versions.append(self.allocator, .{
@@ -165,7 +165,7 @@ pub fn Hot(comptime T: type) type {
             }) catch |err| {
                 self.hooks.destroy(self.hooks.ctx, self.allocator, next_value);
                 Logger.err("{s} 配置切换失败（{s}）", .{ self.log_tag, @errorName(err) });
-                return;
+                return false;
             };
 
             // 先应用（区域切换等副作用），再切换指针：避免片刻「链接指向新值、路由还是旧值」。
@@ -173,6 +173,17 @@ pub fn Hot(comptime T: type) type {
             self.current.store(next_value, .release);
             Logger.info("{s} 配置已热加载：{s}", .{ self.log_tag, self.path });
             self.sweepRetired();
+            return true;
+        }
+
+        /// 底层 `FileText` 的提示（如「缺键已按模板补齐」）。调用方打完日志后请 `clearNotes()`。
+        pub fn notes(self: *Self) []const []u8 {
+            return self.file.notes.items;
+        }
+
+        /// 清空提示（`FileText` 自己的内存，调用方无需释放）。
+        pub fn clearNotes(self: *Self) void {
+            self.file.clearNotes();
         }
 
         /// 回收超出宽限期的旧版本（当前版本永不回收）。
@@ -267,17 +278,17 @@ test "zzig.config.hot：只改文件才切换，解析失败保留旧配置" {
     try std.testing.expectEqual(@as(usize, 0), changed_len);
 
     // 无变化：不切换
-    hot.maybeReload();
+    _ = hot.maybeReload();
     try std.testing.expectEqualStrings("first", hot.settings().name);
 
     // 正常改值：切换 + 回调
     try fsio.writeFile(io, config_path, "Name = second\n");
-    hot.maybeReload();
+    _ = hot.maybeReload();
     try std.testing.expectEqualStrings("second", hot.settings().name);
     try std.testing.expectEqual(@as(usize, 6), changed_len);
 
     // 改坏：保留上一次成功解析的配置
     try fsio.writeFile(io, config_path, "Name = BAD\n");
-    hot.maybeReload();
+    _ = hot.maybeReload();
     try std.testing.expectEqualStrings("second", hot.settings().name);
 }

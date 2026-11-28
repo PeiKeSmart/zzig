@@ -39,11 +39,16 @@ pub const FileText = struct {
         const path_owned = try gpa.dupe(u8, path);
         errdefer gpa.free(path_owned);
 
+        // **自己持有一份模板**：调用方的 `template` 可能是临时缓冲或 arena 里的切片，
+        // 一旦调用方后续释放，字段就成悬垂指针（虽然现在只在 `open` 里用到，但留这个隐患没好处）。
+        const template_owned = try gpa.dupe(u8, template);
+        errdefer gpa.free(template_owned);
+
         var self = FileText{
             .io = io,
             .gpa = gpa,
             .path = path_owned,
-            .template = template,
+            .template = template_owned,
             .text = &.{},
             .stamp = null,
         };
@@ -76,6 +81,7 @@ pub const FileText = struct {
     pub fn deinit(self: *FileText) void {
         for (self.notes.items) |n| self.gpa.free(n);
         self.notes.deinit(self.gpa);
+        self.gpa.free(self.template);
         self.gpa.free(self.text);
         self.gpa.free(self.path);
     }
