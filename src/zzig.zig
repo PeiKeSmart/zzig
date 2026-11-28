@@ -153,6 +153,9 @@ pub const url_canon = @import("net/url_canon.zig");
 /// ASCII 大小写不敏感的前缀/后缀/子串判定
 pub const ascii = @import("text/ascii.zig");
 
+/// 人民币金额转大写（财税口径：整数分运算、零的规则与银行写法一致）
+pub const rmb = @import("text/rmb.zig");
+
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
@@ -160,7 +163,6 @@ pub const hash = @import("crypto/hash_util.zig");
 pub const qr = @import("image/qr.zig");
 /// Data Matrix 生成（复用 `qr.Matrix` 与同一套 SVG 渲染口径）
 pub const datamatrix = @import("image/datamatrix.zig");
-
 
 /// 线程相关：定时器、弹性线程池、Cron
 pub const threading = struct {
@@ -474,6 +476,7 @@ test {
     _ = @import("threading/timer.zig");
     _ = @import("threading/cron.zig");
     _ = @import("threading/jobs.zig");
+    _ = @import("text/rmb.zig");
     _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
