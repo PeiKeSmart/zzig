@@ -156,6 +156,9 @@ pub const ascii = @import("text/ascii.zig");
 /// 人民币金额转大写（财税口径：整数分运算、零的规则与银行写法一致）
 pub const rmb = @import("text/rmb.zig");
 
+/// 汉字转拼音（**显示口径**，EzPinyin 兼容：小写 + 词组消歧；拼音码请用 `zcode.pinyin`）
+pub const pinyin = @import("text/pinyin.zig");
+
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
@@ -477,6 +480,7 @@ test {
     _ = @import("threading/cron.zig");
     _ = @import("threading/jobs.zig");
     _ = @import("text/rmb.zig");
+    _ = @import("text/pinyin.zig");
     _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
