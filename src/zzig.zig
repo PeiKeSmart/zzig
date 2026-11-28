@@ -196,6 +196,13 @@ pub const threading = struct {
 /// 企业微信机器人 Webhook 推送
 pub const wecom = @import("wecom/wecom.zig");
 
+/// Office 文档（最小可靠实现）：xlsx 导出/模板（inlineStr，不引第三方库）
+pub const office = struct {
+    pub const xlsx = @import("office/xlsx.zig");
+    pub const XlsxWriter = xlsx.Writer;
+    pub const XlsxCell = xlsx.Cell;
+};
+
 /// 配置：TOML 子集解析 + 文本热加载（版本戳 / 原子写 / 缺失生成）
 pub const config = struct {
     pub const toml = @import("config/toml.zig");
@@ -482,6 +489,7 @@ test {
     _ = @import("text/rmb.zig");
     _ = @import("text/pinyin.zig");
     _ = @import("wecom/wecom.zig");
+    _ = @import("office/xlsx.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");
 }
