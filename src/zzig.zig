@@ -58,8 +58,12 @@ pub const web = struct {
     pub const view = @import("http/view.zig");
     pub const static_files = @import("http/static_files.zig");
     pub const value = @import("http/value.zig");
-  /// schema.org / JSON-LD 构造器（Article / CollectionPage + BreadcrumbList）
-  pub const structured_data = @import("http/structured_data.zig");
+    /// schema.org / JSON-LD 构造器（Article / CollectionPage + BreadcrumbList）
+    pub const structured_data = @import("http/structured_data.zig");
+    /// SEO head 组装（C# `PekHtmlHelper` 的等价物：title/desc/keywords 分片累加 + canonical/hreflang/og/twitter）
+    pub const pek_html = @import("http/pek_html.zig");
+    /// 通用页面基建（区域路由 / 规范地址 / 安全头 / 简版错误页 / 耗时占位）
+    pub const page_kit = @import("http/page_kit.zig");
     pub const App = @import("http/web.zig").App;
     pub const Options = @import("http/web.zig").Options;
 
@@ -174,6 +178,8 @@ pub const config = struct {
     pub const toml_template = @import("config/toml_template.zig");
     /// 文本级键读写（保留注释与其它行；面板回写单个开关用）
     pub const text_keys = @import("config/text_keys.zig");
+    /// 配置热加载（stat 节流 + 解析失败保旧 + 版本宽限回收 + 请求中间件）
+    pub const hot = @import("config/hot.zig");
     pub const FileText = @import("config/file.zig").FileText;
     pub const FileOptions = @import("config/file.zig").Options;
     pub const getStamp = @import("config/file.zig").getStamp;
@@ -429,13 +435,16 @@ test {
     _ = @import("file/fsio.zig");
     _ = @import("net/url.zig");
     _ = @import("net/socket_timeout.zig");
-_ = @import("net/accept_language.zig");
-_ = @import("net/url_canon.zig");
-_ = @import("http/structured_data.zig");
+    _ = @import("net/accept_language.zig");
+    _ = @import("net/url_canon.zig");
+    _ = @import("http/structured_data.zig");
+    _ = @import("http/pek_html.zig");
+    _ = @import("http/page_kit.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");
     _ = @import("config/file.zig");
+    _ = @import("config/hot.zig");
     _ = @import("logs/text_file_log.zig");
     _ = @import("threading/pool.zig");
     _ = @import("threading/timer.zig");
