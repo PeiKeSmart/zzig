@@ -58,6 +58,8 @@ pub const web = struct {
     pub const view = @import("http/view.zig");
     pub const static_files = @import("http/static_files.zig");
     pub const value = @import("http/value.zig");
+  /// schema.org / JSON-LD 构造器（Article / CollectionPage + BreadcrumbList）
+  pub const structured_data = @import("http/structured_data.zig");
     pub const App = @import("http/web.zig").App;
     pub const Options = @import("http/web.zig").Options;
 
@@ -133,6 +135,8 @@ pub const cookie = @import("net/cookie.zig");
 pub const socket_timeout = @import("net/socket_timeout.zig");
 /// `Accept-Language` 解析与语言挑选（多语言站点的通用能力）
 pub const accept_language = @import("net/accept_language.zig");
+/// URL 规范化（SEO：同一内容只能有一个地址；前缀与后缀由调用方给）
+pub const url_canon = @import("net/url_canon.zig");
 
 /// ASCII 大小写不敏感的前缀/后缀/子串判定
 pub const ascii = @import("text/ascii.zig");
@@ -426,6 +430,8 @@ test {
     _ = @import("net/url.zig");
     _ = @import("net/socket_timeout.zig");
 _ = @import("net/accept_language.zig");
+_ = @import("net/url_canon.zig");
+_ = @import("http/structured_data.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");

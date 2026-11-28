@@ -128,6 +128,29 @@ pub const DateTime = struct {
         });
     }
 
+    /// 输出 `YYYY-MM-DD HH:MM:SS`（**不带**小数秒）。
+    ///
+    /// `formatAlloc` 是 XCode 数据库口径（带 7 位小数秒），后台列表 / 前台展示不需要它；
+    /// 各项目以前各写一份「截前 19 位」或自己套 `civil_from_days`，统一收到这里。
+    pub fn formatSecondAlloc(self: DateTime, gpa: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            @as(u32, @intCast(@max(self.year, 0))),
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+        });
+    }
+
+    /// Unix 秒 + **固定时区偏移**（秒）→ DateTime。
+    ///
+    /// 为什么不让库自己猜时区：同一份数据在不同服务器上必须得到同一结果
+    /// （东八区站点写 `offset = 8 * 3600`），否则换台机器时间就变。
+    pub fn fromUnixSecondsOffset(secs: i64, offset_seconds: i64) DateTime {
+        return fromUnixSeconds(secs + offset_seconds);
+    }
+
     /// 当前本地时间（按系统时区偏移换算；无时区数据库场景够用）。
     pub fn nowLocal() DateTime {
         return fromUnixSeconds(nowUnix() + localOffsetSeconds());
