@@ -62,6 +62,8 @@ pub const web = struct {
     pub const structured_data = @import("http/structured_data.zig");
     /// SEO head 组装（C# `PekHtmlHelper` 的等价物：title/desc/keywords 分片累加 + canonical/hreflang/og/twitter）
     pub const pek_html = @import("http/pek_html.zig");
+    /// 本机 HTTP 头探针（真发请求 + 抠 <head> 事实：SEO 体检 / 上线自检）
+    pub const head_probe = @import("http/head_probe.zig");
     /// 通用页面基建（区域路由 / 规范地址 / 安全头 / 简版错误页 / 耗时占位）
     pub const page_kit = @import("http/page_kit.zig");
     pub const App = @import("http/web.zig").App;
@@ -440,6 +442,7 @@ test {
     _ = @import("http/structured_data.zig");
     _ = @import("http/pek_html.zig");
     _ = @import("http/page_kit.zig");
+_ = @import("http/head_probe.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");
