@@ -110,18 +110,31 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
-        self.retireSlots();
-        // 先停调度线程（join）——之后不可能再有回调引用这些 Slot，才可以释放
+        // 摘掉所有定时器 —— **不释放内存**：`timer` 模块的约定是「Timer 内存活到
+        // `Scheduler.deinit` 返回」（调度线程取出 due 指针后仍会读）。
+        self.lock();
+        const active = self.slots;
+        const retired = self.retired;
+        self.slots = .empty;
+        self.retired = .empty;
+        self.unlock();
+
+        for (active.items) |slot| self.sched.remove(&slot.timer);
         self.sched.deinit();
+
+        for (active.items) |slot| releaseSlot(slot);
+        for (retired.items) |slot| releaseSlot(slot);
+
+        var bulk_active = active;
+        bulk_active.deinit(self.gpa);
+        var bulk_retired = retired;
+        bulk_retired.deinit(self.gpa);
+
         self.lock();
         self.tasks.deinit(self.gpa);
         self.slots.deinit(self.gpa);
-        const retired = self.retired;
-        self.retired = .empty;
+        self.retired.deinit(self.gpa);
         self.unlock();
-        for (retired.items) |slot| releaseSlot(slot);
-        var copy = retired;
-        copy.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -220,8 +233,13 @@ pub const Registry = struct {
             try fresh.append(self.gpa, slot);
         }
 
-        // 换表：先摘旧（不再触发），再装新
-        self.retireSlots();
+        // 换表：先摘旧（不再触发），再装新。退役区扩容失败就本次不重建——
+        // 宁可保留旧作业，也不要「旧的新的一起跑」或泄漏内存。
+        if (!self.retireSlots()) {
+            for (fresh.items) |slot| releaseSlot(slot);
+            fresh.deinit(self.gpa);
+            return error.RetireFailed;
+        }
 
         var added: usize = 0;
         for (fresh.items) |slot| {
@@ -251,25 +269,28 @@ pub const Registry = struct {
     }
 
     /// 摘掉当前全部作业（定时器从调度器移除，内存移到 `retired` 等 deinit 释放）。
-    fn retireSlots(self: *Registry) void {
+    ///
+    /// 返回 false = 退役区扩容失败（本次什么都没动，调用方应放弃重建）。
+    fn retireSlots(self: *Registry) bool {
         self.lock();
+        if (self.slots.items.len == 0) {
+            self.unlock();
+            return true;
+        }
+        self.retired.ensureUnusedCapacity(self.gpa, self.slots.items.len) catch |err| {
+            self.unlock();
+            std.debug.print("[zzig.jobs] 退役区扩容失败（{s}）：本次不重建作业\n", .{@errorName(err)});
+            return false;
+        };
         const old = self.slots;
         self.slots = .empty;
-        var append_err: ?anyerror = null;
-        for (old.items) |slot| {
-            self.retired.append(self.gpa, slot) catch |err| {
-                // 极端情况（内存不足）：宁可泄漏也不能释放，释放会让调度线程 UAF
-                append_err = err;
-            };
-        }
+        for (old.items) |slot| self.retired.appendAssumeCapacity(slot);
         self.unlock();
 
         for (old.items) |slot| self.sched.remove(&slot.timer);
         var copy = old;
         copy.deinit(self.gpa);
-        if (append_err) |err| {
-            std.debug.print("[zzig.jobs] 退役作业登记失败（{s}）：这部分内存不回收（避免 use-after-free）\n", .{@errorName(err)});
-        }
+        return true;
     }
 
     /// 立刻触发一次（对齐 TimerX 的 `Wake(id, -1)`）。找到并已安排返回 true。
