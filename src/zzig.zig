@@ -66,6 +66,8 @@ pub const web = struct {
     pub const head_probe = @import("http/head_probe.zig");
     /// 通用页面基建（区域路由 / 规范地址 / 安全头 / 简版错误页 / 耗时占位）
     pub const page_kit = @import("http/page_kit.zig");
+    /// 随包资源（视图推 <96><101> 静态清单 / 校验 / .gz 预压缩 / ?v= 指纹）
+    pub const assets = @import("http/assets.zig");
     pub const App = @import("http/web.zig").App;
     pub const Options = @import("http/web.zig").Options;
 
@@ -443,6 +445,7 @@ test {
     _ = @import("http/pek_html.zig");
     _ = @import("http/page_kit.zig");
 _ = @import("http/head_probe.zig");
+_ = @import("http/assets.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");
