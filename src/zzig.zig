@@ -131,6 +131,8 @@ pub const cookie = @import("net/cookie.zig");
 
 /// 原生 socket 读超时（Windows AFD / POSIX setsockopt）+ TCP_NODELAY
 pub const socket_timeout = @import("net/socket_timeout.zig");
+/// `Accept-Language` 解析与语言挑选（多语言站点的通用能力）
+pub const accept_language = @import("net/accept_language.zig");
 
 /// ASCII 大小写不敏感的前缀/后缀/子串判定
 pub const ascii = @import("text/ascii.zig");
@@ -423,6 +425,7 @@ test {
     _ = @import("file/fsio.zig");
     _ = @import("net/url.zig");
     _ = @import("net/socket_timeout.zig");
+_ = @import("net/accept_language.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");
