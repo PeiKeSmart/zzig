@@ -156,6 +156,11 @@ pub const ascii = @import("text/ascii.zig");
 /// 哈希小工具（SHA-256 十六进制、常量时间比较）
 pub const hash = @import("crypto/hash_util.zig");
 
+/// QR 码生成（纯 Zig，零依赖：容量选版 / 掩码 / SVG 渲染）
+pub const qr = @import("image/qr.zig");
+/// Data Matrix 生成（复用 `qr.Matrix` 与同一套 SVG 渲染口径）
+pub const datamatrix = @import("image/datamatrix.zig");
+
 /// 线程相关：定时器、弹性线程池、Cron
 pub const threading = struct {
     pub const timer = @import("threading/timer.zig");
