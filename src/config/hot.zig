@@ -177,6 +177,33 @@ pub fn Hot(comptime T: type) type {
         }
 
         /// 底层 `FileText` 的提示（如「缺键已按模板补齐」）。调用方打完日志后请 `clearNotes()`。
+        /// 当前配置文件文本（只读；修改请用 `saveAndReload`）。
+        pub fn text(self: *Self) []const u8 {
+            return self.file.current();
+        }
+
+        /// 写入新文本并**立即**解析应用（跳过 stat 节流）。
+        ///
+        /// 用途：面板保存配置后要马上生效；`maybeReload` 受 `retry_seconds` 节流，
+        /// 刚保存时可能读不到变化。解析失败时**不改文件生效态**（但文件已落盘，需调用方提示）。
+        pub fn saveAndReload(self: *Self, new_text: []const u8) !void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            try self.file.save(new_text);
+            const next_value = try self.hooks.parse(self.hooks.ctx, self.allocator, self.file.current());
+            errdefer self.hooks.destroy(self.hooks.ctx, self.allocator, next_value);
+
+            try self.versions.append(self.allocator, .{
+                .value = next_value,
+                .created_at = DateTime.nowUnix(),
+            });
+            if (self.hooks.on_change) |func| func(self.hooks.ctx, next_value);
+            self.current.store(next_value, .release);
+            self.next_check_at.store(0, .monotonic);
+            self.sweepRetired();
+        }
+
         pub fn notes(self: *Self) []const []u8 {
             return self.file.notes.items;
         }

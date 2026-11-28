@@ -151,6 +151,11 @@ pub const Timer = struct {
     next_unix_ms: i64 = 0,
     /// Cron 表达式
     crons: []const Cron = &.{},
+    /// Cron 按哪个时区解释（秒）。0 = UTC（历史行为）；东八区传 `8*3600`。
+    ///
+    /// 为什么要它：`Cron.nextAfter` 只做纯算术（UTC），而业务上的「每天 00:00」
+    /// 指的是**本地**零点；UTC 与东八区相差 8 小时，不传偏移就会在 08:00 触发。
+    cron_offset_seconds: i64 = 0,
 
     /// 是否异步执行（对齐 TimerX 的 `Async`）：
     ///
@@ -211,6 +216,20 @@ pub const Timer = struct {
         return .{ .callback = cb, .ctx = ctx, .kind = .cron, .crons = crons };
     }
 
+    /// Cron 定时器（指定时区偏移，秒）：业务上的「每天 00:00」按本地时间解释。
+    ///
+    /// 东八区传 `8 * 3600`；传 0 等价于 [`cron`]（UTC）。
+    pub fn cronOffset(cb: TimerCallback, ctx: ?*anyopaque, crons: []const Cron, offset_seconds: i64) !Timer {
+        if (crons.len == 0) return error.EmptySchedule;
+        return .{
+            .callback = cb,
+            .ctx = ctx,
+            .kind = .cron,
+            .crons = crons,
+            .cron_offset_seconds = offset_seconds,
+        };
+    }
+
     /// 下次到期对应的开机滴答（把绝对/Cron 的墙上时刻换算成滴答）。
     fn dueTick(t: *const Timer, now_tick: i64, now_unix_ms: i64) i64 {
         return switch (t.kind) {
@@ -238,8 +257,10 @@ pub const Timer = struct {
                 const from_sec = @divFloor(now_unix_ms, 1000);
                 var best: ?i64 = null;
                 for (t.crons) |*c| {
-                    if (c.nextAfter(from_sec)) |n| {
-                        if (best == null or n < best.?) best = n;
+                    // 按「本地时间」算：先把时刻平移到本地，算完再平移回 UTC。
+                    if (c.nextAfter(from_sec + t.cron_offset_seconds)) |n| {
+                        const hit = n - t.cron_offset_seconds;
+                        if (best == null or hit < best.?) best = hit;
                     }
                 }
                 if (best) |b| {
@@ -354,6 +375,22 @@ pub const Scheduler = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.timers.items.len;
+    }
+
+    /// 立即触发一次（对齐 TimerX 的 `Wake(id, -1)`）：把下次时刻提前到「现在」。
+    ///
+    /// 仅对 `.cron` / `.absolute` 有效（它们按墙上时刻调度）；`.period` / `.once` 是相对滴答，
+    /// 需要提前触发请直接建一个 `period_ms = 0` 的一次性定时器。
+    pub fn triggerNow(self: *Scheduler, t: *Timer) void {
+        self.mutex.lockUncancelable(self.io);
+        switch (t.kind) {
+            .cron, .absolute => {
+                t.next_unix_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds() - 1;
+            },
+            else => {},
+        }
+        self.mutex.unlock(self.io);
+        std.Io.Condition.signal(&self.cond, self.io);
     }
 
     /// 绑定线程池后，`Timer.async = true` 的回调会在线程池里执行。
@@ -803,3 +840,21 @@ test "timer：多调度器分组（同名复用 + 计数 + get）" {
     try timer_testing.expect(get("zzig-test-group") == s1);
     try timer_testing.expect(get("not-exist") == null);
 }
+
+test "timer：Cron 时区偏移（东八区「每天 00:00」落在本地零点）" {
+    var crons = [_]Cron{try Cron.parse("0 0 0 * * *")};
+    // 2026-11-28T00:00:00Z，本地（UTC+8）= 08:00；下一次本地零点 = 2026-11-28T16:00Z
+    const DateTime = @import("../time/datetime.zig").DateTime;
+    const midnight_utc = (DateTime{ .year = 2026, .month = 11, .day = 28 }).toUnixSeconds();
+
+    var t = try Timer.cronOffset(noopCallback, null, &crons, 8 * 3600);
+    try timer_testing.expect(Timer.scheduleNext(&t, 0, midnight_utc * 1000));
+    try timer_testing.expectEqual((midnight_utc + 16 * 3600) * 1000, t.next_unix_ms);
+
+    // 偏移为 0（默认，UTC 口径）时落在次日 00:00Z —— 与改造前完全一致
+    var t2 = try Timer.cron(noopCallback, null, &crons);
+    try timer_testing.expect(Timer.scheduleNext(&t2, 0, midnight_utc * 1000));
+    try timer_testing.expectEqual((midnight_utc + 24 * 3600) * 1000, t2.next_unix_ms);
+}
+
+fn noopCallback(_: ?*anyopaque) void {}
