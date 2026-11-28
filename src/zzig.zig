@@ -23,6 +23,8 @@ pub const File = @import("file/file.zig");
 
 /// HTTP、表单编码与压缩响应辅助
 pub const Http = @import("http/http.zig");
+/// `multipart/form-data` 解析（文件上传：导入 Excel / 头像）
+pub const multipart = @import("http/multipart.zig");
 
 /// HTTP 增强工具（重试机制、表单处理、网络错误处理）
 pub const HttpEnhanced = @import("http/enhanced.zig");
@@ -72,6 +74,8 @@ pub const web = struct {
     pub const machine_resources = @import("http/machine_resources.zig");
     /// 图形验证码（内存 TTL 存储 + SVG 渲染，一次性消费，零第三方依赖）
     pub const captcha = @import("http/captcha.zig");
+    /// `multipart/form-data` 解析（文件上传：导入 Excel / 头像）
+    pub const multipart = @import("http/multipart.zig");
     pub const App = @import("http/web.zig").App;
     pub const Options = @import("http/web.zig").Options;
 
@@ -476,6 +480,7 @@ test {
     _ = @import("http/assets.zig");
     _ = @import("http/machine_resources.zig");
     _ = @import("http/captcha.zig");
+    _ = @import("http/multipart.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");

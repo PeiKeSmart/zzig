@@ -276,6 +276,353 @@ fn writeXmlEscaped(w: *std.Io.Writer, text: []const u8) !void {
     }
 }
 
+// ===========================================================================
+// 读取（导入场景：把 sheet1 读成「行 × 列」文本）
+// ===========================================================================
+
+/// 读取结果：`rows[i][j]` 是单元格文本（空单元格是空串）。
+pub const Reader = struct {
+    gpa: std.mem.Allocator,
+    /// 共享字符串表（`xl/sharedStrings.xml`；没有该部件时为空）
+    shared: []const []const u8 = &.{},
+    sheet_xml: []const u8 = "",
+    rows: []const []const []const u8 = &.{},
+
+    /// 解析 xlsx 字节（默认取 `xl/worksheets/sheet1.xml`）。
+    ///
+    /// 只支持导入需要的子集：`t="s"`（共享串）、`t="inlineStr"`、`t="str"`、`t="b"`、
+    /// 以及无 `t` 的数值单元格。样式、公式**不求值**（公式单元格取缓存的 `<v>`）。
+    pub fn init(gpa: std.mem.Allocator, bytes: []const u8) !Reader {
+        var self = Reader{ .gpa = gpa };
+        errdefer self.deinit();
+
+        var zip_reader = try zip.Reader.init(gpa, bytes);
+        defer zip_reader.deinit();
+
+        if (zip_reader.find("xl/sharedStrings.xml")) |index| {
+            const xml = try zip_reader.extractAlloc(index);
+            defer gpa.free(xml);
+            self.shared = try parseSharedStrings(gpa, xml);
+        }
+
+        const sheet_index = zip_reader.find("xl/worksheets/sheet1.xml") orelse blk: {
+            // 单 sheet 但名字不叫 sheet1 的极端情况：取第一个 worksheets/*.xml
+            for (0..zip_reader.entries.len) |i| {
+                if (std.mem.startsWith(u8, zip_reader.entries[i].name, "xl/worksheets/") and
+                    std.mem.endsWith(u8, zip_reader.entries[i].name, ".xml"))
+                {
+                    break :blk i;
+                }
+            }
+            return error.SheetNotFound;
+        };
+        const xml = try zip_reader.extractAlloc(sheet_index);
+        defer gpa.free(xml);
+        self.sheet_xml = try gpa.dupe(u8, xml);
+
+        self.rows = try parseSheet(gpa, self.sheet_xml, self.shared);
+        return self;
+    }
+
+    pub fn deinit(self: *Reader) void {
+        for (self.shared) |item| self.gpa.free(item);
+        if (self.shared.len > 0) self.gpa.free(self.shared);
+        for (self.rows) |cells_line| {
+            for (cells_line) |text| self.gpa.free(text);
+            self.gpa.free(cells_line);
+        }
+        if (self.rows.len > 0) self.gpa.free(self.rows);
+        if (self.sheet_xml.len > 0) self.gpa.free(self.sheet_xml);
+        self.* = .{ .gpa = self.gpa };
+    }
+
+    pub fn rowCount(self: Reader) usize {
+        return self.rows.len;
+    }
+
+    /// 取一行（越界返回空）。
+    pub fn row(self: Reader, index: usize) []const []const u8 {
+        if (index >= self.rows.len) return &.{};
+        return self.rows[index];
+    }
+
+    /// 单元格文本（越界返回空串）。
+    pub fn cell(self: Reader, row_index: usize, col_index: usize) []const u8 {
+        const r = self.row(row_index);
+        if (col_index >= r.len) return "";
+        return r[col_index];
+    }
+
+    /// 第一行是否就是表头（非空单元格数 > 0）。
+    pub fn hasHeader(self: Reader) bool {
+        for (self.row(0)) |text| {
+            if (std.mem.trim(u8, text, " \t\r\n").len > 0) return true;
+        }
+        return false;
+    }
+};
+
+fn parseSharedStrings(gpa: std.mem.Allocator, xml: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| gpa.free(item);
+        list.deinit(gpa);
+    }
+
+    var pos: usize = 0;
+    while (nextTag(xml, &pos, "si")) |block| {
+        // `<si>` 内可能有多个 `<t>`（富文本分段），拼成一段
+        const text = try collectTexts(gpa, block);
+        try list.append(gpa, text);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+/// 解析 sheet 的 `<row>` / `<c>`，按 `r="A1"` 里的列字母定位（缺列补空）。
+fn parseSheet(
+    gpa: std.mem.Allocator,
+    xml: []const u8,
+    shared: []const []const u8,
+) ![]const []const []const u8 {
+    var rows: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    errdefer {
+        for (rows.items) |row| {
+            for (row) |cell| gpa.free(cell);
+            gpa.free(row);
+        }
+        rows.deinit(gpa);
+    }
+
+    var pos: usize = 0;
+    while (nextTag(xml, &pos, "row")) |row_block| {
+        var cells: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (cells.items) |cell| gpa.free(cell);
+            cells.deinit(gpa);
+        }
+
+        var cpos: usize = 0;
+        while (nextElement(row_block, &cpos, "c")) |element| {
+            const col = columnIndex(element.open) orelse cells.items.len;
+            // 中间缺列要补空串
+            while (cells.items.len < col) try cells.append(gpa, try gpa.dupe(u8, ""));
+            const text = try cellText(gpa, element.open, element.inner, shared);
+            if (cells.items.len == col) {
+                try cells.append(gpa, text);
+            } else {
+                gpa.free(cells.items[col]);
+                cells.items[col] = text;
+            }
+        }
+
+        try rows.append(gpa, try cells.toOwnedSlice(gpa));
+    }
+    return try rows.toOwnedSlice(gpa);
+}
+
+/// 单元格文本。`t="s"` 查共享串；`inlineStr` 取 `<is>` 里的 `<t>`；其余取 `<v>`。
+///
+/// 注意：属性（`r` / `t`）在**开标签**上，所以 `open` 与 `inner` 分开传。
+fn cellText(
+    gpa: std.mem.Allocator,
+    open: []const u8,
+    inner: []const u8,
+    shared: []const []const u8,
+) ![]const u8 {
+    const kind = attrValue(open, "t") orelse "";
+    if (std.mem.eql(u8, kind, "s")) {
+        const raw = innerValue(inner, "v") orelse return try gpa.dupe(u8, "");
+        const index = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch return try gpa.dupe(u8, "");
+        if (index >= shared.len) return try gpa.dupe(u8, "");
+        return try gpa.dupe(u8, shared[index]);
+    }
+    if (std.mem.eql(u8, kind, "inlineStr")) {
+        var pos: usize = 0;
+        if (nextTag(inner, &pos, "is")) |is_block| return try collectTexts(gpa, is_block);
+        return try gpa.dupe(u8, "");
+    }
+    if (std.mem.eql(u8, kind, "b")) {
+        const raw = innerValue(inner, "v") orelse return try gpa.dupe(u8, "");
+        const truthy = !std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "0");
+        return try gpa.dupe(u8, if (truthy) "1" else "0");
+    }
+    // `t="str"`（公式文本结果）与无 t（数值）：都走 `<v>`
+    const raw = innerValue(inner, "v") orelse return try gpa.dupe(u8, "");
+    return try gpa.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+/// 收集一段 XML 里所有 `<t ...>text</t>` 并拼接（富文本分段会合并）。
+fn collectTexts(gpa: std.mem.Allocator, block: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var pos: usize = 0;
+    while (nextTag(block, &pos, "t")) |text| {
+        try appendUnescaped(gpa, &out, text);
+    }
+    return try out.toOwnedSlice(gpa);
+}
+
+const Element = struct { open: []const u8 = "", inner: []const u8 = "" };
+
+/// 找下一个 `<tag ...>inner</tag>`，同时给出**开标签**（属性在它上面）与 inner。
+/// 自闭合返回 `inner = ""`；`pos` 返回后指向 `</tag>` 之后。
+fn nextElement(xml: []const u8, pos: *usize, comptime tag: []const u8) ?Element {
+    const open_pat = "<" ++ tag;
+    const close_pat = "</" ++ tag ++ ">";
+    const start = std.mem.indexOfPos(u8, xml, pos.*, open_pat) orelse return null;
+    const after = start + open_pat.len;
+    if (after < xml.len) {
+        const ch = xml[after];
+        if (ch != '>' and ch != '/' and ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n') {
+            pos.* = after;
+            return nextElement(xml, pos, tag);
+        }
+    }
+    const gt = std.mem.indexOfScalarPos(u8, xml, after, '>') orelse return null;
+    const open = xml[start .. gt + 1];
+    if (gt > 0 and xml[gt - 1] == '/') {
+        pos.* = gt + 1;
+        return .{ .open = open, .inner = "" };
+    }
+    if (std.mem.indexOfPos(u8, xml, gt, close_pat)) |close| {
+        pos.* = close + close_pat.len;
+        return .{ .open = open, .inner = xml[gt + 1 .. close] };
+    }
+    pos.* = gt + 1;
+    return .{ .open = open, .inner = "" };
+}
+
+/// 只要 inner 的便捷版（`parseSharedStrings` / `collectTexts` / `innerValue` 用）。
+fn nextTag(xml: []const u8, pos: *usize, comptime tag: []const u8) ?[]const u8 {
+    const element = nextElement(xml, pos, tag) orelse return null;
+    return element.inner;
+}
+
+/// `<c r="B3" t="s">` 里的列号（A=0、B=1、AA=26）。
+fn columnIndex(cell_block: []const u8) ?usize {
+    const ref = attrValue(cell_block[0..@min(cell_block.len, 200)], "r") orelse return null;
+    var value: usize = 0;
+    var seen: usize = 0;
+    for (ref) |ch| {
+        if (ch >= 'A' and ch <= 'Z') {
+            value = value * 26 + (ch - 'A' + 1);
+            seen += 1;
+        } else if (ch >= 'a' and ch <= 'z') {
+            value = value * 26 + (ch - 'a' + 1);
+            seen += 1;
+        } else break;
+    }
+    if (seen == 0) return null;
+    return value - 1;
+}
+
+fn attrValue(tag_text: []const u8, name: []const u8) ?[]const u8 {
+    const pattern = std.fmt.allocPrint(std.heap.page_allocator, "{s}=\"", .{name}) catch return null;
+    defer std.heap.page_allocator.free(pattern);
+
+    const idx = std.mem.indexOf(u8, tag_text, pattern) orelse return null;
+    const value_start = idx + pattern.len;
+    const value_end = std.mem.indexOfScalarPos(u8, tag_text, value_start, '"') orelse return null;
+    return tag_text[value_start..value_end];
+}
+
+fn innerValue(block: []const u8, comptime tag: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    return nextTag(block, &pos, tag);
+}
+
+/// 把 XML 文本反转义后写入 `out`（只处理 5 个预定义实体与数字实体）。
+fn appendUnescaped(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '&') {
+            if (std.mem.indexOfScalarPos(u8, text, i, ';')) |semi| {
+                const entity = text[i + 1 .. semi];
+                const replacement: ?u8 = if (std.mem.eql(u8, entity, "amp"))
+                    '&'
+                else if (std.mem.eql(u8, entity, "lt"))
+                    '<'
+                else if (std.mem.eql(u8, entity, "gt"))
+                    '>'
+                else if (std.mem.eql(u8, entity, "quot"))
+                    '"'
+                else if (std.mem.eql(u8, entity, "apos"))
+                    '\''
+                else if (std.mem.startsWith(u8, entity, "#x") or std.mem.startsWith(u8, entity, "#X"))
+                    decodeCodePoint(entity[2..], 16)
+                else if (std.mem.startsWith(u8, entity, "#"))
+                    decodeCodePoint(entity[1..], 10)
+                else
+                    null;
+                if (replacement) |byte| {
+                    try out.append(gpa, byte);
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        try out.append(gpa, text[i]);
+        i += 1;
+    }
+}
+
+fn decodeCodePoint(digits: []const u8, base: u8) ?u8 {
+    const value = std.fmt.parseInt(u21, digits, base) catch return null;
+    if (value > 0x7F) return null; // 只处理 ASCII（导入字段用不到更高位）
+    return @intCast(value);
+}
+
+test "xlsx.Reader：写出去的能读回来（表头/数字/空单元格/转义/共享串）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var w = Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const sheet = try w.addSheet("导入");
+    try w.addHeader(sheet, &.{ "帐号", "姓名", "年龄" });
+    try w.addRow(sheet, &.{ .{ .text = "zhangsan" }, .{ .text = "张<三>&\"x\"" }, .{ .int = 30 } });
+    try w.addRow(sheet, &.{ .{ .text = "" }, .{ .text = "李四" }, .blank });
+    const bytes = try w.finishAlloc(a);
+
+    var reader = try Reader.init(std.testing.allocator, bytes);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), reader.rowCount());
+    try std.testing.expect(reader.hasHeader());
+    try std.testing.expectEqualStrings("帐号", reader.cell(0, 0));
+    try std.testing.expectEqualStrings("zhangsan", reader.cell(1, 0));
+    try std.testing.expectEqualStrings("张<三>&\"x\"", reader.cell(1, 1));
+    try std.testing.expectEqualStrings("30", reader.cell(1, 2));
+    try std.testing.expectEqualStrings("", reader.cell(2, 0));
+    try std.testing.expectEqualStrings("李四", reader.cell(2, 1));
+    try std.testing.expectEqualStrings("", reader.cell(2, 2));
+}
+
+test "xlsx.Reader：A/B/AA 列定位与缺失列补空" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(gpa);
+
+    const xml =
+        \\<row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c><c r="C1" t="inlineStr"><is><t>c</t></is></c></row>
+    ;
+    const rows = try parseSheet(gpa, xml, &.{});
+    defer {
+        for (rows) |row| {
+            for (row) |cell| gpa.free(cell);
+            gpa.free(row);
+        }
+        gpa.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(usize, 3), rows[0].len);
+    try std.testing.expectEqualStrings("a", rows[0][0]);
+    try std.testing.expectEqualStrings("", rows[0][1]);
+    try std.testing.expectEqualStrings("c", rows[0][2]);
+}
+
 test "xlsx：生成后能被 zip 读回，含 5 个必要部件与 inlineStr" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
