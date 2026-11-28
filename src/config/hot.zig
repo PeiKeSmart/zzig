@@ -209,7 +209,7 @@ pub fn Hot(comptime T: type) type {
 
         fn middlewareCall(raw: ?*anyopaque, c: *router.Ctx, next: router.Next) anyerror!router.Response {
             const self: *Self = @ptrCast(@alignCast(raw orelse return error.MissingContext));
-            self.maybeReload();
+            _ = self.maybeReload();
             return next.run(c);
         }
     };
