@@ -105,6 +105,20 @@ pub const DateTime = struct {
         return gpa.dupe(u8, text);
     }
 
+    /// 输出 C# 看板口径 `yyyy-MM-dd HH:mm:ss`（**空格分隔**，不是 ISO 的 `T`）。
+    ///
+    /// 空值 / 最小时间（`year <= 1`，即 `DateTime.MinValue` 的等价物）返回**空串**——
+    /// 这是 C# 项目里 `t == DateTime.MinValue ? "" : t.ToString("yyyy-MM-dd HH:mm:ss")`
+    /// 的通用写法，各面板项目不必再各写一份。
+    pub fn formatCsharpAlloc(self: DateTime, gpa: std.mem.Allocator) ![]const u8 {
+        if (self.year <= 1) return "";
+        var scratch: [40]u8 = undefined;
+        const text = try self.formatBuf(&scratch);
+        // `YYYY-MM-DD HH:MM:SS.fffffff` 取前 19 位即 `yyyy-MM-dd HH:mm:ss`
+        const take = @min(text.len, 19);
+        return try gpa.dupe(u8, text[0..take]);
+    }
+
     /// 写入固定缓冲（无分配；`out` 至少 32 字节）。
     pub fn formatBuf(self: DateTime, out: []u8) ![]const u8 {
         const ticks: u32 = self.nanos / 100; // 100ns

@@ -161,6 +161,7 @@ pub const qr = @import("image/qr.zig");
 /// Data Matrix 生成（复用 `qr.Matrix` 与同一套 SVG 渲染口径）
 pub const datamatrix = @import("image/datamatrix.zig");
 
+
 /// 线程相关：定时器、弹性线程池、Cron
 pub const threading = struct {
     pub const timer = @import("threading/timer.zig");
@@ -179,6 +180,12 @@ pub const threading = struct {
     pub const Pool = pool.Pool;
     pub const PoolOptions = pool.Options;
     pub const markAsLongTask = pool.markAsLongTask;
+    /// 通用定时作业注册表（**与存储无关**）：任务注册 + 全量同步 + 执行后回调
+    pub const jobs = @import("threading/jobs.zig");
+    pub const JobRegistry = jobs.Registry;
+    pub const JobSpec = jobs.JobSpec;
+    pub const JobOutcome = jobs.Outcome;
+    pub const JobTask = jobs.Task;
 };
 
 /// 企业微信机器人 Webhook 推送
@@ -453,10 +460,10 @@ test {
     _ = @import("http/structured_data.zig");
     _ = @import("http/pek_html.zig");
     _ = @import("http/page_kit.zig");
-_ = @import("http/head_probe.zig");
-_ = @import("http/assets.zig");
-_ = @import("http/machine_resources.zig");
-_ = @import("http/captcha.zig");
+    _ = @import("http/head_probe.zig");
+    _ = @import("http/assets.zig");
+    _ = @import("http/machine_resources.zig");
+    _ = @import("http/captcha.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/toml_template.zig");
     _ = @import("config/text_keys.zig");
@@ -466,6 +473,7 @@ _ = @import("http/captcha.zig");
     _ = @import("threading/pool.zig");
     _ = @import("threading/timer.zig");
     _ = @import("threading/cron.zig");
+    _ = @import("threading/jobs.zig");
     _ = @import("wecom/wecom.zig");
     _ = @import("number/decimal.zig");
     _ = @import("time/datetime.zig");

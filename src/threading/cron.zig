@@ -264,6 +264,28 @@ fn startOfNextMonth(t: i64, c: Civil) i64 {
     return t + (86400 - daySeconds(c)) + @as(i64, dim - c.day) * 86400;
 }
 
+/// 校验表达式并给出**可直接回显给用户**的中文提示（`null` = 通过）。
+///
+/// 为什么放这里而不是各业务项目：提示文案一旦各写一份，就会出现同一张配置页
+/// 在不同项目里报不同错；语法只在库内演进，文案也该跟着库走。
+pub fn validateAlloc(a: std.mem.Allocator, expression: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    if (trimmed.len == 0) return "Cron表达式不能为空";
+
+    _ = Cron.parse(trimmed) catch |err| {
+        const reason = switch (err) {
+            Error.InvalidCron => "语法非法",
+            Error.ZeroStep => "步进值为 0",
+        };
+        return try std.fmt.allocPrint(
+            a,
+            "Cron表达式不合法（{s}）：{s}，应为 秒 分 时 日 月 周，如 `0 */5 * * * *`",
+            .{ trimmed, reason },
+        );
+    };
+    return null;
+}
+
 pub fn isLeap(year: i32) bool {
     return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
 }
