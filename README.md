@@ -48,6 +48,22 @@
 - **跨平台** - 支持 x86/ARM/RISC-V
 - **灵活配置** - 嵌入式/桌面/服务器预设
 
+### 🧩 图形验证码 (Captcha)
+- **多方案渲染** - `Renderer = .svg / .gif`，存储/校验逻辑共用；需要新格式时只加枚举分支
+- **GIF 输出保留** - `image/gif` 的 GIF89a（90×38，七段数码管 + 干扰线/噪点），前端直接 `data:image/gif;base64,...`
+- **C# 口径校验** - `verify(id, code, now, consume)`：错误不消耗、成功才删除；`take` 仍保留一次性语义
+- **可测试** - `issueWithCode(..., fixed)` 指定固定答案（仅回归；生产传 `null`）
+- **零依赖** - 无字体、无图像库；Linux 静态包同样可用
+
+```zig
+var store = zzig.web.captcha.Store.init(gpa, .{
+    .renderer = .gif,
+    .charset = zzig.web.captcha.digits,
+});
+const img = try zzig.web.captcha.issueImage(&store, arena, now_ms, null);
+// img.base64 + img.mime → 返回前端；登录时 store.verify(img.id, code, now_ms, false)
+```
+
 ---
 
 ## 📦 快速开始
